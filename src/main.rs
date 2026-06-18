@@ -1,827 +1,336 @@
-//! Command line arguments.
-use std::{
-    io,
-    net::{SocketAddrV4, SocketAddrV6, ToSocketAddrs},
-    str::FromStr,
-    time::Duration,
-};
+use iroh::Endpoint;
+use iroh::endpoint::presets;
+use iroh::endpoint::{Connection, Incoming};
+use iroh_tickets::Ticket;
+use iroh_tickets::endpoint::EndpointTicket;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
-use clap::{Parser, Subcommand};
-use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::Accepting};
-use n0_error::{AnyError, Result, StdResultExt, bail_any, ensure_any};
-use nexapipe::EndpointTicket;
-use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
-    select,
-    time::timeout,
-};
-use tokio_util::sync::CancellationToken;
-#[cfg(unix)]
-use {
-    std::path::PathBuf,
-    tokio::net::{UnixListener, UnixStream},
-};
+const ALPN_HTTP3: &[u8] = b"\x05http/3";
+const MAX_REQUEST_SIZE: usize = 1024 * 1024;
 
-const ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Create a dumb pipe between two machines, using an iroh endpoint.
-///
-/// One side listens, the other side connects. Both sides are identified by a
-/// 32 byte endpoint id.
-///
-/// Connecting to a endpoint id is independent of its IP address. nexapipe will try
-/// to establish a direct connection even through NATs and firewalls. If that
-/// fails, it will fall back to using a relay server.
-///
-/// For all subcommands, you can specify a secret key using the IROH_SECRET
-/// environment variable. If you don't, a random one will be generated.
-///
-/// You can also specify a port for the endpoint. If you don't, a random one
-/// will be chosen.
-#[derive(Parser, Debug)]
-pub struct Args {
-    #[clap(subcommand)]
-    pub command: Commands,
+struct ProxyConfig {
+    backend_routes: Arc<HashMap<String, String>>,
+    default_backend: Arc<String>,
 }
 
-#[derive(Subcommand, Debug)]
-pub enum Commands {
-    /// Generate a short endpoint ticket. This ticket can be used to later connect to a
-    /// listener that is using the same secret key again.
-    ///
-    /// This command only really makes sense when you are providing nexapipe with a
-    /// secret key.
-    GenerateTicket,
-
-    /// Listen on an endpoint and forward stdin/stdout to the first incoming
-    /// bidi stream.
-    ///
-    /// Will print a endpoint ticket on stderr that can be used to connect.
-    Listen(ListenArgs),
-
-    /// Listen on an endpoint and forward incoming connections to the specified
-    /// host and port. Every incoming bidi stream is forwarded to a new connection.
-    ///
-    /// Will print a endpoint ticket on stderr that can be used to connect.
-    ///
-    /// As far as the endpoint is concerned, this is listening. But it is
-    /// connecting to a TCP socket for which you have to specify the host and port.
-    ListenTcp(ListenTcpArgs),
-
-    #[cfg(unix)]
-    /// Listen on an endpoint and forward incoming connections to the specified
-    /// Unix socket path. Every incoming bidi stream is forwarded to a new connection.
-    ///
-    /// Will print a endpoint ticket on stderr that can be used to connect.
-    ///
-    /// As far as the endpoint is concerned, this is listening. But it is
-    /// connecting to a Unix socket for which you have to specify the path.
-    ListenUnix(ListenUnixArgs),
-}
-
-#[derive(Parser, Debug)]
-pub struct CommonArgs {
-    /// The IPv4 address that the endpoint will listen on.
-    ///
-    /// If None, defaults to a random free port, but it can be useful to specify a fixed
-    /// port, e.g. to configure a firewall rule.
-    #[clap(long, default_value = None)]
-    pub ipv4_addr: Option<SocketAddrV4>,
-
-    /// The IPv6 address that the endpoint will listen on.
-    ///
-    /// If None, defaults to a random free port, but it can be useful to specify a fixed
-    /// port, e.g. to configure a firewall rule.
-    #[clap(long, default_value = None)]
-    pub ipv6_addr: Option<SocketAddrV6>,
-
-    /// A custom ALPN to use for the endpoint.
-    ///
-    /// This is an expert feature that allows nexapipe to be used to interact
-    /// with existing iroh protocols.
-    ///
-    /// When using this option, the connect side must also specify the same ALPN.
-    /// The listen side will not expect a handshake, and the connect side will
-    /// not send one.
-    ///
-    /// Alpns are byte strings. To specify an utf8 string, prefix it with `utf8:`.
-    /// Otherwise, it will be parsed as a hex string.
-    #[clap(long)]
-    pub custom_alpn: Option<String>,
-
-    /// The verbosity level. Repeat to increase verbosity.
-    #[clap(short = 'v', long, action = clap::ArgAction::Count)]
-    pub verbose: u8,
-}
-
-impl CommonArgs {
-    fn alpn(&self) -> Result<Vec<u8>> {
-        Ok(match &self.custom_alpn {
-            Some(alpn) => parse_alpn(alpn)?,
-            None => nexapipe::ALPN.to_vec(),
-        })
+impl ProxyConfig {
+    fn new(backend_routes: HashMap<String, String>, default_backend: String) -> Self {
+        Self {
+            backend_routes: Arc::new(backend_routes),
+            default_backend: Arc::new(default_backend),
+        }
     }
 
-    fn is_custom_alpn(&self) -> bool {
-        self.custom_alpn.is_some()
+    fn get_backend(&self, host: Option<&str>) -> &str {
+        match host {
+            Some(hostname) => {
+                // 尝试精确匹配
+                if let Some(backend) = self.backend_routes.get(hostname) {
+                    return backend;
+                }
+
+                // 尝试通配符匹配 (*.example.com)
+                let parts: Vec<&str> = hostname.split('.').collect();
+                if parts.len() >= 2 {
+                    let wildcard = format!("*.{}", parts[1..].join("."));
+                    if let Some(backend) = self.backend_routes.get(&wildcard) {
+                        return backend;
+                    }
+                }
+
+                // 使用默认后端
+                &self.default_backend
+            }
+            None => &self.default_backend,
+        }
     }
 }
 
-fn parse_alpn(alpn: &str) -> Result<Vec<u8>> {
-    Ok(if let Some(text) = alpn.strip_prefix("utf8:") {
-        text.as_bytes().to_vec()
+async fn proxy_to_backend(
+    req: &http::Request<()>,
+    backend_url: &str,
+) -> anyhow::Result<http::Response<Vec<u8>>> {
+    let url =
+        url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("backend URL missing host"))?;
+    let port = url.port_or_known_default().unwrap_or(80);
+
+    let mut tcp_stream = TcpStream::connect((host, port))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to connect to backend: {}", e))?;
+
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or(req.uri().path());
+
+    let request_line = format!("{} {} HTTP/1.1\r\n", req.method(), path);
+    tcp_stream.write_all(request_line.as_bytes()).await?;
+
+    tcp_stream.write_all(b"Host: ").await?;
+    tcp_stream.write_all(host.as_bytes()).await?;
+    tcp_stream.write_all(b"\r\n").await?;
+
+    for (name, value) in req.headers() {
+        tcp_stream.write_all(name.as_str().as_bytes()).await?;
+        tcp_stream.write_all(b": ").await?;
+        tcp_stream.write_all(value.as_bytes()).await?;
+        tcp_stream.write_all(b"\r\n").await?;
+    }
+
+    tcp_stream.write_all(b"\r\n").await?;
+
+    let mut response = Vec::new();
+    tcp_stream.read_to_end(&mut response).await?;
+
+    parse_http_response(&response)
+}
+
+fn parse_http_response(response: &[u8]) -> anyhow::Result<http::Response<Vec<u8>>> {
+    let response_str = String::from_utf8_lossy(response);
+    let mut lines = response_str.split("\r\n");
+
+    let status_line = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("invalid HTTP response: missing status line"))?;
+
+    let status_parts: Vec<&str> = status_line.split_whitespace().collect();
+    let status_code = if status_parts.len() >= 2 {
+        status_parts[1]
+            .parse::<u16>()
+            .map_err(|e| anyhow::anyhow!("invalid status code: {}", e))?
     } else {
-        hex::decode(alpn).anyerr()?
-    })
-}
+        500
+    };
 
-#[derive(Parser, Debug)]
-pub struct ListenArgs {
-    /// Immediately close our sending side, indicating that we will not transmit any data
-    #[clap(long)]
-    pub recv_only: bool,
+    let mut builder = http::Response::builder().status(status_code);
 
-    #[clap(flatten)]
-    pub common: CommonArgs,
-}
-
-#[derive(Parser, Debug)]
-pub struct ListenTcpArgs {
-    #[clap(long)]
-    pub host: String,
-
-    #[clap(flatten)]
-    pub common: CommonArgs,
-}
-
-#[derive(Parser, Debug)]
-pub struct ConnectTcpArgs {
-    #[clap(long)]
-    pub addr: String,
-
-    pub ticket: EndpointTicket,
-
-    #[clap(flatten)]
-    pub common: CommonArgs,
-}
-
-#[derive(Parser, Debug)]
-pub struct ConnectArgs {
-    pub ticket: EndpointTicket,
-
-    #[clap(long)]
-    pub recv_only: bool,
-
-    #[clap(flatten)]
-    pub common: CommonArgs,
-}
-
-#[cfg(unix)]
-#[derive(Parser, Debug)]
-pub struct ListenUnixArgs {
-    /// Path to the Unix socket to connect to
-    #[clap(long)]
-    pub socket_path: PathBuf,
-
-    #[clap(flatten)]
-    pub common: CommonArgs,
-}
-
-#[cfg(unix)]
-#[derive(Parser, Debug)]
-pub struct ConnectUnixArgs {
-    #[clap(long)]
-    pub socket_path: PathBuf,
-
-    pub ticket: EndpointTicket,
-
-    #[clap(flatten)]
-    pub common: CommonArgs,
-}
-
-/// Copy from a reader to a quinn stream.
-///
-/// Will send a reset to the other side if the operation is cancelled, and fail
-/// with an error.
-///
-/// Returns the number of bytes copied in case of success.
-async fn copy_to_quinn(
-    mut from: impl AsyncRead + Unpin,
-    mut send: quinn::SendStream,
-    token: CancellationToken,
-) -> io::Result<u64> {
-    tracing::trace!("copying to quinn");
-    tokio::select! {
-        res = tokio::io::copy(&mut from, &mut send) => {
-            let size = res?;
-            send.finish()?;
-            Ok(size)
+    for line in lines {
+        if line.is_empty() {
+            break;
         }
-        _ = token.cancelled() => {
-            // send a reset to the other side immediately
-            send.reset(0u8.into()).ok();
-            Err(io::Error::other("cancelled"))
+        if let Some((name, value)) = line.split_once(':') {
+            builder = builder.header(name.trim(), value.trim());
         }
     }
+
+    Ok(builder.body(response.to_vec())?)
 }
 
-/// Copy from a quinn stream to a writer.
-///
-/// Will send stop to the other side if the operation is cancelled, and fail
-/// with an error.
-///
-/// Returns the number of bytes copied in case of success.
-async fn copy_from_quinn(
-    mut recv: quinn::RecvStream,
-    mut to: impl AsyncWrite + Unpin,
-    token: CancellationToken,
-) -> io::Result<u64> {
-    tokio::select! {
-        res = tokio::io::copy(&mut recv, &mut to) => {
-            Ok(res?)
+async fn handle_bidi_stream(
+    send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream,
+    config: &ProxyConfig,
+) -> anyhow::Result<()> {
+    let buf = recv.read_to_end(MAX_REQUEST_SIZE).await?;
+
+    let request = parse_http_request(&buf)?;
+
+    // 从请求中提取 Host 头部
+    let host = request
+        .headers()
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .map(|h| h.split(':').next().unwrap_or(h)); // 移除端口号
+
+    let backend_url = config.get_backend(host);
+
+    tracing::debug!("Request for host: {:?} -> backend: {}", host, backend_url);
+    tracing::debug!("Received request: {} {}", request.method(), request.uri());
+
+    let response = proxy_to_backend(&request, backend_url).await?;
+    tracing::debug!("Proxy response status: {}", response.status());
+
+    send_response(send, &response).await?;
+
+    Ok(())
+}
+
+fn parse_http_request(buf: &[u8]) -> anyhow::Result<http::Request<()>> {
+    let request_str = String::from_utf8_lossy(buf);
+    let mut lines = request_str.split("\r\n");
+
+    let request_line = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("invalid HTTP request: missing request line"))?;
+
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return Err(anyhow::anyhow!("invalid HTTP request line"));
+    }
+
+    let method = http::Method::from_bytes(parts[0].as_bytes())
+        .map_err(|e| anyhow::anyhow!("invalid HTTP method: {}", e))?;
+    let uri = http::Uri::try_from(parts[1]).map_err(|e| anyhow::anyhow!("invalid URI: {}", e))?;
+
+    let mut builder = http::Request::builder().method(method).uri(uri);
+
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            builder = builder.header(name.trim(), value.trim());
+        }
+    }
+
+    Ok(builder.body(())?)
+}
+
+async fn send_response(
+    send: &mut iroh::endpoint::SendStream,
+    response: &http::Response<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let status = response.status();
+    let status_text = status.canonical_reason().unwrap_or("Unknown");
+
+    let mut response_buf = Vec::new();
+    response_buf
+        .extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), status_text).as_bytes());
+
+    for (name, value) in response.headers() {
+        response_buf.extend_from_slice(name.as_str().as_bytes());
+        response_buf.extend_from_slice(b": ");
+        response_buf.extend_from_slice(value.as_bytes());
+        response_buf.extend_from_slice(b"\r\n");
+    }
+
+    response_buf.extend_from_slice(b"\r\n");
+    response_buf.extend_from_slice(response.body());
+
+    send.write_all(&response_buf).await?;
+    send.finish()?;
+
+    Ok(())
+}
+
+async fn handle_connection(conn: Connection, config: Arc<ProxyConfig>) {
+    let peer_id = conn.remote_id();
+    tracing::info!("New connection from peer: {}", peer_id);
+
+    loop {
+        match conn.accept_bi().await {
+            Ok((mut send, mut recv)) => {
+                let config_clone = config.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_bidi_stream(&mut send, &mut recv, &config_clone).await {
+                        tracing::error!("Failed to handle stream from {}: {}", peer_id, e);
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::warn!("Connection {} stream accept error: {}", peer_id, e);
+                break;
+            }
+        }
+    }
+
+    tracing::info!("Connection closed for peer: {}", peer_id);
+}
+
+async fn handle_incoming(incoming: Incoming, config: Arc<ProxyConfig>) {
+    match incoming.accept() {
+        Ok(accepting) => match accepting.await {
+            Ok(conn) => {
+                tokio::spawn(async move {
+                    handle_connection(conn, config).await;
+                });
+            }
+            Err(e) => {
+                tracing::error!("Failed to complete connection: {}", e);
+            }
         },
-        _ = token.cancelled() => {
-            recv.stop(0u8.into()).ok();
-            Err(io::Error::other("cancelled"))
+        Err(e) => {
+            tracing::error!("Failed to accept incoming connection: {}", e);
         }
     }
 }
 
-/// Get the secret key or generate a new one.
-///
-/// Print the secret key to stderr if it was generated, so the user can save it.
-fn get_or_create_secret() -> Result<SecretKey> {
-    match std::env::var("IROH_SECRET") {
-        Ok(secret) => SecretKey::from_str(&secret).std_context("invalid secret"),
-        Err(_) => {
-            let key = SecretKey::generate(&mut rand::rng());
-            eprintln!(
-                "using secret key {}",
-                data_encoding::HEXLOWER.encode(&key.to_bytes())
-            );
-            Ok(key)
-        }
-    }
-}
+async fn run_proxy(
+    backend_routes: HashMap<String, String>,
+    default_backend: String,
+) -> anyhow::Result<()> {
+    let config = Arc::new(ProxyConfig::new(backend_routes, default_backend));
 
-/// Create a new iroh endpoint.
-async fn create_endpoint(
-    secret_key: SecretKey,
-    common: &CommonArgs,
-    alpns: Vec<Vec<u8>>,
-) -> Result<Endpoint> {
-    let mut builder = Endpoint::builder().secret_key(secret_key).alpns(alpns);
-    if let Some(addr) = common.ipv4_addr {
-        builder = builder.bind_addr(addr)?;
-    }
-    if let Some(addr) = common.ipv6_addr {
-        builder = builder.bind_addr(addr)?;
-    }
-    let endpoint = builder.bind().await.anyerr()?;
-    Ok(endpoint)
-}
+    let ep = Endpoint::builder(presets::N0)
+        .alpns(vec![ALPN_HTTP3.to_vec()])
+        .bind()
+        .await?;
 
-fn cancel_token<T>(token: CancellationToken) -> impl Fn(T) -> T {
-    move |x| {
-        token.cancel();
-        x
-    }
-}
+    let node_id = ep.id();
+    let node_addr = ep.addr();
 
-/// Bidirectionally forward data from a quinn stream and an arbitrary tokio
-/// reader/writer pair, aborting both sides when either one forwarder is done,
-/// or when control-c is pressed.
-async fn forward_bidi(
-    from1: impl AsyncRead + Send + Sync + Unpin + 'static,
-    to1: impl AsyncWrite + Send + Sync + Unpin + 'static,
-    from2: quinn::RecvStream,
-    to2: quinn::SendStream,
-) -> Result<()> {
-    let token1 = CancellationToken::new();
-    let token2 = token1.clone();
-    let token3 = token1.clone();
-    let forward_from_stdin = tokio::spawn(async move {
-        copy_to_quinn(from1, to2, token1.clone())
-            .await
-            .map_err(cancel_token(token1))
-    });
-    let forward_to_stdout = tokio::spawn(async move {
-        copy_from_quinn(from2, to1, token2.clone())
-            .await
-            .map_err(cancel_token(token2))
-    });
-    let _control_c = tokio::spawn(async move {
-        tokio::signal::ctrl_c().await?;
-        token3.cancel();
-        io::Result::Ok(())
-    });
-    forward_to_stdout.await.anyerr()?.anyerr()?;
-    forward_from_stdin.await.anyerr()?.anyerr()?;
-    Ok(())
-}
+    tracing::info!("Iroh proxy endpoint started successfully");
+    tracing::info!("Node ID: {}", node_id);
+    tracing::info!("Backend routes: {:?}", config.backend_routes);
+    tracing::info!("Default backend: {}", config.default_backend);
 
-pub async fn connect_stdio(args: ConnectArgs) -> Result<()> {
-    let secret_key = get_or_create_secret()?;
-    let endpoint = create_endpoint(secret_key, &args.common, vec![]).await?;
-    let addr = args.ticket.endpoint_addr();
-    let remote_endpoint_id = addr.id;
-    let connection = endpoint
-        .connect(addr.clone(), &args.common.alpn()?)
-        .await
-        .anyerr()?;
-    tracing::info!("connected to {}", remote_endpoint_id);
-    let (mut s, r) = connection.open_bi().await.anyerr()?;
-    tracing::info!("opened bidi stream to {}", remote_endpoint_id);
-    if !args.common.is_custom_alpn() {
-        s.write_all(&nexapipe::HANDSHAKE).await.anyerr()?;
-    }
-    if args.recv_only {
-        tracing::info!(
-            "forwarding stdout to {} (ignoring stdin)",
-            remote_endpoint_id
-        );
-        forward_bidi(tokio::io::empty(), tokio::io::stdout(), r, s).await?;
-    } else {
-        tracing::info!("forwarding stdin/stdout to {}", remote_endpoint_id);
-        forward_bidi(tokio::io::stdin(), tokio::io::stdout(), r, s).await?;
-    }
-    tokio::io::stdout().flush().await.anyerr()?;
-    Ok(())
-}
+    // 生成可分享的连接凭证
+    let ticket = EndpointTicket::new(node_addr);
+    let ticket_str = ticket.encode_string();
 
-async fn listen_stdio(args: ListenArgs) -> Result<()> {
-    let secret_key = get_or_create_secret()?;
-    let endpoint = create_endpoint(secret_key, &args.common, vec![args.common.alpn()?]).await?;
-    // wait for the endpoint to figure out its home relay and addresses before making a ticket
-    if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
-        eprintln!("Warning: Failed to connect to the home relay");
-    }
-    let addr = endpoint.addr();
-    let short = create_short_ticket(&addr);
-    let ticket = EndpointTicket::new(addr);
+    println!("\n========================================");
+    println!("Proxy Connection Information");
+    println!("========================================");
+    println!("Node ID: {}", node_id);
+    println!("Ticket (for clients): {}", ticket_str);
+    println!("========================================\n");
 
-    // print the ticket on stderr so it doesn't interfere with the data itself
-    //
-    // note that the tests rely on the ticket being the last thing printed
-    eprintln!("Listening. To connect, use:\nnexapipe connect {ticket}");
-    if args.common.verbose > 0 {
-        eprintln!("or:\nnexapipe connect {short}");
-    }
+    tracing::info!("Connection ticket: {}", ticket_str);
 
     loop {
-        let Some(connecting) = endpoint.accept().await else {
-            break;
-        };
-        let connection = match connecting.await {
-            Ok(connection) => connection,
-            Err(cause) => {
-                tracing::warn!("error accepting connection: {}", cause);
-                // if accept fails, we want to continue accepting connections
-                continue;
+        match ep.accept().await {
+            Some(incoming) => {
+                let config_clone = config.clone();
+                tokio::spawn(async move {
+                    handle_incoming(incoming, config_clone).await;
+                });
             }
-        };
-        let remote_endpoint_id = &connection.remote_id();
-        tracing::info!("got connection from {}", remote_endpoint_id);
-        let (s, mut r) = match connection.accept_bi().await {
-            Ok(x) => x,
-            Err(cause) => {
-                tracing::warn!("error accepting stream: {}", cause);
-                // if accept_bi fails, we want to continue accepting connections
-                continue;
-            }
-        };
-        tracing::info!("accepted bidi stream from {}", remote_endpoint_id);
-        if !args.common.is_custom_alpn() {
-            // read the handshake and verify it
-            let mut buf = [0u8; nexapipe::HANDSHAKE.len()];
-            r.read_exact(&mut buf).await.anyerr()?;
-            ensure_any!(buf == nexapipe::HANDSHAKE, "invalid handshake");
-        }
-        if args.recv_only {
-            tracing::info!(
-                "forwarding stdout to {} (ignoring stdin)",
-                remote_endpoint_id
-            );
-            forward_bidi(tokio::io::empty(), tokio::io::stdout(), r, s).await?;
-        } else {
-            tracing::info!("forwarding stdin/stdout to {}", remote_endpoint_id);
-            forward_bidi(tokio::io::stdin(), tokio::io::stdout(), r, s).await?;
-        }
-        // stop accepting connections after the first successful one
-        break;
-    }
-    Ok(())
-}
-
-pub async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
-    use iroh::EndpointAddr;
-    use std::net::SocketAddr;
-
-    let addrs = args
-        .addr
-        .to_socket_addrs()
-        .std_context(format!("invalid host string {}", args.addr))?;
-    let secret_key = get_or_create_secret()?;
-    let endpoint = create_endpoint(secret_key, &args.common, vec![])
-        .await
-        .std_context("unable to bind endpoint")?;
-    tracing::info!("tcp listening on {:?}", addrs);
-
-    if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
-        eprintln!("Warning: Failed to connect to the home relay");
-    }
-
-    let tcp_listener = match tokio::net::TcpListener::bind(addrs.as_slice()).await {
-        Ok(tcp_listener) => tcp_listener,
-        Err(cause) => {
-            tracing::error!("error binding tcp socket to {:?}: {}", addrs, cause);
-            return Ok(());
-        }
-    };
-    async fn handle_tcp_accept(
-        next: io::Result<(tokio::net::TcpStream, SocketAddr)>,
-        addr: EndpointAddr,
-        endpoint: Endpoint,
-        handshake: bool,
-        alpn: &[u8],
-    ) -> Result<()> {
-        let (tcp_stream, tcp_addr) = next.std_context("error accepting tcp connection")?;
-        let (tcp_recv, tcp_send) = tcp_stream.into_split();
-        tracing::info!("got tcp connection from {}", tcp_addr);
-        let remote_endpoint_id = addr.id;
-        let connection = endpoint
-            .connect(addr, alpn)
-            .await
-            .std_context(format!("error connecting to {remote_endpoint_id}"))?;
-        let (mut endpoint_send, endpoint_recv) = connection
-            .open_bi()
-            .await
-            .std_context(format!("error opening bidi stream to {remote_endpoint_id}"))?;
-        if handshake {
-            endpoint_send
-                .write_all(&nexapipe::HANDSHAKE)
-                .await
-                .anyerr()?;
-        }
-        forward_bidi(tcp_recv, tcp_send, endpoint_recv, endpoint_send).await?;
-        Ok::<_, AnyError>(())
-    }
-    let addr = args.ticket.endpoint_addr();
-    loop {
-        let next = tokio::select! {
-            stream = tcp_listener.accept() => stream,
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("got ctrl-c, exiting");
+            None => {
+                tracing::info!("Endpoint closed");
                 break;
             }
-        };
-        let endpoint = endpoint.clone();
-        let addr = addr.clone();
-        let handshake = !args.common.is_custom_alpn();
-        let alpn = args.common.alpn()?;
-        tokio::spawn(async move {
-            if let Err(cause) = handle_tcp_accept(next, addr, endpoint, handshake, &alpn).await {
-                tracing::warn!("error handling connection: {}", cause);
-            }
-        });
-    }
-    Ok(())
-}
-
-/// Listen on an endpoint and forward incoming connections to a tcp socket.
-async fn listen_tcp(args: ListenTcpArgs) -> Result<()> {
-    let addrs = match args.host.to_socket_addrs() {
-        Ok(addrs) => addrs.collect::<Vec<_>>(),
-        Err(e) => bail_any!("invalid host string {}: {}", args.host, e),
-    };
-    let secret_key = get_or_create_secret()?;
-    let endpoint = create_endpoint(secret_key, &args.common, vec![args.common.alpn()?]).await?;
-    // wait for the endpoint to figure out its address before making a ticket
-    if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
-        eprintln!("Warning: Failed to connect to the home relay");
-    }
-    let addr = endpoint.addr();
-    let short = create_short_ticket(&addr);
-    let ticket = EndpointTicket::new(addr);
-
-    // print the ticket on stderr so it doesn't interfere with the data itself
-    //
-    // note that the tests rely on the ticket being the last thing printed
-    eprintln!("Forwarding incoming requests to '{}'.", args.host);
-    eprintln!("To connect, use e.g.:");
-    eprintln!("nexapipe connect-tcp {ticket}");
-    if args.common.verbose > 0 {
-        eprintln!("or:\nnexapipe connect-tcp {short}");
-    }
-    tracing::info!("endpoint id is {}", ticket.endpoint_addr().id);
-    tracing::info!(
-        "relay url is {:?}",
-        ticket
-            .endpoint_addr()
-            .relay_urls()
-            .next()
-            .map_or("None".to_string(), |url| url.to_string())
-    );
-
-    // handle a new incoming connection on the endpoint
-    async fn handle_endpoint_accept(
-        accepting: Accepting,
-        addrs: Vec<std::net::SocketAddr>,
-        handshake: bool,
-    ) -> Result<()> {
-        let connection = accepting.await.std_context("error accepting connection")?;
-        let remote_endpoint_id = &connection.remote_id();
-        tracing::info!("got connection from {}", remote_endpoint_id);
-        let (s, mut r) = connection
-            .accept_bi()
-            .await
-            .std_context("error accepting stream")?;
-        tracing::info!("accepted bidi stream from {}", remote_endpoint_id);
-        if handshake {
-            // read the handshake and verify it
-            let mut buf = [0u8; nexapipe::HANDSHAKE.len()];
-            r.read_exact(&mut buf).await.anyerr()?;
-            ensure_any!(buf == nexapipe::HANDSHAKE, "invalid handshake");
-        }
-        let connection = tokio::net::TcpStream::connect(addrs.as_slice())
-            .await
-            .std_context(format!("error connecting to {addrs:?}"))?;
-        let (read, write) = connection.into_split();
-        forward_bidi(read, write, r, s).await?;
-        Ok(())
-    }
-
-    loop {
-        let incoming = select! {
-            incoming = endpoint.accept() => incoming,
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("got ctrl-c, exiting");
-                break;
-            }
-        };
-        let Some(incoming) = incoming else {
-            break;
-        };
-        let Ok(connecting) = incoming.accept() else {
-            break;
-        };
-        let addrs = addrs.clone();
-        let handshake = !args.common.is_custom_alpn();
-        tokio::spawn(async move {
-            if let Err(cause) = handle_endpoint_accept(connecting, addrs, handshake).await {
-                // log error at warn level
-                //
-                // we should know about it, but it's not fatal
-                tracing::warn!("error handling connection: {}", cause);
-            }
-        });
-    }
-    Ok(())
-}
-
-/// Creates a ticket that only includes the id and any relay urls
-fn create_short_ticket(addr: &EndpointAddr) -> EndpointTicket {
-    let mut short = EndpointAddr::new(addr.id);
-    for relay_url in addr.relay_urls() {
-        short = short.with_relay_url(relay_url.clone());
-    }
-    short.into()
-}
-
-#[cfg(unix)]
-struct UnixSocketGuard {
-    path: PathBuf,
-}
-
-#[cfg(unix)]
-impl Drop for UnixSocketGuard {
-    fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_file(&self.path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::error!("failed to remove socket file {:?}: {}", self.path, e);
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-pub async fn connect_unix(args: ConnectUnixArgs) -> Result<()> {
-    let socket_path = args.socket_path.clone();
-    let secret_key = get_or_create_secret()?;
-    let endpoint = create_endpoint(secret_key, &args.common, vec![])
-        .await
-        .std_context("unable to bind endpoint")?;
-    tracing::info!("unix listening on {:?}", socket_path);
-
-    if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
-        eprintln!("Warning: Failed to connect to the home relay");
-    }
-
-    if let Err(e) = tokio::fs::remove_file(&socket_path).await {
-        if e.kind() != io::ErrorKind::NotFound {
-            bail_any!("failed to remove existing socket file: {}", e);
         }
     }
 
-    let addr = args.ticket.endpoint_addr();
-    tracing::info!("connecting to remote endpoint: {:?}", addr);
-    let connection = endpoint
-        .connect(addr.clone(), &args.common.alpn()?)
-        .await
-        .std_context("failed to connect to remote endpoint")?;
-    tracing::info!("connected to remote endpoint successfully");
-
-    let unix_listener = tokio::net::UnixListener::bind(&socket_path)
-        .with_std_context(|_| format!("failed to bind Unix socket at {socket_path:?}"))?;
-    tracing::info!("bound local unix socket: {:?}", socket_path);
-
-    let _guard = UnixSocketGuard {
-        path: socket_path.clone(),
-    };
-
-    async fn handle_unix_accept(
-        next: io::Result<(tokio::net::UnixStream, tokio::net::unix::SocketAddr)>,
-        connection: iroh::endpoint::Connection,
-        handshake: bool,
-    ) -> Result<()> {
-        tracing::trace!("handling new local connection");
-        let (unix_stream, unix_addr) = next.std_context("error accepting unix connection")?;
-        let (unix_recv, unix_send) = unix_stream.into_split();
-        tracing::trace!("got unix connection from {:?}", unix_addr);
-
-        tracing::trace!("opening bidi stream");
-        let (mut endpoint_send, endpoint_recv) = connection
-            .open_bi()
-            .await
-            .std_context("error opening bidi stream")?;
-        tracing::trace!("bidi stream opened");
-
-        if handshake {
-            tracing::trace!("sending handshake");
-            endpoint_send
-                .write_all(&nexapipe::HANDSHAKE)
-                .await
-                .anyerr()?;
-            tracing::trace!("handshake sent");
-        }
-
-        tracing::trace!("starting forward_bidi");
-        forward_bidi(unix_recv, unix_send, endpoint_recv, endpoint_send).await?;
-        tracing::trace!("forward_bidi finished");
-        Ok(())
-    }
-
-    tracing::info!("entering accept loop");
-    loop {
-        let next = tokio::select! {
-            stream = unix_listener.accept() => stream,
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("got ctrl-c, exiting");
-                break;
-            }
-        };
-        tracing::trace!("accepted a local connection");
-        let connection = connection.clone();
-        let handshake = !args.common.is_custom_alpn();
-        tokio::spawn(async move {
-            tracing::trace!("spawning handler task");
-            if let Err(cause) = handle_unix_accept(next, connection, handshake).await {
-                tracing::warn!("error handling connection: {}", cause);
-            }
-            tracing::trace!("handler task finished");
-        });
-    }
-
-    Ok(())
-}
-
-#[cfg(unix)]
-/// Listen on an endpoint and forward incoming connections to a Unix socket.
-async fn listen_unix(args: ListenUnixArgs) -> Result<()> {
-    let socket_path = args.socket_path.clone();
-    let secret_key = get_or_create_secret()?;
-    let endpoint = create_endpoint(secret_key, &args.common, vec![args.common.alpn()?]).await?;
-    // wait for the endpoint to figure out its address before making a ticket
-    if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
-        eprintln!("Warning: Failed to connect to the home relay");
-    }
-    let addr = endpoint.addr();
-    let short = create_short_ticket(&addr);
-    let ticket = EndpointTicket::new(addr);
-
-    // print the ticket on stderr so it doesn't interfere with the data itself
-    //
-    // note that the tests rely on the ticket being the last thing printed
-    eprintln!(
-        "Forwarding incoming requests to '{}'.",
-        socket_path.display()
-    );
-    eprintln!("To connect, use e.g.:");
-    eprintln!("nexapipe connect-unix --socket-path /path/to/client.sock {ticket}");
-    eprintln!("nexapipe connect-tcp --addr 127.0.0.1:8080 {ticket}");
-    if args.common.verbose > 0 {
-        eprintln!("or:\nnexapipe connect-unix --socket-path /path/to/client.sock {short}");
-        eprintln!("nexapipe connect-tcp --addr 127.0.0.1:8080 {short}");
-    }
-    tracing::info!("endpoint id is {}", ticket.endpoint_addr().id);
-    tracing::info!(
-        "relay url is {:?}",
-        ticket
-            .endpoint_addr()
-            .relay_urls()
-            .next()
-            .map_or("None".to_string(), |url| url.to_string())
-    );
-
-    // handle a new incoming connection on the endpoint
-    async fn handle_endpoint_accept(
-        accepting: Accepting,
-        socket_path: PathBuf,
-        handshake: bool,
-    ) -> Result<()> {
-        tracing::trace!("accepting connection");
-        let connection = accepting.await.std_context("error accepting connection")?;
-        let remote_endpoint_id = &connection.remote_id();
-        tracing::info!("got connection from {}", remote_endpoint_id);
-        let (s, mut r) = connection
-            .accept_bi()
-            .await
-            .std_context("error accepting stream")?;
-        tracing::info!("accepted bidi stream from {}", remote_endpoint_id);
-        if handshake {
-            // read the handshake and verify it
-            tracing::trace!("reading handshake");
-            let mut buf = [0u8; nexapipe::HANDSHAKE.len()];
-            r.read_exact(&mut buf).await.anyerr()?;
-            ensure_any!(buf == nexapipe::HANDSHAKE, "invalid handshake");
-            tracing::trace!("handshake verified");
-        }
-        tracing::trace!("connecting to backend socket {:?}", socket_path);
-        let connection = UnixStream::connect(&socket_path)
-            .await
-            .std_context(format!("error connecting to {socket_path:?}"))?;
-        tracing::trace!("connected to backend socket");
-        let (read, write) = connection.into_split();
-        tracing::trace!("starting forward_bidi");
-        forward_bidi(read, write, r, s).await?;
-        tracing::trace!("forward_bidi finished");
-        Ok(())
-    }
-
-    loop {
-        let incoming = select! {
-            incoming = endpoint.accept() => incoming,
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("got ctrl-c, exiting");
-                break;
-            }
-        };
-        let Some(incoming) = incoming else {
-            break;
-        };
-        let Ok(connecting) = incoming.accept() else {
-            break;
-        };
-        let socket_path = socket_path.clone();
-        let handshake = !args.common.is_custom_alpn();
-        tokio::spawn(async move {
-            if let Err(cause) = handle_endpoint_accept(connecting, socket_path, handshake).await {
-                // log error at warn level
-                //
-                // we should know about it, but it's not fatal
-                tracing::warn!("error handling connection: {}", cause);
-            }
-        });
-    }
-    Ok(())
-}
-
-async fn generate_ticket() -> Result<()> {
-    let secret_key = get_or_create_secret()?;
-    let public_key = secret_key.public();
-    let addr = EndpointAddr::new(public_key);
-    let ticket = EndpointTicket::new(addr);
-    println!("{}", ticket);
     Ok(())
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     tracing_subscriber::fmt::init();
-    let args = Args::parse();
-    let res = match args.command {
-        Commands::GenerateTicket => generate_ticket().await,
-        Commands::Listen(args) => listen_stdio(args).await,
-        Commands::ListenTcp(args) => listen_tcp(args).await,
 
-        #[cfg(unix)]
-        Commands::ListenUnix(args) => listen_unix(args).await,
-    };
-    match res {
-        Ok(()) => std::process::exit(0),
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1)
-        }
+    // 配置域名到后端的映射
+    let mut backend_routes = HashMap::<String, String>::new();
+    backend_routes.insert(
+        "gw.iroh.iakl.top".to_string(),
+        "http://127.0.0.1:9080".to_string(),
+    );
+    backend_routes.insert(
+        "gw1.iroh.iakl.top".to_string(),
+        "http://127.0.0.1:9081".to_string(),
+    );
+    backend_routes.insert(
+        "*.iroh.iakl.top".to_string(),
+        "http://127.0.0.1:9082".to_string(),
+    ); // 通配符匹配
+
+    // 默认后端
+    let default_backend = "http://127.0.0.1:9080".to_string();
+
+    tracing::info!("Starting proxy with domain-based routing");
+    tracing::info!("Routes: {:?}", backend_routes);
+    tracing::info!("Default: {}", default_backend);
+
+    if let Err(e) = run_proxy(backend_routes, default_backend).await {
+        tracing::error!("Proxy failed: {}", e);
+        std::process::exit(1);
     }
 }
