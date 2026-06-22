@@ -47,17 +47,21 @@ pub struct ProxyConfig {
 impl ProxyConfig {
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
         let path = Path::new(path);
+        tracing::debug!("Loading config from: {}", path.display());
         
         if !path.exists() {
             return Err(anyhow::anyhow!("Config file not found: {}", path.display()));
         }
         
+        tracing::debug!("Config file exists, reading content");
         let content = fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
         
+        tracing::debug!("Config content read successfully, parsing TOML");
         let config: Self = toml::from_str(&content)
             .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
         
+        tracing::debug!("Config parsed successfully: {:?}", config);
         Ok(config)
     }
 }

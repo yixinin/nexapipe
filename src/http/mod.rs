@@ -14,6 +14,13 @@ pub async fn proxy_to_backend(
     backend_url: &str,
     _verify_cert: bool,
 ) -> Result<Response<Vec<u8>>> {
+    tracing::debug!(
+        "Proxying request to backend: method={}, uri={}, backend={}",
+        req.method(),
+        req.uri(),
+        backend_url
+    );
+
     let url = Url::parse(backend_url)
         .map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
 
@@ -24,6 +31,12 @@ pub async fn proxy_to_backend(
     let port = url.port_or_known_default().unwrap_or(80);
 
     let is_https = url.scheme() == "https";
+    tracing::debug!(
+        "Backend connection: host={}, port={}, is_https={}",
+        host,
+        port,
+        is_https
+    );
 
     let path = req
         .uri()
@@ -50,9 +63,11 @@ pub async fn proxy_to_backend(
     if is_https {
         use tokio_rustls::TlsConnector;
         
+        tracing::debug!("Establishing HTTPS connection to {}:{}", host, port);
         let tcp_stream = TcpStream::connect((host.as_str(), port))
             .await
             .map_err(|e| anyhow::anyhow!("failed to connect to backend: {}", e))?;
+        tracing::debug!("TCP connection established");
 
         let mut root_certs = rustls::RootCertStore::empty();
         root_certs.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -66,22 +81,31 @@ pub async fn proxy_to_backend(
         let server_name = ServerName::try_from(host_str)
             .map_err(|e| anyhow::anyhow!("invalid server name: {}", e))?;
 
+        tracing::debug!("Starting TLS handshake");
         let mut tls_stream = connector.connect(server_name, tcp_stream).await?;
+        tracing::debug!("TLS handshake completed");
+
+        tracing::debug!("Sending request to backend, size={}", request_buf.len());
         tls_stream.write_all(&request_buf).await?;
 
         let mut response = Vec::new();
         tls_stream.read_to_end(&mut response).await?;
+        tracing::debug!("Received response from backend, size={}", response.len());
 
         parse_http_response(&response)
     } else {
+        tracing::debug!("Establishing HTTP connection to {}:{}", host, port);
         let mut tcp_stream = TcpStream::connect((host.as_str(), port))
             .await
             .map_err(|e| anyhow::anyhow!("failed to connect to backend: {}", e))?;
+        tracing::debug!("TCP connection established");
 
+        tracing::debug!("Sending request to backend, size={}", request_buf.len());
         tcp_stream.write_all(&request_buf).await?;
 
         let mut response = Vec::new();
         tcp_stream.read_to_end(&mut response).await?;
+        tracing::debug!("Received response from backend, size={}", response.len());
 
         parse_http_response(&response)
     }

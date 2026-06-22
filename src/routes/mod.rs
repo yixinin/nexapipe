@@ -163,17 +163,29 @@ impl RouteConfig {
     }
 
     pub async fn get_backend(&self, host: &str, path: &str) -> BackendInfo {
+        tracing::debug!("Looking up backend for host={}, path={}", host, path);
         let mut matched_route: Option<(&Route, u32)> = None;
 
         for route in self.routes.iter() {
             if route.matches(host, path) {
                 let priority = route.priority();
+                tracing::debug!(
+                    "Route matched: host={}, path={}, priority={}",
+                    route.host_pattern(),
+                    route.path_pattern(),
+                    priority
+                );
                 match matched_route {
                     None => {
                         matched_route = Some((route, priority));
                     }
                     Some((_, current_priority)) => {
                         if priority > current_priority {
+                            tracing::debug!(
+                                "Higher priority route found: {} > {}",
+                                priority,
+                                current_priority
+                            );
                             matched_route = Some((route, priority));
                         }
                     }
@@ -183,11 +195,23 @@ impl RouteConfig {
 
         if let Some((route, _)) = matched_route {
             let backend_url = route.backend_pool().select_backend().await;
+            tracing::debug!(
+                "Selected backend: {} for host={}, path={}",
+                backend_url,
+                host,
+                path
+            );
             BackendInfo {
                 url: backend_url.to_string(),
                 verify_cert: true,
             }
         } else {
+            tracing::debug!(
+                "No route matched, using default backend: {} for host={}, path={}",
+                self.default_backend,
+                host,
+                path
+            );
             BackendInfo {
                 url: self.default_backend.clone().to_string(),
                 verify_cert: true,

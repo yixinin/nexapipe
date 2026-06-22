@@ -15,7 +15,11 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_target(false)
+        .with_level(true)
+        .init();
 
     let cli = Cli::parse();
 
@@ -72,7 +76,14 @@ async fn run_server_mode(proxy_config: &ProxyConfig) {
     tracing::info!("Starting proxy with domain-based and path-based routing");
     tracing::info!("Default backend: {}", proxy_config.default_backend);
 
-    if let Err(e) = run_proxy(routes, proxy_config.default_backend.clone(), server_config, iroh_config).await {
+    if let Err(e) = run_proxy(
+        routes,
+        proxy_config.default_backend.clone(),
+        server_config,
+        iroh_config,
+    )
+    .await
+    {
         tracing::error!("Proxy failed: {}", e);
         std::process::exit(1);
     }

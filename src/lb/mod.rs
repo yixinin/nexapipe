@@ -26,6 +26,7 @@ impl BackendPool {
 
     pub async fn select_backend(&self) -> &str {
         if self.backends.is_empty() {
+            tracing::debug!("No backends available");
             return "";
         }
 
@@ -33,12 +34,25 @@ impl BackendPool {
             LoadBalancingStrategy::RoundRobin => {
                 let mut index = self.round_robin_index.write().await;
                 let selected = &self.backends[*index];
+                tracing::debug!(
+                    "RoundRobin selected backend: {} (index={}/{})",
+                    selected,
+                    *index,
+                    self.backends.len()
+                );
                 *index = (*index + 1) % self.backends.len();
                 selected
             }
             LoadBalancingStrategy::Random => {
                 let idx = (rand::random::<u64>() % self.backends.len() as u64) as usize;
-                &self.backends[idx]
+                let selected = &self.backends[idx];
+                tracing::debug!(
+                    "Random selected backend: {} (index={}/{})",
+                    selected,
+                    idx,
+                    self.backends.len()
+                );
+                selected
             }
         }
     }
