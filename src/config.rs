@@ -28,11 +28,20 @@ pub struct RouteConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct LocalProxyConfig {
+    pub enabled: bool,
+    pub listen_addr: String,
+    pub proxy_domains: Vec<String>,
+    pub server_ticket: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct ProxyConfig {
     pub default_backend: String,
     pub routes: Option<Vec<RouteConfig>>,
     pub server: Option<ServerConfig>,
     pub iroh: Option<IrohConfig>,
+    pub local_proxy: Option<LocalProxyConfig>,
 }
 
 impl ProxyConfig {

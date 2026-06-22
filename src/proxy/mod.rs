@@ -1,4 +1,6 @@
-use crate::config::{IrohConfig, ServerConfig};
+pub mod local_proxy;
+
+use crate::config::{IrohConfig, LocalProxyConfig, ServerConfig};
 use crate::conn;
 use crate::routes::Route;
 use crate::routes::RouteConfig;
@@ -122,6 +124,10 @@ pub async fn run_proxy(
     }
 
     Ok(())
+}
+
+pub async fn run_local_proxy(local_proxy_config: LocalProxyConfig) -> anyhow::Result<()> {
+    local_proxy::run_local_proxy(local_proxy_config).await
 }
 
 const ALPN_HTTP3: &[u8] = b"\x05http/3";

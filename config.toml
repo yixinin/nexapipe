@@ -47,3 +47,9 @@ path_pattern = "/static/"
 path_is_prefix = true
 strategy = "round_robin"
 backends = ["http://localhost:5000"]
+
+[local_proxy]
+enabled = false
+listen_addr = "127.0.0.1:8081"
+proxy_domains = ["*.example.com", "api.example.com"]
+server_ticket = ""
