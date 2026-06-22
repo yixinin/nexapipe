@@ -1,0 +1,49 @@
+default_backend = "http://localhost:8080"
+
+[iroh]
+# Relay server URL (optional)
+# 使用自定义的 relay 服务器进行连接和打洞
+relay_url = "https://relay.iroh.network"
+
+# Relay mode: "disabled", "default", "custom"
+# disabled: 不使用 relay（纯点对点连接）
+# default: 使用默认的 iroh relay
+# custom: 使用自定义 relay（需要设置 relay_url）
+relay_mode = "custom"
+
+# Bind port for iroh endpoint (optional)
+# bind_port = 4433
+
+[server]
+tls_enabled = false
+cert_path = "cert.pem"
+key_path = "key.pem"
+
+[[routes]]
+host_pattern = "*.example.com"
+path_pattern = "/"
+path_is_prefix = true
+strategy = "round_robin"
+backends = ["http://localhost:3000", "http://localhost:3001"]
+cert_path = "example.com.crt"
+key_path = "example.com.key"
+
+[[routes]]
+host_pattern = "api.example.com"
+path_pattern = "/api/"
+path_is_prefix = true
+strategy = "random"
+backends = [
+  "http://localhost:4000",
+  "http://localhost:4001",
+  "http://localhost:4002",
+]
+cert_path = "api.example.com.crt"
+key_path = "api.example.com.key"
+
+[[routes]]
+host_pattern = "static.example.com"
+path_pattern = "/static/"
+path_is_prefix = true
+strategy = "round_robin"
+backends = ["http://localhost:5000"]
