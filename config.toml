@@ -33,3 +33,26 @@ enabled = true
 listen_addr = "127.0.0.1:8081"
 proxy_domains = ["fn.iroh.iakl.top"]
 server_ticket = "endpointacomkql4qlxp4ognndujyuge2rmwjkt4swimtfcic4ha7vro24qxuaybaafaaadt5dragaiavqi2aapi4ibqcajebgfcqdvqaxqhta5o3hpeof2t5lrag"
+
+[acme]
+# Enable automatic certificate management
+enabled = false
+
+# Email address for Let's Encrypt account
+email = "your-email@example.com"
+
+# ACME directory URL (Let's Encrypt production)
+directory_url = "https://acme-v02.api.letsencrypt.org/directory"
+
+# Cloudflare API token (required for DNS challenge)
+# Create token with Zone.DNS:Edit permissions at https://dash.cloudflare.com/profile/api-tokens
+cloudflare_api_token = "your-cloudflare-api-token"
+
+# Directory to store certificates
+certs_dir = "./certs"
+
+# Renew certificate before expiry (days)
+renew_before_days = 30
+
+# Domains to obtain certificates for
+domains = ["example.com", "www.example.com"]

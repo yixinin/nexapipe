@@ -29,6 +29,13 @@ rustls-native-certs = "0.8.4"
 webpki-roots = "1.0.8"
 rustls-pemfile = "2.0"
 rustls-pki-types = "1.14.1"
+# ACME certificate management
+acme-client = { version = "0.11.0", features = ["rustls"] }
+cloudflare = { version = "0.22.0", features = ["native-tls"] }
+# Certificate utilities
+x509-parser = "0.15.0"
+chrono = { version = "0.4.38", features = ["serde"] }
+futures-util = "0.3.30"
 
 [dev-dependencies]
 duct = "1.1.1"

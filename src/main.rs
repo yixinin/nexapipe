@@ -1,4 +1,5 @@
 use clap::Parser;
+use nexapipe::acme::{AcmeConfig, AcmeManager};
 use nexapipe::config::{self, IrohConfig, LocalProxyConfig, ProxyConfig, ServerConfig};
 use nexapipe::proxy::{run_local_proxy, run_proxy};
 use nexapipe::routes::Route;
@@ -11,6 +12,9 @@ struct Cli {
 
     #[arg(long, help = "Run in client local proxy mode")]
     local_proxy: bool,
+
+    #[arg(long, help = "Obtain certificates without starting proxy")]
+    obtain_certs: bool,
 }
 
 #[tokio::main]
@@ -31,10 +35,80 @@ async fn main() {
         }
     };
 
+    if let Some(acme_config) = &proxy_config.acme {
+        if let Ok(acme_manager) = setup_acme(acme_config).await {
+            if cli.obtain_certs {
+                obtain_certs_once(&acme_manager, acme_config).await;
+                return;
+            }
+            
+            tokio::spawn(async move {
+                if let Err(e) = acme_manager.start_renewal_loop().await {
+                    tracing::error!("ACME renewal loop failed: {}", e);
+                }
+            });
+        }
+    }
+
     if cli.local_proxy {
         run_local_proxy_mode(&proxy_config).await;
     } else {
         run_server_mode(&proxy_config).await;
+    }
+}
+
+async fn setup_acme(config: &config::AcmeConfig) -> Result<AcmeManager, anyhow::Error> {
+    if !config.enabled.unwrap_or(false) {
+        return Err(anyhow::anyhow!("ACME is not enabled"));
+    }
+
+    let email = config.email.clone().ok_or_else(|| anyhow::anyhow!("ACME email is required"))?;
+    let directory_url = config.directory_url.clone()
+        .unwrap_or_else(|| "https://acme-v02.api.letsencrypt.org/directory".to_string());
+    let cloudflare_api_token = config.cloudflare_api_token.clone()
+        .ok_or_else(|| anyhow::anyhow!("Cloudflare API token is required"))?;
+    let certs_dir = config.certs_dir.clone().unwrap_or_else(|| "./certs".to_string());
+    let renew_before_days = config.renew_before_days.unwrap_or(30);
+    let domains = config.domains.clone().unwrap_or_default();
+
+    if domains.is_empty() {
+        return Err(anyhow::anyhow!("ACME domains list is empty"));
+    }
+
+    std::fs::create_dir_all(&certs_dir)?;
+
+    let acme_config = AcmeConfig {
+        enabled: true,
+        email,
+        directory_url,
+        cloudflare_api_token,
+        certs_dir,
+        renew_before_days,
+        domains,
+    };
+
+    let manager = AcmeManager::new(acme_config).await?;
+    tracing::info!("ACME manager initialized");
+
+    Ok(manager)
+}
+
+async fn obtain_certs_once(manager: &AcmeManager, config: &config::AcmeConfig) {
+    let domains = config.domains.clone().unwrap_or_default();
+    
+    for domain in domains {
+        match manager.obtain_or_renew_certificate(&domain).await {
+            Ok(info) => {
+                tracing::info!(
+                    "Successfully obtained certificate for {} (expires in {} days)",
+                    domain,
+                    info.days_remaining
+                );
+            }
+            Err(e) => {
+                tracing::error!("Failed to obtain certificate for {}: {}", domain, e);
+            }
+        }
     }
 }
 

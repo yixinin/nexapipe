@@ -10,6 +10,17 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct AcmeConfig {
+    pub enabled: Option<bool>,
+    pub email: Option<String>,
+    pub directory_url: Option<String>,
+    pub cloudflare_api_token: Option<String>,
+    pub certs_dir: Option<String>,
+    pub renew_before_days: Option<u32>,
+    pub domains: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct IrohConfig {
     pub relay_url: Option<String>,
     pub relay_mode: Option<String>,
@@ -42,6 +53,7 @@ pub struct ProxyConfig {
     pub server: Option<ServerConfig>,
     pub iroh: Option<IrohConfig>,
     pub local_proxy: Option<LocalProxyConfig>,
+    pub acme: Option<AcmeConfig>,
 }
 
 impl ProxyConfig {
