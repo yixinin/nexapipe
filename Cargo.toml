@@ -18,7 +18,7 @@ data-encoding = "2.11.0"
 n0-error = "1.0.0"
 async-trait = "0.1"
 pingora = { version = "0.8.0", features = ["rustls", "lb"] }
-anyhow = "1.0.71"
+anyhow = "1.0.103"
 http = "1.4.2"
 url = "2.5"
 toml = "1.1.2"
@@ -30,12 +30,14 @@ webpki-roots = "1.0.8"
 rustls-pemfile = "2.0"
 rustls-pki-types = "1.14.1"
 # ACME certificate management
-acme-client = { version = "0.11.0", features = ["rustls"] }
-cloudflare = { version = "0.22.0", features = ["native-tls"] }
+instant-acme = { version = "0.8.5", features = ["hyper-rustls", "aws-lc-rs"] }
+cloudflare = { version = "0.14.0" }
 # Certificate utilities
-x509-parser = "0.15.0"
+x509-parser = "0.18.1"
 chrono = { version = "0.4.38", features = ["serde"] }
 futures-util = "0.3.30"
+base64 = "0.22"
+sha1 = "0.10"
 
 [dev-dependencies]
 duct = "1.1.1"

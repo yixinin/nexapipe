@@ -4,6 +4,7 @@ use std::path::Path;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
+    pub listen_addr: Option<String>,
     pub tls_enabled: Option<bool>,
     pub cert_path: Option<String>,
     pub key_path: Option<String>,
@@ -49,6 +50,7 @@ pub struct LocalProxyConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProxyConfig {
     pub default_backend: String,
+    pub debug: Option<bool>,
     pub routes: Option<Vec<RouteConfig>>,
     pub server: Option<ServerConfig>,
     pub iroh: Option<IrohConfig>,

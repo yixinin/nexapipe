@@ -1,4 +1,5 @@
 default_backend = "http://10.0.0.72:15666"
+debug = true
 
 [iroh]
 # Relay server URL (optional)
@@ -15,6 +16,7 @@ default_backend = "http://10.0.0.72:15666"
 # bind_port = 4433
 
 [server]
+listen_addr = "0.0.0.0:8080"
 tls_enabled = false
 cert_path = ""
 key_path = ""
@@ -32,7 +34,7 @@ key_path = ""
 enabled = true
 listen_addr = "127.0.0.1:8081"
 proxy_domains = ["fn.iroh.iakl.top"]
-server_ticket = "endpointacomkql4qlxp4ognndujyuge2rmwjkt4swimtfcic4ha7vro24qxuaybaafaaadt5dragaiavqi2aapi4ibqcajebgfcqdvqaxqhta5o3hpeof2t5lrag"
+server_ticket = "endpointabtawuqygsg2pz6cccac6uxgw75tolpkmkrzqiehfm65jro6shqmgbibaafaaadtutpagaiavqofaane3ybqcajebgfcqdvrijqaaaaaaaaaaalgu3pagaibeqeyukaowfbgazohze7bfni3nktn4aybaesatcrib2yueygzu3kk3256khzknxqd"
 
 [acme]
 # Enable automatic certificate management
@@ -55,4 +57,4 @@ certs_dir = "./certs"
 renew_before_days = 30
 
 # Domains to obtain certificates for
-domains = ["example.com", "www.example.com"]
+domains = ["fn.iroh.iakl.top"]

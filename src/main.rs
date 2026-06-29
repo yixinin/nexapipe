@@ -19,21 +19,32 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_target(false)
-        .with_level(true)
-        .init();
-
     let cli = Cli::parse();
 
     let proxy_config = match ProxyConfig::from_file(&cli.config) {
         Ok(config) => config,
         Err(e) => {
-            tracing::error!("Failed to load config: {}", e);
+            eprintln!("Failed to load config: {}", e);
             std::process::exit(1);
         }
     };
+
+    let debug_enabled = proxy_config.debug.unwrap_or(false);
+    let log_filter = if debug_enabled {
+        "nexapipe=debug"
+    } else {
+        "nexapipe=info"
+    };
+
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_filter))
+        .with_target(false)
+        .with_level(true)
+        .init();
+
+    if debug_enabled {
+        tracing::info!("Debug mode enabled");
+    }
 
     if let Some(acme_config) = &proxy_config.acme {
         if let Ok(acme_manager) = setup_acme(acme_config).await {
@@ -41,7 +52,7 @@ async fn main() {
                 obtain_certs_once(&acme_manager, acme_config).await;
                 return;
             }
-            
+
             tokio::spawn(async move {
                 if let Err(e) = acme_manager.start_renewal_loop().await {
                     tracing::error!("ACME renewal loop failed: {}", e);
@@ -62,12 +73,22 @@ async fn setup_acme(config: &config::AcmeConfig) -> Result<AcmeManager, anyhow::
         return Err(anyhow::anyhow!("ACME is not enabled"));
     }
 
-    let email = config.email.clone().ok_or_else(|| anyhow::anyhow!("ACME email is required"))?;
-    let directory_url = config.directory_url.clone()
+    let email = config
+        .email
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("ACME email is required"))?;
+    let directory_url = config
+        .directory_url
+        .clone()
         .unwrap_or_else(|| "https://acme-v02.api.letsencrypt.org/directory".to_string());
-    let cloudflare_api_token = config.cloudflare_api_token.clone()
+    let cloudflare_api_token = config
+        .cloudflare_api_token
+        .clone()
         .ok_or_else(|| anyhow::anyhow!("Cloudflare API token is required"))?;
-    let certs_dir = config.certs_dir.clone().unwrap_or_else(|| "./certs".to_string());
+    let certs_dir = config
+        .certs_dir
+        .clone()
+        .unwrap_or_else(|| "./certs".to_string());
     let renew_before_days = config.renew_before_days.unwrap_or(30);
     let domains = config.domains.clone().unwrap_or_default();
 
@@ -95,7 +116,7 @@ async fn setup_acme(config: &config::AcmeConfig) -> Result<AcmeManager, anyhow::
 
 async fn obtain_certs_once(manager: &AcmeManager, config: &config::AcmeConfig) {
     let domains = config.domains.clone().unwrap_or_default();
-    
+
     for domain in domains {
         match manager.obtain_or_renew_certificate(&domain).await {
             Ok(info) => {

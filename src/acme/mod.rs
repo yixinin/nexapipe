@@ -1,23 +1,22 @@
-use acme_client::{
-    api::Directory,
-    Certificate, DirectoryUrl, Error as AcmeError, Order, Account, AccountBuilder,
-    Identifier, Authorization, DnsChallenge, ChallengeType
-};
 use anyhow::{Context, Result};
-use cloudflare::endpoints::dns::{DnsContent, DnsRecord, DnsRecordType};
-use cloudflare::framework::{
-    auth::Credentials,
-    Environment,
-    HttpApiClient,
-    HttpApiClientConfig,
+use base64::Engine;
+use chrono::{DateTime, NaiveDateTime, Utc};
+use cloudflare::endpoints::dns::dns::{
+    CreateDnsRecord, CreateDnsRecordParams, DnsContent, ListDnsRecords, ListDnsRecordsParams,
+};
+use cloudflare::endpoints::zones::zone::{ListZones, ListZonesParams};
+use cloudflare::framework::{Environment, auth::Credentials, client::async_api::Client};
+use instant_acme::{
+    Account, AuthorizationHandle, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
+    RetryPolicy,
 };
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
-use chrono::{DateTime, Utc};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct AcmeConfig {
@@ -33,7 +32,7 @@ pub struct AcmeConfig {
 pub struct AcmeManager {
     config: AcmeConfig,
     account: Arc<Mutex<Option<Account>>>,
-    client: Arc<HttpApiClient>,
+    client: Arc<Client>,
 }
 
 impl AcmeManager {
@@ -41,10 +40,10 @@ impl AcmeManager {
         let credentials = Credentials::UserAuthToken {
             token: config.cloudflare_api_token.clone(),
         };
-        
-        let client = HttpApiClient::new(
+
+        let client = Client::new(
             credentials,
-            HttpApiClientConfig::default(),
+            cloudflare::framework::client::ClientConfig::default(),
             Environment::Production,
         )?;
 
@@ -56,19 +55,25 @@ impl AcmeManager {
     }
 
     async fn get_or_create_account(&self) -> Result<Account> {
-        let mut account_guard = self.account.lock()?;
-        
+        let mut account_guard = self.account.lock().await;
+
         if let Some(account) = &*account_guard {
             return Ok(account.clone());
         }
 
-        let directory_url = DirectoryUrl::parse(&self.config.directory_url)?;
-        let directory = Directory::fetch(&directory_url).await?;
-        
-        let account = AccountBuilder::new()
-            .email(&self.config.email)
-            .terms_of_service_agreed(true)
-            .build(&directory)
+        let builder = Account::builder().context("Failed to create account builder")?;
+
+        let contact = vec![format!("mailto:{}", self.config.email)];
+        let contact_refs: Vec<&str> = contact.iter().map(|s| s.as_str()).collect();
+
+        let new_account = NewAccount {
+            contact: &contact_refs,
+            terms_of_service_agreed: true,
+            only_return_existing: false,
+        };
+
+        let (account, _credentials) = builder
+            .create(&new_account, self.config.directory_url.clone(), None)
             .await
             .context("Failed to create ACME account")?;
 
@@ -82,7 +87,7 @@ impl AcmeManager {
 
         if Path::new(&cert_path).exists() && Path::new(&key_path).exists() {
             if let Some(info) = self.check_certificate_expiry(&cert_path).await? {
-                if info.days_remaining > self.config.renew_before_days {
+                if info.days_remaining > self.config.renew_before_days as i64 {
                     tracing::info!(
                         "Certificate for {} is still valid for {} days, no renewal needed",
                         domain,
@@ -100,105 +105,134 @@ impl AcmeManager {
 
         tracing::info!("Obtaining certificate for domain: {}", domain);
         let cert_info = self.request_certificate(domain).await?;
-        
-        self.save_certificate(&cert_info, &cert_path, &key_path).await?;
+
+        self.save_certificate(&cert_info, &cert_path, &key_path)
+            .await?;
         tracing::info!("Certificate saved to {} and {}", cert_path, key_path);
-        
+
         Ok(cert_info)
     }
 
     async fn request_certificate(&self, domain: &str) -> Result<CertificateInfo> {
-        let directory_url = DirectoryUrl::parse(&self.config.directory_url)?;
-        let directory = Directory::fetch(&directory_url).await?;
         let account = self.get_or_create_account().await?;
 
-        let order = Order::new(&directory, &account, &[Identifier::Dns(domain.to_string())])
+        let identifiers = vec![Identifier::Dns(domain.to_string())];
+
+        let new_order = NewOrder::new(&identifiers);
+
+        let mut order = account
+            .new_order(&new_order)
             .await
             .context("Failed to create ACME order")?;
 
-        let authorizations = order.authorizations().await?;
-        
-        for auth in authorizations {
-            self.solve_dns_challenge(&directory, &account, &auth).await?;
+        let mut authorizations = order.authorizations();
+
+        while let Some(auth_result) = authorizations.next().await {
+            let mut auth = auth_result.context("Failed to get authorization")?;
+            self.solve_dns_challenge(&mut auth).await?;
         }
 
-        let order = order.finalize(None).await?;
-        let certificate = order.download_certificate().await?;
+        let retry_policy = RetryPolicy::default();
+
+        let status = order.poll_ready(&retry_policy).await?;
+        if status != OrderStatus::Ready {
+            return Err(anyhow::anyhow!("Order not ready, status: {:?}", status));
+        }
+
+        let cert_pem = order.finalize().await.context("Failed to finalize order")?;
+
+        let cert_der = pem_to_der(&cert_pem)?;
+
+        let expires_at = self.parse_certificate_expiry(&cert_der).await?;
+        let days_remaining = self.calculate_days_remaining(expires_at);
 
         Ok(CertificateInfo {
-            cert_der: certificate.cert_chain,
-            key_der: certificate.private_key,
-            expires_at: certificate.expiry,
-            days_remaining: self.calculate_days_remaining(certificate.expiry),
+            cert_der,
+            key_der: cert_pem.as_bytes().to_vec(),
+            expires_at,
+            days_remaining,
         })
     }
 
-    async fn solve_dns_challenge(
-        &self,
-        directory: &Directory,
-        account: &Account,
-        auth: &Authorization,
-    ) -> Result<()> {
-        let challenge = auth
-            .challenges()
-            .iter()
-            .find(|c| c.challenge_type() == ChallengeType::Dns01)
+    async fn solve_dns_challenge<'a>(&self, auth: &'a mut AuthorizationHandle<'a>) -> Result<()> {
+        let identifier = auth.identifier();
+        let dns_name = identifier.to_string();
+
+        let mut challenge = auth
+            .challenge(ChallengeType::Dns01)
             .ok_or_else(|| anyhow::anyhow!("DNS challenge not found"))?;
 
-        let dns_challenge = DnsChallenge::new(challenge);
-        let record_name = dns_challenge.dns_name();
-        let record_value = dns_challenge.dns_value();
+        let record_name = format!("_acme-challenge.{}", dns_name);
+        let key_auth = challenge.key_authorization().dns_value();
 
-        tracing::info!(
-            "Creating DNS TXT record: {} = {}",
-            record_name,
-            record_value
-        );
+        tracing::info!("Creating DNS TXT record: {} = {}", record_name, key_auth);
 
-        self.create_dns_record(&record_name, &record_value).await?;
-        
+        self.create_dns_record(&record_name, &key_auth).await?;
+
         tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
 
-        challenge.validate(directory, account).await?;
-        
+        challenge.set_ready().await?;
+
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
-        self.delete_dns_record(&record_name, &record_value).await?;
-        
+        self.delete_dns_record(&record_name, &key_auth).await?;
+
         Ok(())
     }
 
     async fn create_dns_record(&self, name: &str, value: &str) -> Result<()> {
         let zone_id = self.get_zone_id(name).await?;
-        
-        let record = DnsRecord {
-            name: name.to_string(),
-            content: DnsContent::TXT { content: value.to_string() },
-            ttl: 300,
+
+        let params = CreateDnsRecordParams {
+            name,
+            content: DnsContent::TXT {
+                content: value.to_string(),
+            },
+            ttl: Some(300),
             proxied: Some(false),
-            ..Default::default()
+            priority: None,
         };
 
+        let endpoint = CreateDnsRecord {
+            zone_identifier: &zone_id,
+            params,
+        };
         self.client
-            .create_dns_record(&zone_id, &record)
+            .request(&endpoint)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to create DNS record: {}", e))?;
-        
+
         Ok(())
     }
 
     async fn delete_dns_record(&self, name: &str, value: &str) -> Result<()> {
         let zone_id = self.get_zone_id(name).await?;
+        let params = ListDnsRecordsParams {
+            name: Some(name.to_string()),
+            ..Default::default()
+        };
+        let endpoint = ListDnsRecords {
+            zone_identifier: &zone_id,
+            params,
+        };
         let records = self
             .client
-            .list_dns_records(&zone_id)
+            .request(&endpoint)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to list DNS records: {}", e))?;
 
         for record in records.result {
-            if record.name == name && 
-               matches!(record.content, DnsContent::TXT { content } if content == value) 
+            if record.name == name
+                && matches!(record.content, DnsContent::TXT { content } if content == value)
             {
+                use cloudflare::endpoints::dns::dns::DeleteDnsRecord;
+                let endpoint = DeleteDnsRecord {
+                    zone_identifier: &zone_id,
+                    identifier: &record.id,
+                };
                 self.client
-                    .delete_dns_record(&zone_id, record.id)
+                    .request(&endpoint)
+                    .await
                     .map_err(|e| anyhow::anyhow!("Failed to delete DNS record: {}", e))?;
                 tracing::info!("Deleted DNS TXT record: {}", name);
                 return Ok(());
@@ -209,9 +243,13 @@ impl AcmeManager {
     }
 
     async fn get_zone_id(&self, name: &str) -> Result<String> {
+        let endpoint = ListZones {
+            params: ListZonesParams::default(),
+        };
         let zones = self
             .client
-            .list_zones()
+            .request(&endpoint)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to list zones: {}", e))?;
 
         let domain_parts: Vec<&str> = name.split('.').collect();
@@ -233,18 +271,9 @@ impl AcmeManager {
         cert_path: &str,
         key_path: &str,
     ) -> Result<()> {
-        let cert_pem = pem::encode(&pem::Pem {
-            tag: "CERTIFICATE".to_string(),
-            contents: cert_info.cert_der.clone(),
-        });
-
-        let key_pem = pem::encode(&pem::Pem {
-            tag: "PRIVATE KEY".to_string(),
-            contents: cert_info.key_der.clone(),
-        });
-
+        let cert_pem = der_to_pem(&cert_info.cert_der, "CERTIFICATE")?;
         fs::write(cert_path, cert_pem)?;
-        fs::write(key_path, key_pem)?;
+        fs::write(key_path, &cert_info.key_der)?;
 
         Ok(())
     }
@@ -252,7 +281,7 @@ impl AcmeManager {
     async fn check_certificate_expiry(&self, cert_path: &str) -> Result<Option<CertificateInfo>> {
         let file = File::open(cert_path)?;
         let mut reader = BufReader::new(file);
-        
+
         let cert_der: Vec<CertificateDer> = certs(&mut reader)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| anyhow::anyhow!("Failed to parse certificate: {}", e))?;
@@ -262,9 +291,23 @@ impl AcmeManager {
         }
 
         let cert = x509_parser::parse_x509_certificate(&cert_der[0].as_ref())?;
-        let not_after = cert.tbs_certificate.validity.not_after.to_datetime();
-        
-        let expires_at = DateTime::from_utc(not_after, Utc);
+        let not_after = cert.1.validity.not_after.to_datetime();
+        let naive_not_after = NaiveDateTime::new(
+            chrono::NaiveDate::from_ymd_opt(
+                not_after.year(),
+                not_after.month() as u32,
+                not_after.day() as u32,
+            )
+            .unwrap(),
+            chrono::NaiveTime::from_hms_opt(
+                not_after.hour() as u32,
+                not_after.minute() as u32,
+                not_after.second() as u32,
+            )
+            .unwrap(),
+        );
+
+        let expires_at = DateTime::from_utc(naive_not_after, Utc);
         let days_remaining = self.calculate_days_remaining(expires_at);
 
         Ok(Some(CertificateInfo {
@@ -273,6 +316,26 @@ impl AcmeManager {
             expires_at,
             days_remaining,
         }))
+    }
+
+    async fn parse_certificate_expiry(&self, cert_der: &[u8]) -> Result<DateTime<Utc>> {
+        let cert = x509_parser::parse_x509_certificate(cert_der)?;
+        let not_after = cert.1.validity.not_after.to_datetime();
+        let naive_not_after = NaiveDateTime::new(
+            chrono::NaiveDate::from_ymd_opt(
+                not_after.year(),
+                not_after.month() as u32,
+                not_after.day() as u32,
+            )
+            .unwrap(),
+            chrono::NaiveTime::from_hms_opt(
+                not_after.hour() as u32,
+                not_after.minute() as u32,
+                not_after.second() as u32,
+            )
+            .unwrap(),
+        );
+        Ok(DateTime::from_utc(naive_not_after, Utc))
     }
 
     fn calculate_days_remaining(&self, expires_at: DateTime<Utc>) -> i64 {
@@ -288,7 +351,10 @@ impl AcmeManager {
         format!("{}/{}.key", self.config.certs_dir, domain)
     }
 
-    pub async fn load_certificate(&self, domain: &str) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    pub async fn load_certificate(
+        &self,
+        domain: &str,
+    ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
         let cert_path = self.get_cert_path(domain);
         let key_path = self.get_key_path(domain);
 
@@ -313,7 +379,7 @@ impl AcmeManager {
 
     pub async fn start_renewal_loop(&self) -> Result<()> {
         let interval = tokio::time::Duration::from_hours(24);
-        
+
         loop {
             for domain in &self.config.domains {
                 match self.obtain_or_renew_certificate(domain).await {
@@ -325,15 +391,11 @@ impl AcmeManager {
                         );
                     }
                     Err(e) => {
-                        tracing::error!(
-                            "Failed to obtain/renew certificate for {}: {}",
-                            domain,
-                            e
-                        );
+                        tracing::error!("Failed to obtain/renew certificate for {}: {}", domain, e);
                     }
                 }
             }
-            
+
             tokio::time::sleep(interval).await;
         }
     }
@@ -345,4 +407,34 @@ pub struct CertificateInfo {
     pub key_der: Vec<u8>,
     pub expires_at: DateTime<Utc>,
     pub days_remaining: i64,
+}
+
+fn pem_to_der(pem_data: &str) -> Result<Vec<u8>> {
+    let mut reader = BufReader::new(pem_data.as_bytes());
+    let certs: Vec<CertificateDer> = certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("Failed to parse PEM: {}", e))?;
+
+    if certs.is_empty() {
+        return Err(anyhow::anyhow!("No certificate found in PEM data"));
+    }
+
+    Ok(certs[0].to_vec())
+}
+
+fn der_to_pem(der_data: &[u8], tag: &str) -> Result<String> {
+    use base64::engine::general_purpose::STANDARD;
+    let encoded = STANDARD.encode(der_data);
+    let lines: Vec<String> = encoded
+        .as_bytes()
+        .chunks(64)
+        .map(|chunk| String::from_utf8_lossy(chunk).to_string())
+        .collect();
+
+    Ok(format!(
+        "-----BEGIN {}-----\n{}\n-----END {}-----",
+        tag,
+        lines.join("\n"),
+        tag
+    ))
 }
