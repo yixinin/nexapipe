@@ -9,8 +9,8 @@ use crate::routes::{Route, RouteConfig};
 use crate::shutdown::ShutdownSignal;
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::client::legacy;
-use hyper_util::server::conn::auto::Builder;
 use hyper_util::rt::TokioIo;
+use hyper_util::server::conn::auto::Builder;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, RelayMap, RelayUrl};
 use iroh_tickets::Ticket;
@@ -37,15 +37,15 @@ pub async fn run_proxy(
 ) -> anyhow::Result<()> {
     let shutdown_signal = Arc::new(ShutdownSignal::new());
     let shutdown_signal_clone = shutdown_signal.clone();
-    
+
     tokio::spawn(async move {
         crate::shutdown::wait_for_shutdown_signal(shutdown_signal_clone).await;
     });
-    
+
     let config = Arc::new(RouteConfig::new(routes, default_backend.clone()));
     let http_client = Arc::new(http::create_http_client());
 
-    let mut builder = Endpoint::builder(presets::N0).alpns(vec![ALPN_HTTP3.to_vec()]);
+    let mut builder = Endpoint::builder(presets::N0).alpns(vec![ALPN_NEXAPIPE.to_vec()]);
 
     if let Some(iroh_cfg) = iroh_config {
         if let Some(port) = iroh_cfg.bind_port {
@@ -246,7 +246,7 @@ pub async fn run_proxy(
 
     tracing::info!("Waiting for existing connections to close...");
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-    
+
     Ok(())
 }
 
@@ -295,7 +295,10 @@ async fn proxy_handler(
     client: Arc<HttpClient>,
     is_https: bool,
     remote_addr: String,
-) -> Result<hyper::Response<http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, hyper::Error>>, anyhow::Error> {
+) -> Result<
+    hyper::Response<http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, hyper::Error>>,
+    anyhow::Error,
+> {
     let start = std::time::Instant::now();
     let method = req.method().to_string();
     let uri = req.uri().to_string();
@@ -313,7 +316,14 @@ async fn proxy_handler(
         Err(e) => {
             tracing::error!("Proxy request failed: {}", e);
             let duration = start.elapsed();
-            log::log_access(&remote_addr, &method, &uri, hyper::StatusCode::BAD_GATEWAY.as_u16(), duration.as_millis() as u64, 0);
+            log::log_access(
+                &remote_addr,
+                &method,
+                &uri,
+                hyper::StatusCode::BAD_GATEWAY.as_u16(),
+                duration.as_millis() as u64,
+                0,
+            );
             return Ok(http::create_error_response(
                 hyper::StatusCode::BAD_GATEWAY,
                 &format!("Proxy error: {}", e),
@@ -323,12 +333,21 @@ async fn proxy_handler(
 
     let duration = start.elapsed();
     let status = response.status().as_u16();
-    let content_length = response.headers().get("content-length")
+    let content_length = response
+        .headers()
+        .get("content-length")
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
 
-    log::log_access(&remote_addr, &method, &uri, status, duration.as_millis() as u64, content_length);
+    log::log_access(
+        &remote_addr,
+        &method,
+        &uri,
+        status,
+        duration.as_millis() as u64,
+        content_length,
+    );
 
     Ok(response)
 }
@@ -358,10 +377,13 @@ fn load_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<Arc<TlsA
         .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
     let key = PrivateKeyDer::Pkcs8(key);
 
-    let config = rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| anyhow::anyhow!("Failed to create TLS config: {}", e))?;
+    let config = rustls::ServerConfig::builder_with_protocol_versions(&[
+        &rustls::version::TLS13,
+        &rustls::version::TLS12,
+    ])
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .map_err(|e| anyhow::anyhow!("Failed to create TLS config: {}", e))?;
 
     Ok(Arc::new(TlsAcceptor::from(Arc::new(config))))
 }
@@ -414,4 +436,4 @@ async fn start_https_server(
     Ok(())
 }
 
-const ALPN_HTTP3: &[u8] = b"\x05http/3";
+const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-const ALPN_HTTP3: &[u8] = b"\x05http/3";
+const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024 * 10; // 10MB
 
 pub async fn run_local_proxy(config: LocalProxyConfig) -> anyhow::Result<()> {
@@ -112,7 +112,7 @@ async fn handle_local_connection(
             .await?;
 
         // Establish bidirectional Iroh stream for tunneling
-        let conn = ep.connect(endpoint_addr, ALPN_HTTP3).await?;
+        let conn = ep.connect(endpoint_addr, ALPN_NEXAPIPE).await?;
         let (send, recv) = conn.open_bi().await?;
 
         // Forward data bidirectionally through the tunnel
@@ -139,7 +139,7 @@ async fn handle_local_connection(
     let host = target_host.unwrap();
     tracing::info!("Proxying request for host: {}", host);
 
-    let conn = ep.connect(endpoint_addr, ALPN_HTTP3).await?;
+    let conn = ep.connect(endpoint_addr, ALPN_NEXAPIPE).await?;
     let (mut send, mut recv) = conn.open_bi().await?;
 
     let mut modified_request = Vec::with_capacity(n);
