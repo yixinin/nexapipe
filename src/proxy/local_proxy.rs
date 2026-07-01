@@ -84,7 +84,7 @@ async fn handle_local_connection(
     let request_str = String::from_utf8_lossy(&buf[..n]);
     tracing::debug!("Request: {}", request_str);
 
-    let request = match http::parse_http_request(&buf[..n]) {
+    let request = match http::parse_http_request_legacy(&buf[..n]) {
         Ok(req) => req,
         Err(e) => {
             tracing::warn!("Failed to parse HTTP request: {}", e);
@@ -158,7 +158,7 @@ async fn handle_local_connection(
         }
     }
 
-    if http::is_websocket_request(&request) {
+    if http::is_websocket_request_static(&request) {
         tracing::debug!("WebSocket request detected, handling bidirectional stream");
         handle_local_websocket(stream, send, recv, &modified_request).await?;
     } else {

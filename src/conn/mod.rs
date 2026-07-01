@@ -1,20 +1,27 @@
 use crate::http;
 use crate::routes::{BackendInfo, RouteConfig};
 use ::http::Request;
+use hyper_util::client::legacy;
 use iroh::endpoint::{Connection, Incoming};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+type HttpClient = legacy::Client<
+    hyper_rustls::HttpsConnector<legacy::connect::HttpConnector>,
+    http_body_util::Full<bytes::Bytes>,
+>;
 
 pub async fn handle_bidi_stream(
     send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
     config: &RouteConfig,
+    _client: &HttpClient,
 ) -> anyhow::Result<()> {
     let mut recv = recv;
     let mut buf = Vec::new();
     let mut line_buf = Vec::new();
     let mut temp_byte = [0u8; 1];
-    
+
     loop {
         match recv.read(&mut temp_byte).await {
             Ok(None) => break,
@@ -22,7 +29,7 @@ pub async fn handle_bidi_stream(
                 let byte = temp_byte[0];
                 buf.push(byte);
                 line_buf.push(byte);
-                
+
                 if line_buf.len() >= 4 {
                     let last_four = &line_buf[line_buf.len() - 4..];
                     if last_four == b"\r\n\r\n" {
@@ -41,15 +48,12 @@ pub async fn handle_bidi_stream(
         }
     }
 
-    tracing::debug!(
-        "Iroh stream data received - bytes_read: {}",
-        buf.len()
-    );
+    tracing::debug!("Iroh stream data received - bytes_read: {}", buf.len());
 
     let request_str = String::from_utf8_lossy(&buf);
     tracing::debug!("Raw Iroh request:\n{}", request_str);
 
-    let request = http::parse_http_request(&buf)?;
+    let request = http::parse_http_request_legacy(&buf)?;
 
     let host = request
         .headers()
@@ -66,8 +70,12 @@ pub async fn handle_bidi_stream(
     let backend_info: BackendInfo = match host {
         Some(h) => config.get_backend(h, path).await,
         None => BackendInfo {
-            url: config.default_backend().to_string(),
+            url: config.default_backend().await,
             verify_cert: true,
+            path_rewrite: None,
+            redirect_to_https: false,
+            path_pattern: "/".to_string(),
+            path_is_prefix: true,
         },
     };
 
@@ -80,14 +88,16 @@ pub async fn handle_bidi_stream(
     );
     tracing::debug!("Received request: {} {}", request.method(), request.uri());
 
-    if http::is_websocket_request(&request) {
+    if http::is_websocket_request_static(&request) {
         tracing::debug!("WebSocket request detected");
         handle_websocket_stream(send, recv, &request, &backend_info.url).await?;
     } else {
         let mut send = send;
-        let response = http::proxy_to_backend(&request, &backend_info.url, backend_info.verify_cert).await?;
+        let response =
+            http::proxy_to_backend_legacy(&request, &backend_info.url, backend_info.verify_cert)
+                .await?;
         tracing::debug!("Proxy response status: {}", response.status());
-        http::send_response(&mut send, &response).await?;
+        http::send_response_legacy(&mut send, &response).await?;
     }
 
     Ok(())
@@ -99,8 +109,8 @@ async fn handle_websocket_stream(
     req: &Request<()>,
     backend_url: &str,
 ) -> anyhow::Result<()> {
-    let url = url::Url::parse(backend_url)
-        .map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
+    let url =
+        url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
 
     let host = url
         .host_str()
@@ -140,23 +150,21 @@ async fn handle_websocket_stream(
 
     let mut response_buf = Vec::new();
     let mut line_buf = Vec::new();
-    let mut header_done = false;
-    
+
     loop {
         let byte = backend_stream.read_u8().await?;
         response_buf.push(byte);
         line_buf.push(byte);
-        
+
         if line_buf.len() >= 4 {
             let last_four = &line_buf[line_buf.len() - 4..];
             if last_four == b"\r\n\r\n" {
-                header_done = true;
                 break;
             }
         }
     }
 
-    let response = http::parse_http_response(&response_buf)?;
+    let response = http::parse_http_response_legacy(&response_buf)?;
     if response.status().as_u16() == 101 {
         tracing::debug!("WebSocket handshake successful with backend");
         send.write_all(&response_buf).await?;
@@ -207,7 +215,10 @@ async fn handle_websocket_stream(
             _ = backend_to_iroh => (),
         }
     } else {
-        tracing::debug!("WebSocket handshake failed with backend, status: {}", response.status());
+        tracing::debug!(
+            "WebSocket handshake failed with backend, status: {}",
+            response.status()
+        );
         send.write_all(&response_buf).await?;
         send.finish()?;
     }
@@ -215,7 +226,11 @@ async fn handle_websocket_stream(
     Ok(())
 }
 
-pub async fn handle_connection(conn: Connection, config: Arc<RouteConfig>) {
+pub async fn handle_connection(
+    conn: Connection,
+    config: Arc<RouteConfig>,
+    client: Arc<HttpClient>,
+) {
     let peer_id = conn.remote_id();
     tracing::info!("New connection from peer: {}", peer_id);
     tracing::debug!("Iroh connection info - peer_id: {}", peer_id);
@@ -224,8 +239,11 @@ pub async fn handle_connection(conn: Connection, config: Arc<RouteConfig>) {
         match conn.accept_bi().await {
             Ok((mut send, mut recv)) => {
                 let config_clone = config.clone();
+                let client_clone = client.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_bidi_stream(send, recv, &config_clone).await {
+                    if let Err(e) =
+                        handle_bidi_stream(send, recv, &config_clone, &client_clone).await
+                    {
                         tracing::error!("Failed to handle stream from {}: {}", peer_id, e);
                     }
                 });
@@ -244,12 +262,16 @@ pub async fn handle_connection(conn: Connection, config: Arc<RouteConfig>) {
     tracing::info!("Connection closed for peer: {}", peer_id);
 }
 
-pub async fn handle_incoming(incoming: Incoming, config: Arc<RouteConfig>) {
+pub async fn handle_incoming(
+    incoming: Incoming,
+    config: Arc<RouteConfig>,
+    client: Arc<HttpClient>,
+) {
     match incoming.accept() {
         Ok(accepting) => match accepting.await {
             Ok(conn) => {
                 tokio::spawn(async move {
-                    handle_connection(conn, config).await;
+                    handle_connection(conn, config, client).await;
                 });
             }
             Err(e) => {

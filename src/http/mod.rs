@@ -1,31 +1,259 @@
-use ::http::Request;
-use ::http::Response;
-use anyhow::Result;
-use base64::{Engine as _, engine::general_purpose};
-use rustls::ClientConfig;
-use rustls_pki_types::ServerName;
-use sha1::{Digest, Sha1};
+use crate::routes::{BackendInfo, RouteConfig};
+use ::http::{Request, Response, StatusCode};
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper_rustls::HttpsConnectorBuilder;
+use std::io::Write;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use url::Url;
 
-const MAX_REQUEST_SIZE: usize = 1024 * 1024;
-const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+pub type HttpClient = hyper_util::client::legacy::Client<
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    Full<bytes::Bytes>,
+>;
 
-pub async fn proxy_to_backend(
+pub fn create_http_client() -> HttpClient {
+    let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
+    http_connector.set_nodelay(true);
+    http_connector.set_keepalive(Some(std::time::Duration::from_secs(30)));
+    http_connector.enforce_http(false);
+
+    let https = HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .expect("no native root CA certificates found")
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .wrap_connector(http_connector);
+
+    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .pool_max_idle_per_host(10)
+        .pool_idle_timeout(Some(std::time::Duration::from_secs(60)))
+        .http1_title_case_headers(true)
+        .http1_ignore_invalid_headers_in_responses(true)
+        .build(https)
+}
+
+pub async fn proxy_request(
+    client: &HttpClient,
+    req: Request<Incoming>,
+    config: Arc<RouteConfig>,
+    is_https: bool,
+) -> Result<
+    Response<http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, hyper::Error>>,
+    anyhow::Error,
+> {
+    let host = req
+        .headers()
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .map(|h| h.split(':').next().unwrap_or(h))
+        .ok_or_else(|| anyhow::anyhow!("Missing host header"))?;
+
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or(req.uri().path());
+
+    let accept_encoding = req
+        .headers()
+        .get("accept-encoding")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+    let headers_clone = req.headers().clone();
+    let method = req.method().clone();
+
+    let backend_info: BackendInfo = config.get_backend(host, path).await;
+
+    if backend_info.redirect_to_https && !is_https {
+        let redirect_url = format!("https://{}{}", host, path);
+        tracing::debug!("Redirecting to HTTPS: {}", redirect_url);
+        return Ok(create_redirect_response(&redirect_url));
+    }
+
+    let rewritten_path = if let Some(rewrite_pattern) = &backend_info.path_rewrite {
+        if backend_info.path_is_prefix && path.starts_with(&backend_info.path_pattern) {
+            let suffix = &path[backend_info.path_pattern.len()..];
+            rewrite_pattern.replace("{}", suffix)
+        } else if !backend_info.path_is_prefix && path == backend_info.path_pattern {
+            rewrite_pattern.replace("{}", "")
+        } else {
+            path.to_string()
+        }
+    } else {
+        path.to_string()
+    };
+
+    let backend_url = url::Url::parse(&backend_info.url)
+        .map_err(|e| anyhow::anyhow!("Invalid backend URL: {}", e))?;
+
+    let backend_scheme = backend_url.scheme();
+    let backend_host = backend_url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("Backend URL missing host"))?;
+    let backend_port = backend_url.port_or_known_default().unwrap_or(80);
+
+    let new_uri = format!(
+        "{}://{}:{}{}",
+        backend_scheme, backend_host, backend_port, rewritten_path
+    )
+    .parse::<http::Uri>()
+    .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
+
+    let body = req.into_body().collect().await?.to_bytes();
+
+    let mut builder = Request::builder().method(method).uri(new_uri);
+
+    for (name, value) in headers_clone.iter() {
+        if name.as_str().to_lowercase() != "host" {
+            builder = builder.header(name, value);
+        }
+    }
+    builder = builder.header("host", backend_host);
+
+    let proxied_req = builder.body(Full::new(body))?;
+
+    tracing::debug!(
+        "Proxying request: {} {} -> {}://{}:{}",
+        proxied_req.method(),
+        proxied_req.uri(),
+        backend_scheme,
+        backend_host,
+        backend_port
+    );
+
+    let response = client.request(proxied_req).await?;
+
+    let content_encoding = response.headers().get("content-encoding");
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|h| h.to_str().ok());
+
+    if content_encoding.is_none() && should_compress(content_type) {
+        if let Some(encodings) = accept_encoding {
+            if encodings.contains("gzip") {
+                return Ok(compress_response(response, "gzip").await);
+            }
+        }
+    }
+
+    Ok(response.map(|body| http_body_util::BodyExt::boxed_unsync(body)))
+}
+
+fn should_compress(content_type: Option<&str>) -> bool {
+    if let Some(ct) = content_type {
+        ct.starts_with("text/")
+            || ct.contains("application/json")
+            || ct.contains("application/javascript")
+            || ct.contains("application/xml")
+            || ct.contains("application/xhtml")
+    } else {
+        false
+    }
+}
+
+async fn compress_response(
+    response: Response<hyper::body::Incoming>,
+    encoding: &str,
+) -> Response<http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, hyper::Error>> {
+    let (parts, body) = response.into_parts();
+    let bytes = body.collect().await.unwrap().to_bytes();
+
+    let compressed_bytes = {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&bytes).unwrap();
+        encoder.finish().unwrap()
+    };
+
+    let mut new_parts = parts;
+    new_parts.headers.remove("content-encoding");
+    new_parts.headers.remove("content-length");
+    new_parts
+        .headers
+        .insert("content-encoding", encoding.parse().unwrap());
+
+    Response::from_parts(
+        new_parts,
+        http_body_util::BodyExt::boxed_unsync(
+            Full::new(compressed_bytes.into()).map_err(|_| unreachable!()),
+        ),
+    )
+}
+
+pub fn create_error_response(
+    status: StatusCode,
+    message: &str,
+) -> Response<http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, hyper::Error>> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/plain")
+        .body(http_body_util::BodyExt::boxed_unsync(
+            Full::new(message.as_bytes().to_vec().into()).map_err(|_| unreachable!()),
+        ))
+        .unwrap()
+}
+
+pub fn create_redirect_response(
+    url: &str,
+) -> Response<http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, hyper::Error>> {
+    Response::builder()
+        .status(StatusCode::PERMANENT_REDIRECT)
+        .header("location", url)
+        .header("content-type", "text/html")
+        .body(http_body_util::BodyExt::boxed_unsync(
+            Full::new(
+                format!(
+                    "<html><body>Redirecting to <a href=\"{}\">{}</a></body></html>",
+                    url, url
+                )
+                .into_bytes()
+                .into(),
+            )
+            .map_err(|_| unreachable!()),
+        ))
+        .unwrap()
+}
+
+pub fn is_websocket_request(req: &Request<Incoming>) -> bool {
+    if let Some(upgrade) = req.headers().get("upgrade") {
+        if let Ok(upgrade_str) = upgrade.to_str() {
+            if upgrade_str.to_lowercase() == "websocket" {
+                if let Some(connection) = req.headers().get("connection") {
+                    if let Ok(connection_str) = connection.to_str() {
+                        return connection_str.to_lowercase().contains("upgrade");
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+pub fn is_websocket_request_static(req: &Request<()>) -> bool {
+    if let Some(upgrade) = req.headers().get("upgrade") {
+        if let Ok(upgrade_str) = upgrade.to_str() {
+            if upgrade_str.to_lowercase() == "websocket" {
+                if let Some(connection) = req.headers().get("connection") {
+                    if let Ok(connection_str) = connection.to_str() {
+                        return connection_str.to_lowercase().contains("upgrade");
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+pub async fn proxy_to_backend_legacy(
     req: &Request<()>,
     backend_url: &str,
     _verify_cert: bool,
-) -> Result<Response<Vec<u8>>> {
-    tracing::debug!(
-        "Proxying request to backend: method={}, uri={}, backend={}",
-        req.method(),
-        req.uri(),
-        backend_url
-    );
-
-    let url = Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
+) -> Result<Response<Vec<u8>>, anyhow::Error> {
+    let url =
+        url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
 
     let host = url
         .host_str()
@@ -34,12 +262,6 @@ pub async fn proxy_to_backend(
     let port = url.port_or_known_default().unwrap_or(80);
 
     let is_https = url.scheme() == "https";
-    tracing::debug!(
-        "Backend connection: host={}, port={}, is_https={}",
-        host,
-        port,
-        is_https
-    );
 
     let path = req
         .uri()
@@ -70,79 +292,52 @@ pub async fn proxy_to_backend(
     request_buf.extend_from_slice(b"Connection: close\r\n");
     request_buf.extend_from_slice(b"\r\n");
 
-    let outgoing_request_str = String::from_utf8_lossy(&request_buf);
-    tracing::debug!("Outgoing request to backend:\n{}", outgoing_request_str);
-
     if is_https {
         use tokio_rustls::TlsConnector;
 
-        tracing::debug!("Establishing HTTPS connection to {}:{}", host, port);
-        let tcp_stream = TcpStream::connect((host.as_str(), port))
+        let tcp_stream = tokio::net::TcpStream::connect((host.as_str(), port))
             .await
             .map_err(|e| anyhow::anyhow!("failed to connect to backend: {}", e))?;
-        let tcp_peer_addr = tcp_stream.peer_addr()?;
-        let tcp_local_addr = tcp_stream.local_addr()?;
-        tracing::debug!(
-            "TCP connection established - peer: {}, local: {}",
-            tcp_peer_addr,
-            tcp_local_addr
-        );
 
         let mut root_certs = rustls::RootCertStore::empty();
         root_certs.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let config = ClientConfig::builder()
+        let config = rustls::ClientConfig::builder()
             .with_root_certificates(root_certs)
             .with_no_client_auth();
 
         let connector = TlsConnector::from(Arc::new(config));
         let host_str: &'static str = Box::leak(host.clone().into_boxed_str());
-        let server_name = ServerName::try_from(host_str)
+        let server_name = rustls_pki_types::ServerName::try_from(host_str)
             .map_err(|e| anyhow::anyhow!("invalid server name: {}", e))?;
 
-        tracing::debug!("Starting TLS handshake");
         let mut tls_stream = connector.connect(server_name, tcp_stream).await?;
-        tracing::debug!("TLS handshake completed");
 
-        tracing::debug!("Sending request to backend, size={}", request_buf.len());
+        use tokio::io::AsyncWriteExt;
         tls_stream.write_all(&request_buf).await?;
 
         let mut response = Vec::new();
+        use tokio::io::AsyncReadExt;
         tls_stream.read_to_end(&mut response).await?;
-        tracing::debug!("Received response from backend, size={}", response.len());
 
-        let response_str = String::from_utf8_lossy(&response);
-        tracing::debug!("Raw response from backend:\n{}", response_str);
-
-        parse_http_response(&response)
+        parse_http_response_legacy(&response)
     } else {
-        tracing::debug!("Establishing HTTP connection to {}:{}", host, port);
-        let mut tcp_stream = TcpStream::connect((host.as_str(), port))
+        let mut tcp_stream = tokio::net::TcpStream::connect((host.as_str(), port))
             .await
             .map_err(|e| anyhow::anyhow!("failed to connect to backend: {}", e))?;
-        let tcp_peer_addr = tcp_stream.peer_addr()?;
-        let tcp_local_addr = tcp_stream.local_addr()?;
-        tracing::debug!(
-            "TCP connection established - peer: {}, local: {}",
-            tcp_peer_addr,
-            tcp_local_addr
-        );
 
-        tracing::debug!("Sending request to backend, size={}", request_buf.len());
+        use tokio::io::AsyncWriteExt;
         tcp_stream.write_all(&request_buf).await?;
 
         let mut response = Vec::new();
+        use tokio::io::AsyncReadExt;
         tcp_stream.read_to_end(&mut response).await?;
-        tracing::debug!("Received response from backend, size={}", response.len());
 
-        let response_str = String::from_utf8_lossy(&response);
-        tracing::debug!("Raw response from backend:\n{}", response_str);
-
-        parse_http_response(&response)
+        parse_http_response_legacy(&response)
     }
 }
 
-pub fn parse_http_response(response: &[u8]) -> Result<Response<Vec<u8>>> {
+pub fn parse_http_response_legacy(response: &[u8]) -> Result<Response<Vec<u8>>, anyhow::Error> {
     let response_str = String::from_utf8_lossy(response);
     let mut lines = response_str.split("\r\n");
 
@@ -182,7 +377,7 @@ pub fn parse_http_response(response: &[u8]) -> Result<Response<Vec<u8>>> {
     Ok(builder.body(body)?)
 }
 
-pub fn parse_http_request(buf: &[u8]) -> Result<Request<()>> {
+pub fn parse_http_request_legacy(buf: &[u8]) -> Result<Request<()>, anyhow::Error> {
     let request_str = String::from_utf8_lossy(buf);
     let mut lines = request_str.split("\r\n");
 
@@ -213,10 +408,10 @@ pub fn parse_http_request(buf: &[u8]) -> Result<Request<()>> {
     Ok(builder.body(())?)
 }
 
-pub async fn send_response(
+pub async fn send_response_legacy(
     send: &mut iroh::endpoint::SendStream,
     response: &Response<Vec<u8>>,
-) -> Result<()> {
+) -> Result<(), anyhow::Error> {
     let status = response.status();
     let status_text = status.canonical_reason().unwrap_or("Unknown");
 
@@ -236,111 +431,6 @@ pub async fn send_response(
 
     send.write_all(&response_buf).await?;
     send.finish()?;
-
-    Ok(())
-}
-
-pub fn get_max_request_size() -> usize {
-    MAX_REQUEST_SIZE
-}
-
-pub fn is_websocket_request(req: &Request<()>) -> bool {
-    if let Some(upgrade) = req.headers().get("upgrade") {
-        if let Ok(upgrade_str) = upgrade.to_str() {
-            if upgrade_str.to_lowercase() == "websocket" {
-                if let Some(connection) = req.headers().get("connection") {
-                    if let Ok(connection_str) = connection.to_str() {
-                        return connection_str.to_lowercase().contains("upgrade");
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
-pub fn build_websocket_accept_key(key: &str) -> String {
-    let mut sha1 = Sha1::new();
-    sha1.update(key.as_bytes());
-    sha1.update(WEBSOCKET_GUID.as_bytes());
-    let hash = sha1.finalize();
-    general_purpose::STANDARD.encode(hash)
-}
-
-pub fn build_websocket_handshake_response(req: &Request<()>) -> Response<Vec<u8>> {
-    let key = req
-        .headers()
-        .get("sec-websocket-key")
-        .and_then(|k| k.to_str().ok())
-        .unwrap_or("");
-    let accept = build_websocket_accept_key(key);
-
-    Response::builder()
-        .status(101)
-        .header("Upgrade", "websocket")
-        .header("Connection", "Upgrade")
-        .header("Sec-WebSocket-Accept", accept)
-        .body(Vec::new())
-        .unwrap()
-}
-
-pub async fn websocket_proxy(
-    mut client_stream: tokio::net::TcpStream,
-    mut backend_stream: tokio::net::TcpStream,
-) -> Result<()> {
-    let (mut client_read, mut client_write) = tokio::io::split(client_stream);
-    let (mut backend_read, mut backend_write) = tokio::io::split(backend_stream);
-
-    let client_to_backend = async {
-        let mut buf = [0u8; 8192];
-        loop {
-            match client_read.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if let Err(e) = backend_write.write_all(&buf[..n]).await {
-                        tracing::debug!("WebSocket client_to_backend error: {}", e);
-                        break;
-                    }
-                    if let Err(e) = backend_write.flush().await {
-                        tracing::debug!("WebSocket client_to_backend flush error: {}", e);
-                        break;
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("WebSocket client_to_backend read error: {}", e);
-                    break;
-                }
-            }
-        }
-    };
-
-    let backend_to_client = async {
-        let mut buf = [0u8; 8192];
-        loop {
-            match backend_read.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if let Err(e) = client_write.write_all(&buf[..n]).await {
-                        tracing::debug!("WebSocket backend_to_client error: {}", e);
-                        break;
-                    }
-                    if let Err(e) = client_write.flush().await {
-                        tracing::debug!("WebSocket backend_to_client flush error: {}", e);
-                        break;
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("WebSocket backend_to_client read error: {}", e);
-                    break;
-                }
-            }
-        }
-    };
-
-    tokio::select! {
-        _ = client_to_backend => (),
-        _ = backend_to_client => (),
-    }
 
     Ok(())
 }

@@ -2,6 +2,7 @@ use crate::lb::{BackendPool, LoadBalancingStrategy};
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Clone)]
 pub struct Route {
@@ -13,6 +14,8 @@ pub struct Route {
     key_path: Option<String>,
     certs: Arc<Option<Vec<CertificateDer<'static>>>>,
     key: Arc<Option<PrivateKeyDer<'static>>>,
+    path_rewrite: Option<String>,
+    redirect_to_https: bool,
 }
 
 impl Route {
@@ -24,6 +27,8 @@ impl Route {
         strategy: LoadBalancingStrategy,
         cert_path: Option<String>,
         key_path: Option<String>,
+        path_rewrite: Option<String>,
+        redirect_to_https: bool,
     ) -> Self {
         let (certs, key) = load_certs_keys(&cert_path, &key_path);
         
@@ -36,6 +41,8 @@ impl Route {
             key_path,
             certs: Arc::new(certs),
             key: Arc::new(key),
+            path_rewrite,
+            redirect_to_https,
         }
     }
 
@@ -99,6 +106,29 @@ impl Route {
     pub fn has_cert(&self) -> bool {
         self.certs.is_some() && self.key.is_some()
     }
+
+    pub fn path_rewrite(&self) -> &Option<String> {
+        &self.path_rewrite
+    }
+
+    pub fn redirect_to_https(&self) -> bool {
+        self.redirect_to_https
+    }
+
+    pub fn rewrite_path(&self, original_path: &str) -> String {
+        if let Some(rewrite_pattern) = &self.path_rewrite {
+            if self.path_is_prefix && original_path.starts_with(&self.path_pattern) {
+                let suffix = &original_path[self.path_pattern.len()..];
+                rewrite_pattern.replace("{}", suffix)
+            } else if !self.path_is_prefix && original_path == self.path_pattern {
+                rewrite_pattern.replace("{}", "")
+            } else {
+                original_path.to_string()
+            }
+        } else {
+            original_path.to_string()
+        }
+    }
 }
 
 fn load_certs_keys(cert_path: &Option<String>, key_path: &Option<String>) -> (Option<Vec<CertificateDer<'static>>>, Option<PrivateKeyDer<'static>>) {
@@ -146,54 +176,63 @@ fn load_keys(path: &str) -> anyhow::Result<Vec<PrivateKeyDer<'static>>> {
 pub struct BackendInfo {
     pub url: String,
     pub verify_cert: bool,
+    pub path_rewrite: Option<String>,
+    pub redirect_to_https: bool,
+    pub path_pattern: String,
+    pub path_is_prefix: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct RouteConfig {
-    routes: Arc<Vec<Route>>,
-    default_backend: Arc<String>,
+    routes: Arc<RwLock<Vec<Route>>>,
+    default_backend: Arc<RwLock<String>>,
 }
 
 impl RouteConfig {
     pub fn new(routes: Vec<Route>, default_backend: String) -> Self {
         Self {
-            routes: Arc::new(routes),
-            default_backend: Arc::new(default_backend),
+            routes: Arc::new(RwLock::new(routes)),
+            default_backend: Arc::new(RwLock::new(default_backend)),
         }
     }
 
     pub async fn get_backend(&self, host: &str, path: &str) -> BackendInfo {
         tracing::debug!("Looking up backend for host={}, path={}", host, path);
-        let mut matched_route: Option<(&Route, u32)> = None;
+        
+        let matched_route_info = {
+            let routes = self.routes.read().await;
+            let mut matched_route: Option<(Route, u32)> = None;
 
-        for route in self.routes.iter() {
-            if route.matches(host, path) {
-                let priority = route.priority();
-                tracing::debug!(
-                    "Route matched: host={}, path={}, priority={}",
-                    route.host_pattern(),
-                    route.path_pattern(),
-                    priority
-                );
-                match matched_route {
-                    None => {
-                        matched_route = Some((route, priority));
-                    }
-                    Some((_, current_priority)) => {
-                        if priority > current_priority {
-                            tracing::debug!(
-                                "Higher priority route found: {} > {}",
-                                priority,
-                                current_priority
-                            );
-                            matched_route = Some((route, priority));
+            for route in routes.iter() {
+                if route.matches(host, path) {
+                    let priority = route.priority();
+                    tracing::debug!(
+                        "Route matched: host={}, path={}, priority={}",
+                        route.host_pattern(),
+                        route.path_pattern(),
+                        priority
+                    );
+                    match matched_route {
+                        None => {
+                            matched_route = Some((route.clone(), priority));
+                        }
+                        Some((_, current_priority)) => {
+                            if priority > current_priority {
+                                tracing::debug!(
+                                    "Higher priority route found: {} > {}",
+                                    priority,
+                                    current_priority
+                                );
+                                matched_route = Some((route.clone(), priority));
+                            }
                         }
                     }
                 }
             }
-        }
+            matched_route
+        };
 
-        if let Some((route, _)) = matched_route {
+        if let Some((route, _)) = matched_route_info {
             let backend_url = route.backend_pool().select_backend().await;
             tracing::debug!(
                 "Selected backend: {} for host={}, path={}",
@@ -202,37 +241,59 @@ impl RouteConfig {
                 path
             );
             BackendInfo {
-                url: backend_url.to_string(),
+                url: backend_url,
                 verify_cert: true,
+                path_rewrite: route.path_rewrite().clone(),
+                redirect_to_https: route.redirect_to_https(),
+                path_pattern: route.path_pattern().to_string(),
+                path_is_prefix: route.path_is_prefix(),
             }
         } else {
+            let default_backend = self.default_backend.read().await.clone();
             tracing::debug!(
                 "No route matched, using default backend: {} for host={}, path={}",
-                self.default_backend,
+                default_backend,
                 host,
                 path
             );
             BackendInfo {
-                url: self.default_backend.clone().to_string(),
+                url: default_backend,
                 verify_cert: true,
+                path_rewrite: None,
+                redirect_to_https: false,
+                path_pattern: "/".to_string(),
+                path_is_prefix: true,
             }
         }
     }
 
-    pub fn routes(&self) -> &Vec<Route> {
-        &self.routes
+    pub async fn routes(&self) -> Vec<Route> {
+        self.routes.read().await.clone()
     }
 
-    pub fn default_backend(&self) -> &str {
-        &self.default_backend
+    pub async fn default_backend(&self) -> String {
+        self.default_backend.read().await.clone()
     }
 
-    pub async fn get_route_for_host(&self, host: &str) -> Option<&Route> {
-        for route in self.routes.iter() {
+    pub async fn get_route_for_host(&self, host: &str) -> Option<Route> {
+        let routes = self.routes.read().await;
+        for route in routes.iter() {
             if route.matches(host, "/") {
-                return Some(route);
+                return Some(route.clone());
             }
         }
         None
+    }
+
+    pub async fn update_routes(&self, new_routes: Vec<Route>) {
+        let mut routes = self.routes.write().await;
+        *routes = new_routes;
+        tracing::info!("Routes updated successfully");
+    }
+
+    pub async fn update_default_backend(&self, new_default: String) {
+        let mut default_backend = self.default_backend.write().await;
+        *default_backend = new_default.clone();
+        tracing::info!("Default backend updated to: {}", new_default);
     }
 }

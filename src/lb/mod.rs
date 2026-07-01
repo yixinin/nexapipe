@@ -9,52 +9,104 @@ pub enum LoadBalancingStrategy {
 }
 
 #[derive(Debug, Clone)]
+pub struct BackendStatus {
+    url: String,
+    healthy: bool,
+    last_check: Option<std::time::Instant>,
+    consecutive_failures: usize,
+}
+
+impl BackendStatus {
+    pub fn new(url: String) -> Self {
+        BackendStatus {
+            url,
+            healthy: true,
+            last_check: None,
+            consecutive_failures: 0,
+        }
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.healthy
+    }
+
+    pub fn mark_healthy(&mut self) {
+        self.healthy = true;
+        self.consecutive_failures = 0;
+        self.last_check = Some(std::time::Instant::now());
+    }
+
+    pub fn mark_unhealthy(&mut self) {
+        self.healthy = false;
+        self.consecutive_failures += 1;
+        self.last_check = Some(std::time::Instant::now());
+    }
+
+    pub fn consecutive_failures(&self) -> usize {
+        self.consecutive_failures
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct BackendPool {
-    backends: Vec<String>,
+    backends: Vec<Arc<RwLock<BackendStatus>>>,
     strategy: LoadBalancingStrategy,
     round_robin_index: Arc<RwLock<usize>>,
 }
 
 impl BackendPool {
     pub fn new(backends: Vec<String>, strategy: LoadBalancingStrategy) -> Self {
+        let backend_statuses = backends
+            .into_iter()
+            .map(|url| Arc::new(RwLock::new(BackendStatus::new(url))))
+            .collect();
+
         BackendPool {
-            backends,
+            backends: backend_statuses,
             strategy,
             round_robin_index: Arc::new(RwLock::new(0)),
         }
     }
 
-    pub async fn select_backend(&self) -> &str {
-        if self.backends.is_empty() {
-            tracing::debug!("No backends available");
-            return "";
+    pub async fn select_backend(&self) -> String {
+        let healthy_backends: Vec<usize> = self
+            .backends
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.blocking_read().is_healthy())
+            .map(|(i, _)| i)
+            .collect();
+
+        if healthy_backends.is_empty() {
+            tracing::warn!("No healthy backends available, falling back to all backends");
+            return self.backends.first().map(|b| b.blocking_read().url.clone()).unwrap_or_default();
         }
 
-        match self.strategy {
+        let idx = match self.strategy {
             LoadBalancingStrategy::RoundRobin => {
                 let mut index = self.round_robin_index.write().await;
-                let selected = &self.backends[*index];
-                tracing::debug!(
-                    "RoundRobin selected backend: {} (index={}/{})",
-                    selected,
-                    *index,
-                    self.backends.len()
-                );
-                *index = (*index + 1) % self.backends.len();
-                selected
+                let idx = healthy_backends[*index % healthy_backends.len()];
+                *index = (*index + 1) % healthy_backends.len();
+                idx
             }
             LoadBalancingStrategy::Random => {
-                let idx = (rand::random::<u64>() % self.backends.len() as u64) as usize;
-                let selected = &self.backends[idx];
-                tracing::debug!(
-                    "Random selected backend: {} (index={}/{})",
-                    selected,
-                    idx,
-                    self.backends.len()
-                );
-                selected
+                let rand_idx = (rand::random::<u64>() % healthy_backends.len() as u64) as usize;
+                healthy_backends[rand_idx]
             }
-        }
+        };
+
+        let selected = &self.backends[idx];
+        let url = selected.read().await.url.clone();
+        tracing::debug!(
+            "Selected backend: {} (strategy={:?})",
+            url,
+            self.strategy
+        );
+        url
     }
 
     pub fn len(&self) -> usize {
@@ -65,7 +117,40 @@ impl BackendPool {
         self.strategy
     }
 
-    pub fn backends(&self) -> &[String] {
-        &self.backends
+    pub fn backends(&self) -> Vec<String> {
+        self.backends
+            .iter()
+            .map(|b| b.blocking_read().url.clone())
+            .collect()
+    }
+
+    pub async fn set_backend_health(&self, url: &str, healthy: bool) {
+        for backend in &self.backends {
+            let mut status = backend.write().await;
+            if status.url == url {
+                if healthy {
+                    status.mark_healthy();
+                } else {
+                    status.mark_unhealthy();
+                }
+                tracing::debug!(
+                    "Backend {} health status: {} (failures: {})",
+                    url,
+                    healthy,
+                    status.consecutive_failures()
+                );
+                return;
+            }
+        }
+    }
+
+    pub async fn get_backend_statuses(&self) -> Vec<(String, bool)> {
+        self.backends
+            .iter()
+            .map(|b| {
+                let status = b.blocking_read();
+                (status.url.clone(), status.healthy)
+            })
+            .collect()
     }
 }

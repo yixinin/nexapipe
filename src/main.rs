@@ -1,8 +1,11 @@
 use clap::Parser;
 use nexapipe::acme::{AcmeConfig, AcmeManager};
 use nexapipe::config::{self, IrohConfig, LocalProxyConfig, ProxyConfig, ServerConfig};
+use nexapipe::config_watcher::ConfigWatcher;
 use nexapipe::proxy::{run_local_proxy, run_proxy};
 use nexapipe::routes::Route;
+use nexapipe::shutdown::{ShutdownSignal, wait_for_shutdown_signal};
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -46,6 +49,14 @@ async fn main() {
         tracing::info!("Debug mode enabled");
     }
 
+    let shutdown_signal = Arc::new(ShutdownSignal::new());
+    let shutdown_signal_clone = shutdown_signal.clone();
+    
+    tokio::spawn(async move {
+        wait_for_shutdown_signal(shutdown_signal_clone).await;
+    });
+    tracing::info!("Shutdown signal handler registered");
+
     if let Some(acme_config) = &proxy_config.acme {
         if let Ok(acme_manager) = setup_acme(acme_config).await {
             if cli.obtain_certs {
@@ -64,8 +75,12 @@ async fn main() {
     if cli.local_proxy {
         run_local_proxy_mode(&proxy_config).await;
     } else {
-        run_server_mode(&proxy_config).await;
+        run_server_mode(&proxy_config, &cli.config).await;
     }
+
+    tracing::info!("Waiting for graceful shutdown...");
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    tracing::info!("Proxy shutdown complete");
 }
 
 async fn setup_acme(config: &config::AcmeConfig) -> Result<AcmeManager, anyhow::Error> {
@@ -133,7 +148,19 @@ async fn obtain_certs_once(manager: &AcmeManager, config: &config::AcmeConfig) {
     }
 }
 
-async fn run_server_mode(proxy_config: &ProxyConfig) {
+async fn run_server_mode(proxy_config: &ProxyConfig, config_path: &str) {
+    let config_watcher = Arc::new(ConfigWatcher::new(config_path.to_string(), proxy_config.clone()));
+    
+    tokio::spawn({
+        let config_watcher_clone = config_watcher.clone();
+        async move {
+            if let Err(e) = config_watcher_clone.start_watch().await {
+                tracing::error!("Config watcher failed: {}", e);
+            }
+        }
+    });
+    tracing::info!("Config watcher started, monitoring: {}", config_path);
+
     let server_config: Option<ServerConfig> = proxy_config.server.clone();
     let iroh_config: Option<IrohConfig> = proxy_config.iroh.clone();
 
@@ -155,6 +182,8 @@ async fn run_server_mode(proxy_config: &ProxyConfig) {
                 strategy,
                 route_config.cert_path,
                 route_config.key_path,
+                route_config.path_rewrite,
+                route_config.redirect_to_https.unwrap_or(false),
             ));
 
             tracing::info!(

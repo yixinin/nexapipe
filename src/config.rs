@@ -6,6 +6,7 @@ use std::path::Path;
 pub struct ServerConfig {
     pub listen_addr: Option<String>,
     pub tls_enabled: Option<bool>,
+    pub tls_listen_addr: Option<String>,
     pub cert_path: Option<String>,
     pub key_path: Option<String>,
 }
@@ -36,6 +37,8 @@ pub struct RouteConfig {
     pub strategy: Option<String>,
     pub backends: Vec<String>,
     pub cert_path: Option<String>,
+    pub path_rewrite: Option<String>,
+    pub redirect_to_https: Option<bool>,
     pub key_path: Option<String>,
 }
 
