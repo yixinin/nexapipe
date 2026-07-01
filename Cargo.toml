@@ -18,7 +18,7 @@ url = "2.5.8"
 toml = "1.1.2"
 serde = { version = "1.0.228", features = ["derive"] }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
-tokio-rustls = "0.26.4"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
 rustls-native-certs = "0.8.4"
 webpki-roots = "1.0.8"
 rustls-pemfile = "2.0"
@@ -31,7 +31,7 @@ futures-util = "0.3.32"
 base64 = "0.22.1"
 hyper = { version = "1.10.1", features = ["full", "http2"] }
 hyper-util = { version = "0.1", features = ["full"] }
-hyper-rustls = "0.27.9"
+hyper-rustls = { version = "0.27.9", default-features = false, features = ["ring", "http1", "http2", "native-tokio"] }
 http-body-util = "0.1"
 tokio-stream = "0.1"
 flate2 = "1.0"
