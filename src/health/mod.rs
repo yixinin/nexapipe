@@ -51,7 +51,7 @@ impl HealthChecker {
     }
 
     async fn check_all_backends(&self) {
-        let backends = self.backend_pool.backends();
+        let backends = self.backend_pool.backends().await;
         for url in backends {
             let is_healthy = self.check_backend(&url).await;
             let statuses = self.backend_pool.get_backend_statuses().await;

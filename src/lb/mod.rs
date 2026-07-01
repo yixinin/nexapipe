@@ -73,17 +73,20 @@ impl BackendPool {
     }
 
     pub async fn select_backend(&self) -> String {
-        let healthy_backends: Vec<usize> = self
-            .backends
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.blocking_read().is_healthy())
-            .map(|(i, _)| i)
-            .collect();
+        let mut healthy_backends = Vec::new();
+        for (i, b) in self.backends.iter().enumerate() {
+            if b.read().await.is_healthy() {
+                healthy_backends.push(i);
+            }
+        }
 
         if healthy_backends.is_empty() {
             tracing::warn!("No healthy backends available, falling back to all backends");
-            return self.backends.first().map(|b| b.blocking_read().url.clone()).unwrap_or_default();
+            return if let Some(b) = self.backends.first() {
+                b.read().await.url.clone()
+            } else {
+                String::new()
+            };
         }
 
         let idx = match self.strategy {
@@ -117,11 +120,12 @@ impl BackendPool {
         self.strategy
     }
 
-    pub fn backends(&self) -> Vec<String> {
-        self.backends
-            .iter()
-            .map(|b| b.blocking_read().url.clone())
-            .collect()
+    pub async fn backends(&self) -> Vec<String> {
+        let mut result = Vec::new();
+        for b in &self.backends {
+            result.push(b.read().await.url.clone());
+        }
+        result
     }
 
     pub async fn set_backend_health(&self, url: &str, healthy: bool) {
@@ -145,12 +149,11 @@ impl BackendPool {
     }
 
     pub async fn get_backend_statuses(&self) -> Vec<(String, bool)> {
-        self.backends
-            .iter()
-            .map(|b| {
-                let status = b.blocking_read();
-                (status.url.clone(), status.healthy)
-            })
-            .collect()
+        let mut result = Vec::new();
+        for b in &self.backends {
+            let status = b.read().await;
+            result.push((status.url.clone(), status.healthy));
+        }
+        result
     }
 }

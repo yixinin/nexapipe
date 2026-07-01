@@ -22,6 +22,11 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
+    // Install ring as the default CryptoProvider for rustls
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install ring as default CryptoProvider");
+
     let cli = Cli::parse();
 
     let proxy_config = match ProxyConfig::from_file(&cli.config) {
