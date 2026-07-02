@@ -34,14 +34,8 @@ pub async fn run_proxy(
     default_backend: String,
     server_config: Option<ServerConfig>,
     iroh_config: Option<IrohConfig>,
+    shutdown_signal: Arc<ShutdownSignal>,
 ) -> anyhow::Result<()> {
-    let shutdown_signal = Arc::new(ShutdownSignal::new());
-    let shutdown_signal_clone = shutdown_signal.clone();
-
-    tokio::spawn(async move {
-        crate::shutdown::wait_for_shutdown_signal(shutdown_signal_clone).await;
-    });
-
     let config = Arc::new(RouteConfig::new(routes, default_backend.clone()));
     let http_client = Arc::new(http::create_http_client());
 
@@ -352,8 +346,11 @@ async fn proxy_handler(
     Ok(response)
 }
 
-pub async fn run_local_proxy(local_proxy_config: LocalProxyConfig) -> anyhow::Result<()> {
-    local_proxy::run_local_proxy(local_proxy_config).await
+pub async fn run_local_proxy(
+    local_proxy_config: LocalProxyConfig,
+    shutdown_signal: Arc<ShutdownSignal>,
+) -> anyhow::Result<()> {
+    local_proxy::run_local_proxy(local_proxy_config, shutdown_signal).await
 }
 
 fn load_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<Arc<TlsAcceptor>> {

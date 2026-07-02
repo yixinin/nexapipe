@@ -9,7 +9,7 @@ COPY src ./src
 
 RUN cargo build --release
 
-FROM alpine:3.19
+FROM alpine
 
 RUN apk add --no-cache ca-certificates tzdata
 

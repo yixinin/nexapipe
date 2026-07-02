@@ -1,0 +1,9 @@
+version: "3"
+services:
+  nexapipe:
+    build: .
+    container_name: nexapipe
+    volumes:
+      - ./config.toml:/app/config.toml
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
