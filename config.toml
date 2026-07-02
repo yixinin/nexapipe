@@ -34,7 +34,7 @@ key_path = ""
 enabled = true
 listen_addr = "127.0.0.1:8081"
 proxy_domains = ["fn.iroh.iakl.top"]
-server_ticket = "endpointabvpkxgqg5pdhtsofv3auec7i4uk7rixhdjxb242xjtp7hrcfdiosbibaafaaadtxsqqgaiavqofaan4uebqcajebgfcqdvrijqaaaaaaaaaaalgx2qqgaibeqeyukaowfbgblgxzdhyttwwkw7kcaybaesatcrib2yueygzu3kk3256khzl5iid"
+server_ticket = "endpointacmj7wczujgzjqyoy2eobf2e5yrswrvpueumfirnihfyzygyhmdfaaibacwboaacqtcqe"
 
 [acme]
 # Enable automatic certificate management
