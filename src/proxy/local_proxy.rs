@@ -1,5 +1,6 @@
 use crate::config::LocalProxyConfig;
 use crate::http;
+use crate::shutdown::ShutdownSignal;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr};
 use iroh_tickets::endpoint::EndpointTicket;
@@ -10,7 +11,10 @@ use tokio::net::TcpListener;
 const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024 * 10; // 10MB
 
-pub async fn run_local_proxy(config: LocalProxyConfig) -> anyhow::Result<()> {
+pub async fn run_local_proxy(
+    config: LocalProxyConfig,
+    shutdown_signal: Arc<ShutdownSignal>,
+) -> anyhow::Result<()> {
     let listen_addr = config.listen_addr.clone();
     let proxy_domains = Arc::new(config.proxy_domains);
     let server_ticket = config.server_ticket;
@@ -40,32 +44,44 @@ pub async fn run_local_proxy(config: LocalProxyConfig) -> anyhow::Result<()> {
     let endpoint_addr: EndpointAddr = ticket.into();
 
     loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                tracing::debug!("New connection from: {}", addr);
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, addr)) => {
+                        tracing::debug!("New connection from: {}", addr);
 
-                let proxy_domains_clone = proxy_domains.clone();
-                let ep_clone = ep.clone();
-                let endpoint_addr_clone = endpoint_addr.clone();
+                        let proxy_domains_clone = proxy_domains.clone();
+                        let ep_clone = ep.clone();
+                        let endpoint_addr_clone = endpoint_addr.clone();
 
-                tokio::spawn(async move {
-                    if let Err(e) = handle_local_connection(
-                        stream,
-                        proxy_domains_clone,
-                        ep_clone,
-                        endpoint_addr_clone,
-                    )
-                    .await
-                    {
-                        tracing::error!("Failed to handle local connection: {}", e);
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_local_connection(
+                                stream,
+                                proxy_domains_clone,
+                                ep_clone,
+                                endpoint_addr_clone,
+                            )
+                            .await
+                            {
+                                tracing::error!("Failed to handle local connection: {}", e);
+                            }
+                        });
                     }
-                });
+                    Err(e) => {
+                        tracing::error!("Failed to accept connection: {}", e);
+                    }
+                }
             }
-            Err(e) => {
-                tracing::error!("Failed to accept connection: {}", e);
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
+                if shutdown_signal.is_shutdown_requested() {
+                    tracing::info!("Shutdown signal received, stopping local proxy");
+                    break;
+                }
             }
         }
     }
+
+    Ok(())
 }
 
 async fn handle_local_connection(

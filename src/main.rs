@@ -56,7 +56,7 @@ async fn main() {
 
     let shutdown_signal = Arc::new(ShutdownSignal::new());
     let shutdown_signal_clone = shutdown_signal.clone();
-    
+
     tokio::spawn(async move {
         wait_for_shutdown_signal(shutdown_signal_clone).await;
     });
@@ -78,9 +78,9 @@ async fn main() {
     }
 
     if cli.local_proxy {
-        run_local_proxy_mode(&proxy_config).await;
+        run_local_proxy_mode(&proxy_config, &shutdown_signal).await;
     } else {
-        run_server_mode(&proxy_config, &cli.config).await;
+        run_server_mode(&proxy_config, &cli.config, &shutdown_signal).await;
     }
 
     tracing::info!("Waiting for graceful shutdown...");
@@ -153,9 +153,16 @@ async fn obtain_certs_once(manager: &AcmeManager, config: &config::AcmeConfig) {
     }
 }
 
-async fn run_server_mode(proxy_config: &ProxyConfig, config_path: &str) {
-    let config_watcher = Arc::new(ConfigWatcher::new(config_path.to_string(), proxy_config.clone()));
-    
+async fn run_server_mode(
+    proxy_config: &ProxyConfig,
+    config_path: &str,
+    shutdown_signal: &Arc<ShutdownSignal>,
+) {
+    let config_watcher = Arc::new(ConfigWatcher::new(
+        config_path.to_string(),
+        proxy_config.clone(),
+    ));
+
     tokio::spawn({
         let config_watcher_clone = config_watcher.clone();
         async move {
@@ -210,6 +217,7 @@ async fn run_server_mode(proxy_config: &ProxyConfig, config_path: &str) {
         proxy_config.default_backend.clone(),
         server_config,
         iroh_config,
+        shutdown_signal.clone(),
     )
     .await
     {
@@ -218,7 +226,7 @@ async fn run_server_mode(proxy_config: &ProxyConfig, config_path: &str) {
     }
 }
 
-async fn run_local_proxy_mode(proxy_config: &ProxyConfig) {
+async fn run_local_proxy_mode(proxy_config: &ProxyConfig, shutdown_signal: &Arc<ShutdownSignal>) {
     let local_proxy_config: Option<LocalProxyConfig> = proxy_config.local_proxy.clone();
 
     let config = match local_proxy_config {
@@ -236,7 +244,7 @@ async fn run_local_proxy_mode(proxy_config: &ProxyConfig) {
 
     tracing::info!("Starting local proxy mode");
 
-    if let Err(e) = run_local_proxy(config).await {
+    if let Err(e) = run_local_proxy(config, shutdown_signal.clone()).await {
         tracing::error!("Local proxy failed: {}", e);
         std::process::exit(1);
     }
