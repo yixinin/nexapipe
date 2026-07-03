@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tokio_stream::StreamExt;
 
 const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024 * 10;
@@ -53,6 +54,43 @@ impl IrohConnectionPool {
         )
         .await
         .map_err(|e| anyhow::anyhow!("Connection timeout: {}", e))??;
+
+        let paths = conn.paths();
+        if let Some(selected_path) = paths.iter().find(|p| p.is_selected()) {
+            if selected_path.is_ip() {
+                tracing::info!("Iroh connection type: Direct (直连)");
+            } else if selected_path.is_relay() {
+                tracing::info!("Iroh connection type: Relay (中转)");
+            } else {
+                tracing::info!("Iroh connection type: Unknown");
+            }
+        } else {
+            tracing::info!("Iroh connection type: Unknown (no selected path)");
+        }
+
+        let conn_clone = conn.clone();
+        tokio::spawn(async move {
+            let mut path_events = conn_clone.path_events();
+            while let Some(event) = path_events.next().await {
+                match event {
+                    iroh::endpoint::PathEvent::Selected { remote_addr, .. } => {
+                        if remote_addr.is_ip() {
+                            tracing::info!("Connection upgraded: Relay → Direct (直连)");
+                        } else if remote_addr.is_relay() {
+                            tracing::info!("Connection downgraded: Direct → Relay (中转)");
+                        }
+                    }
+                    iroh::endpoint::PathEvent::Opened { remote_addr, .. } => {
+                        if remote_addr.is_ip() {
+                            tracing::info!("Direct path opened (waiting for selection)");
+                        } else if remote_addr.is_relay() {
+                            tracing::info!("Relay path opened");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
 
         tracing::debug!("Created new iroh connection");
         Ok(conn)
