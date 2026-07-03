@@ -5,6 +5,7 @@ use hyper_util::client::legacy;
 use iroh::endpoint::{Connection, Incoming};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_stream::StreamExt;
 
 type HttpClient = legacy::Client<
     hyper_rustls::HttpsConnector<legacy::connect::HttpConnector>,
@@ -241,6 +242,16 @@ async fn handle_websocket_stream(
     Ok(())
 }
 
+fn get_connection_type(path: &iroh::endpoint::Path<'_>) -> &'static str {
+    if path.is_ip() {
+        "Direct (直连)"
+    } else if path.is_relay() {
+        "Relay (中转)"
+    } else {
+        "Unknown"
+    }
+}
+
 pub async fn handle_connection(
     conn: Connection,
     config: Arc<RouteConfig>,
@@ -249,6 +260,37 @@ pub async fn handle_connection(
     let peer_id = conn.remote_id();
     tracing::info!("New connection from peer: {}", peer_id);
     tracing::debug!("Iroh connection info - peer_id: {}", peer_id);
+
+    let paths = conn.paths();
+    if let Some(selected_path) = paths.iter().find(|p| p.is_selected()) {
+        tracing::info!("Initial connection type: {}", get_connection_type(&selected_path));
+    } else {
+        tracing::info!("Initial connection type: Unknown (no selected path)");
+    }
+
+    let conn_clone = conn.clone();
+    tokio::spawn(async move {
+        let mut path_events = conn_clone.path_events();
+        while let Some(event) = path_events.next().await {
+            match event {
+                iroh::endpoint::PathEvent::Selected { remote_addr, .. } => {
+                    if remote_addr.is_ip() {
+                        tracing::info!("Connection upgraded: Relay → Direct (直连)");
+                    } else if remote_addr.is_relay() {
+                        tracing::info!("Connection downgraded: Direct → Relay (中转)");
+                    }
+                }
+                iroh::endpoint::PathEvent::Opened { remote_addr, .. } => {
+                    if remote_addr.is_ip() {
+                        tracing::info!("Direct path opened (waiting for selection)");
+                    } else if remote_addr.is_relay() {
+                        tracing::info!("Relay path opened");
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
 
     loop {
         match conn.accept_bi().await {
