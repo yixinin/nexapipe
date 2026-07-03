@@ -1,15 +1,73 @@
 use crate::config::LocalProxyConfig;
 use crate::http;
 use crate::shutdown::ShutdownSignal;
+use iroh::endpoint::Connection;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr};
 use iroh_tickets::endpoint::EndpointTicket;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 
 const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
-const MAX_RESPONSE_SIZE: usize = 1024 * 1024 * 10; // 10MB
+const MAX_RESPONSE_SIZE: usize = 1024 * 1024 * 10;
+const MAX_CONNECTIONS: usize = 10;
+const CONNECTION_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+
+struct PooledConnection {
+    conn: Connection,
+    created_at: std::time::Instant,
+}
+
+struct IrohConnectionPool {
+    connections: Mutex<Vec<PooledConnection>>,
+    ep: Endpoint,
+    endpoint_addr: EndpointAddr,
+}
+
+impl IrohConnectionPool {
+    fn new(ep: Endpoint, endpoint_addr: EndpointAddr) -> Self {
+        Self {
+            connections: Mutex::new(Vec::new()),
+            ep,
+            endpoint_addr,
+        }
+    }
+
+    async fn get_connection(&self) -> anyhow::Result<Connection> {
+        let mut connections = self.connections.lock().await;
+
+        while let Some(pooled) = connections.pop() {
+            if pooled.created_at.elapsed() < tokio::time::Duration::from_secs(60) {
+                return Ok(pooled.conn);
+            }
+            tracing::debug!("Removed stale connection from pool");
+        }
+
+        drop(connections);
+
+        let conn = tokio::time::timeout(
+            CONNECTION_TIMEOUT,
+            self.ep.connect(self.endpoint_addr.clone(), ALPN_NEXAPIPE),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Connection timeout: {}", e))??;
+
+        tracing::debug!("Created new iroh connection");
+        Ok(conn)
+    }
+
+    async fn return_connection(&self, conn: Connection) {
+        let mut connections = self.connections.lock().await;
+        if connections.len() < MAX_CONNECTIONS {
+            connections.push(PooledConnection {
+                conn,
+                created_at: std::time::Instant::now(),
+            });
+        }
+    }
+}
 
 pub async fn run_local_proxy(
     config: LocalProxyConfig,
@@ -43,6 +101,8 @@ pub async fn run_local_proxy(
         .map_err(|e| anyhow::anyhow!("Failed to parse ticket: {}", e))?;
     let endpoint_addr: EndpointAddr = ticket.into();
 
+    let conn_pool = Arc::new(IrohConnectionPool::new(ep, endpoint_addr));
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -51,15 +111,13 @@ pub async fn run_local_proxy(
                         tracing::debug!("New connection from: {}", addr);
 
                         let proxy_domains_clone = proxy_domains.clone();
-                        let ep_clone = ep.clone();
-                        let endpoint_addr_clone = endpoint_addr.clone();
+                        let conn_pool_clone = conn_pool.clone();
 
                         tokio::spawn(async move {
                             if let Err(e) = handle_local_connection(
                                 stream,
                                 proxy_domains_clone,
-                                ep_clone,
-                                endpoint_addr_clone,
+                                conn_pool_clone,
                             )
                             .await
                             {
@@ -87,8 +145,7 @@ pub async fn run_local_proxy(
 async fn handle_local_connection(
     mut stream: tokio::net::TcpStream,
     proxy_domains: Arc<Vec<String>>,
-    ep: Endpoint,
-    endpoint_addr: EndpointAddr,
+    conn_pool: Arc<IrohConnectionPool>,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; 8192];
     let n = stream.read(&mut buf).await?;
@@ -108,13 +165,11 @@ async fn handle_local_connection(
         }
     };
 
-    // Handle CONNECT method for HTTP tunneling (used by WebSocket)
     if request.method().as_str() == "CONNECT" {
         let uri = request.uri().to_string();
         let host_port = uri.split(':').next().unwrap_or(&uri);
         let host = host_port.to_string();
 
-        // Check if this domain should be proxied
         if !should_proxy_domain(&host, &proxy_domains) {
             tracing::debug!("CONNECT target {} not in proxy domains, skipping", host);
             return Ok(());
@@ -122,17 +177,15 @@ async fn handle_local_connection(
 
         tracing::info!("Establishing CONNECT tunnel for: {}", host);
 
-        // Send 200 Connection Established response to client
         stream
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
 
-        // Establish bidirectional Iroh stream for tunneling
-        let conn = ep.connect(endpoint_addr, ALPN_NEXAPIPE).await?;
+        let conn = conn_pool.get_connection().await?;
         let (send, recv) = conn.open_bi().await?;
 
-        // Forward data bidirectionally through the tunnel
         handle_connect_tunnel(stream, send, recv).await?;
+        conn_pool.return_connection(conn).await;
         return Ok(());
     }
 
@@ -155,7 +208,7 @@ async fn handle_local_connection(
     let host = target_host.unwrap();
     tracing::info!("Proxying request for host: {}", host);
 
-    let conn = ep.connect(endpoint_addr, ALPN_NEXAPIPE).await?;
+    let conn = conn_pool.get_connection().await?;
     let (mut send, mut recv) = conn.open_bi().await?;
 
     let mut modified_request = Vec::with_capacity(n);
@@ -184,11 +237,12 @@ async fn handle_local_connection(
         stream.write_all(&response).await?;
     }
 
+    conn_pool.return_connection(conn).await;
     Ok(())
 }
 
 async fn handle_local_websocket(
-    mut client_stream: tokio::net::TcpStream,
+    client_stream: tokio::net::TcpStream,
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     initial_request: &[u8],

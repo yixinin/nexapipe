@@ -4,4 +4,3 @@ certs/
 .gitignore
 examples/
 *.md
-Cargo.lock

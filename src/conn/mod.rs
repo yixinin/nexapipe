@@ -11,35 +11,40 @@ type HttpClient = legacy::Client<
     http_body_util::Full<bytes::Bytes>,
 >;
 
+fn find_headers_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
 pub async fn handle_bidi_stream(
     send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
     config: &RouteConfig,
-    _client: &HttpClient,
+    client: &HttpClient,
 ) -> anyhow::Result<()> {
     let mut recv = recv;
-    let mut buf = Vec::new();
-    let mut line_buf = Vec::new();
-    let mut temp_byte = [0u8; 1];
+    let mut buf = Vec::with_capacity(8192);
+    let mut read_buf = [0u8; 8192];
+    let mut body_data = Vec::new();
 
     loop {
-        match recv.read(&mut temp_byte).await {
+        match recv.read(&mut read_buf).await {
             Ok(None) => break,
-            Ok(Some(1)) => {
-                let byte = temp_byte[0];
-                buf.push(byte);
-                line_buf.push(byte);
+            Ok(Some(n)) => {
+                buf.extend_from_slice(&read_buf[..n]);
 
-                if line_buf.len() >= 4 {
-                    let last_four = &line_buf[line_buf.len() - 4..];
-                    if last_four == b"\r\n\r\n" {
-                        break;
+                if let Some(pos) = find_headers_end(&buf) {
+                    let headers_end = pos + 4;
+                    if buf.len() > headers_end {
+                        body_data.extend_from_slice(&buf[headers_end..]);
                     }
+                    buf.truncate(headers_end);
+                    break;
                 }
-            }
-            Ok(Some(_)) => {
-                let byte = temp_byte[0];
-                buf.push(byte);
+
+                if buf.len() > 64 * 1024 {
+                    tracing::warn!("Request headers too large");
+                    break;
+                }
             }
             Err(e) => {
                 tracing::debug!("Failed to read from iroh stream: {}", e);
@@ -94,7 +99,7 @@ pub async fn handle_bidi_stream(
     } else {
         let mut send = send;
         let response =
-            http::proxy_to_backend_legacy(&request, &backend_info.url, backend_info.verify_cert)
+            http::proxy_to_backend_using_client(client, &request, &backend_info.url, body_data)
                 .await?;
         tracing::debug!("Proxy response status: {}", response.status());
         http::send_response_legacy(&mut send, &response).await?;
@@ -148,18 +153,28 @@ async fn handle_websocket_stream(
 
     backend_stream.write_all(&request_buf).await?;
 
-    let mut response_buf = Vec::new();
-    let mut line_buf = Vec::new();
+    let mut response_buf = Vec::with_capacity(8192);
+    let mut read_buf = [0u8; 8192];
 
     loop {
-        let byte = backend_stream.read_u8().await?;
-        response_buf.push(byte);
-        line_buf.push(byte);
-
-        if line_buf.len() >= 4 {
-            let last_four = &line_buf[line_buf.len() - 4..];
-            if last_four == b"\r\n\r\n" {
-                break;
+        match backend_stream.read(&mut read_buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                response_buf.extend_from_slice(&read_buf[..n]);
+                
+                if let Some(pos) = find_headers_end(&response_buf) {
+                    response_buf.truncate(pos + 4);
+                    break;
+                }
+                
+                if response_buf.len() > 64 * 1024 {
+                    tracing::warn!("WebSocket handshake response too large");
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Failed to read from backend stream: {}", e);
+                return Err(e.into());
             }
         }
     }
@@ -237,7 +252,7 @@ pub async fn handle_connection(
 
     loop {
         match conn.accept_bi().await {
-            Ok((mut send, mut recv)) => {
+            Ok((send, recv)) => {
                 let config_clone = config.clone();
                 let client_clone = client.clone();
                 tokio::spawn(async move {

@@ -28,12 +28,14 @@ pub fn create_http_client() -> HttpClient {
         .wrap_connector(http_connector);
 
     hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-        .pool_max_idle_per_host(10)
-        .pool_idle_timeout(Some(std::time::Duration::from_secs(60)))
+        .pool_max_idle_per_host(100)
+        .pool_idle_timeout(Some(std::time::Duration::from_secs(120)))
         .http1_title_case_headers(true)
         .http1_ignore_invalid_headers_in_responses(true)
         .build(https)
 }
+
+const MAX_COMPRESS_SIZE: usize = 1024 * 1024;
 
 pub async fn proxy_request(
     client: &HttpClient,
@@ -160,7 +162,30 @@ async fn compress_response(
     encoding: &str,
 ) -> Response<http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, hyper::Error>> {
     let (parts, body) = response.into_parts();
+
+    if let Some(content_length) = parts.headers.get("content-length") {
+        if let Ok(content_length_str) = content_length.to_str() {
+            if let Ok(len) = content_length_str.parse::<usize>() {
+                if len > MAX_COMPRESS_SIZE {
+                    tracing::debug!("Response too large for compression: {} bytes", len);
+                    return Response::from_parts(
+                        parts,
+                        http_body_util::BodyExt::boxed_unsync(body),
+                    );
+                }
+            }
+        }
+    }
+
     let bytes = body.collect().await.unwrap().to_bytes();
+
+    if bytes.len() > MAX_COMPRESS_SIZE {
+        tracing::debug!("Response too large for compression: {} bytes", bytes.len());
+        return Response::from_parts(
+            parts,
+            http_body_util::BodyExt::boxed_unsync(Full::new(bytes).map_err(|_| unreachable!())),
+        );
+    }
 
     let compressed_bytes = {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -245,6 +270,64 @@ pub fn is_websocket_request_static(req: &Request<()>) -> bool {
         }
     }
     false
+}
+
+pub async fn proxy_to_backend_using_client(
+    client: &HttpClient,
+    req: &Request<()>,
+    backend_url: &str,
+    body_data: Vec<u8>,
+) -> Result<Response<Vec<u8>>, anyhow::Error> {
+    let url =
+        url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("backend URL missing host"))?
+        .to_string();
+    let port = url.port_or_known_default().unwrap_or(80);
+
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or(req.uri().path());
+
+    let new_uri = format!(
+        "{}://{}:{}{}",
+        url.scheme(), host, port, path
+    )
+    .parse::<http::Uri>()
+    .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
+
+    let mut builder = Request::builder().method(req.method()).uri(new_uri);
+
+    for (name, value) in req.headers() {
+        if name.as_str().to_lowercase() != "host" {
+            builder = builder.header(name, value);
+        }
+    }
+    builder = builder.header("host", host);
+
+    let proxied_req = builder.body(Full::new(body_data.into()))?;
+
+    tracing::debug!(
+        "Proxying request via client: {} {}",
+        proxied_req.method(),
+        proxied_req.uri()
+    );
+
+    let response = client.request(proxied_req).await?;
+
+    let (parts, body) = response.into_parts();
+    let bytes = body.collect().await.unwrap().to_bytes();
+
+    let mut builder = Response::builder().status(parts.status);
+    for (name, value) in parts.headers.iter() {
+        builder = builder.header(name, value);
+    }
+
+    Ok(builder.body(bytes.to_vec())?)
 }
 
 pub async fn proxy_to_backend_legacy(

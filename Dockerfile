@@ -1,4 +1,4 @@
-FROM rust:1.85-alpine AS builder
+FROM rust:alpine AS builder
 
 RUN apk add --no-cache musl-dev gcc make cmake ninja perl coreutils
 
@@ -9,7 +9,7 @@ COPY src ./src
 
 RUN cargo build --release
 
-FROM alpine
+FROM registry.it.iakl.top/alpine:3.22
 
 RUN apk add --no-cache ca-certificates tzdata
 
