@@ -12,7 +12,7 @@ use hyper_util::client::legacy;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder;
 use iroh::endpoint::presets;
-use iroh::{Endpoint, RelayMap, RelayUrl};
+use iroh::{Endpoint, RelayMap, RelayUrl, SecretKey};
 use iroh_tickets::Ticket;
 use iroh_tickets::endpoint::EndpointTicket;
 use rustls_pemfile::{certs, pkcs8_private_keys};
@@ -42,6 +42,19 @@ pub async fn run_proxy(
     let mut builder = Endpoint::builder(presets::N0).alpns(vec![ALPN_NEXAPIPE.to_vec()]);
 
     if let Some(iroh_cfg) = iroh_config {
+        // Use configured secret key for stable endpoint identity
+        if let Some(secret_key_str) = &iroh_cfg.secret_key {
+            match secret_key_str.parse::<SecretKey>() {
+                Ok(secret_key) => {
+                    builder = builder.secret_key(secret_key);
+                    tracing::info!("Using configured secret key for stable endpoint identity");
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse secret_key from config, generating new one: {}", e);
+                }
+            }
+        }
+
         if let Some(port) = iroh_cfg.bind_port {
             let addr = SocketAddr::from_str(&format!("0.0.0.0:{}", port))
                 .map_err(|e| anyhow::anyhow!("Invalid bind address: {}", e))?;

@@ -15,6 +15,12 @@ debug = true
 # Bind port for iroh endpoint (optional)
 # bind_port = 4433
 
+# Secret key for stable endpoint identity (optional)
+# 如果设置了此选项，服务端每次启动时将使用相同的 Node ID
+# 从而生成固定的连接 Ticket，客户端不需要每次更新 Ticket
+# 使用 `nexapipe --generate-secret` 命令生成一个新的 secret key
+# secret_key = "your-generated-secret-key-here"
+
 [server]
 listen_addr = "0.0.0.0:8080"
 tls_enabled = false
@@ -34,7 +40,7 @@ key_path = ""
 enabled = true
 listen_addr = "127.0.0.1:8081"
 proxy_domains = ["fn.iroh.iakl.top"]
-server_ticket = "endpointadlojae72qbc2v2idgt3nx3wprkceph2auzhds2s2rzpinwaqh4leaibacwboaacuobae"
+server_ticket = "endpointad7rmhpniv7k4hv6rwxnhsh3e5jllp4eitr3ftnczr5osnx5f4qpoaibacwboaac2c3ag"
 
 [acme]
 # Enable automatic certificate management

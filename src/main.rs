@@ -1,4 +1,5 @@
 use clap::Parser;
+use iroh::SecretKey;
 use nexapipe::acme::{AcmeConfig, AcmeManager};
 use nexapipe::config::{self, IrohConfig, LocalProxyConfig, ProxyConfig, ServerConfig};
 use nexapipe::config_watcher::ConfigWatcher;
@@ -18,6 +19,9 @@ struct Cli {
 
     #[arg(long, help = "Obtain certificates without starting proxy")]
     obtain_certs: bool,
+
+    #[arg(long, help = "Generate a new secret key for stable endpoint identity")]
+    generate_secret: bool,
 }
 
 #[tokio::main]
@@ -28,6 +32,19 @@ async fn main() {
         .expect("Failed to install ring as default CryptoProvider");
 
     let cli = Cli::parse();
+
+    // Handle --generate-secret flag
+    if cli.generate_secret {
+        let secret_key = SecretKey::generate();
+        // Convert to hex string for storage
+        let secret_key_hex = hex::encode(secret_key.to_bytes());
+        println!("Generated secret key for stable endpoint identity:");
+        println!("{}", secret_key_hex);
+        println!();
+        println!("Add this to your config.toml under [iroh] section:");
+        println!("secret_key = \"{}\"", secret_key_hex);
+        return;
+    }
 
     let proxy_config = match ProxyConfig::from_file(&cli.config) {
         Ok(config) => config,

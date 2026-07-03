@@ -27,6 +27,10 @@ pub struct IrohConfig {
     pub relay_url: Option<String>,
     pub relay_mode: Option<String>,
     pub bind_port: Option<u16>,
+    /// Secret key for stable endpoint identity.
+    /// If provided, the endpoint will have the same Node ID across restarts.
+    /// Can be generated using `nexapipe --generate-secret` command.
+    pub secret_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
