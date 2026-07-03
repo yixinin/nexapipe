@@ -324,8 +324,13 @@ pub async fn proxy_to_backend_using_client(
 
     let mut builder = Response::builder().status(parts.status);
     for (name, value) in parts.headers.iter() {
-        builder = builder.header(name, value);
+        // Skip Transfer-Encoding header since hyper auto-decodes chunked responses
+        if name.as_str().to_lowercase() != "transfer-encoding" {
+            builder = builder.header(name, value);
+        }
     }
+    // Add Content-Length since body is already fully collected
+    builder = builder.header("content-length", bytes.len());
 
     Ok(builder.body(bytes.to_vec())?)
 }

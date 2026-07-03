@@ -253,7 +253,21 @@ async fn handle_local_connection(
     let request_str = String::from_utf8_lossy(&buf[..n]);
     let mut host_replaced = false;
 
-    for line in request_str.lines() {
+    // Find the end of headers (empty line) and separate body if present
+    let header_end = request_str.find("\r\n\r\n").map(|pos| pos + 4);
+    let (headers_part, body_part) = if let Some(pos) = header_end {
+        let headers = &request_str[..pos];
+        let body = &buf[pos..n];
+        (headers, Some(body))
+    } else {
+        (request_str.as_ref(), None)
+    };
+
+    // Process headers
+    for line in headers_part.lines() {
+        if line.is_empty() {
+            continue; // Skip empty lines in headers
+        }
         if line.to_lowercase().starts_with("host:") {
             if !host_replaced {
                 modified_request.extend_from_slice(format!("Host: {}\r\n", host).as_bytes());
@@ -263,6 +277,14 @@ async fn handle_local_connection(
             modified_request.extend_from_slice(line.as_bytes());
             modified_request.extend_from_slice(b"\r\n");
         }
+    }
+
+    // Add empty line to end headers section
+    modified_request.extend_from_slice(b"\r\n");
+
+    // Append body if present
+    if let Some(body) = body_part {
+        modified_request.extend_from_slice(body);
     }
 
     if http::is_websocket_request_static(&request) {
