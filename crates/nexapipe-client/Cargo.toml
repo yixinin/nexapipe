@@ -7,6 +7,9 @@ keywords = ["iroh", "proxy", "p2p", "quinn"]
 categories = ["network-programming"]
 license = "MIT"
 
+[lib]
+crate-type = ["lib", "cdylib"]
+
 [dependencies]
 iroh = { version = "1.0.1", default-features = false, features = ["tls-ring"] }
 iroh-tickets = { version = "1.0.0" }
