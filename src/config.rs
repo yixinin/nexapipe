@@ -51,7 +51,13 @@ pub struct LocalProxyConfig {
     pub enabled: bool,
     pub listen_addr: String,
     pub proxy_domains: Vec<String>,
+    /// Full server ticket (contains Node ID + addresses)
+    /// Ticket changes when addresses change, but connection info is complete
     pub server_ticket: Option<String>,
+    /// Server Node ID only (stable across restarts when using secret_key)
+    /// When set, uses discovery service to find server addresses
+    /// Preferred for long-term configurations
+    pub server_node_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

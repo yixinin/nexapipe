@@ -135,11 +135,15 @@ pub async fn run_proxy(
     println!("\n========================================");
     println!("Proxy Connection Information");
     println!("========================================");
-    println!("Node ID: {}", node_id);
+    println!("Node ID (stable, for server_node_id): {}", node_id);
     println!("Ticket (for clients): {}", ticket_str);
+    println!("========================================");
+    println!("To use stable connection, add to [local_proxy] in config.toml:");
+    println!("server_node_id = \"{}\"", node_id);
     println!("========================================\n");
 
     tracing::info!("Connection ticket: {}", ticket_str);
+    tracing::info!("Node ID (for server_node_id config): {}", node_id);
 
     let listen_addr = server_config
         .as_ref()

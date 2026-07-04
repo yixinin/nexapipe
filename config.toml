@@ -40,7 +40,12 @@ key_path = ""
 enabled = true
 listen_addr = "127.0.0.1:8081"
 proxy_domains = ["fn.iroh.iakl.top"]
-server_ticket = "endpointad7rmhpniv7k4hv6rwxnhsh3e5jllp4eitr3ftnczr5osnx5f4qpoaibacwboaac2c3ag"
+# 连接方式二选一：
+# 1. server_node_id（推荐）：只使用 Node ID，通过 discovery 服务自动查找地址
+#    当服务端配置了固定 secret_key 时，Node ID 不变，无需每次更新
+# 2. server_ticket：完整 ticket，包含地址信息，但服务端重启后会变化
+server_node_id = "319c6a852834da0350b9e91366373a23cd81aeb825fef84077da15a3ffd5d88e"
+# server_ticket = "endpointaayzy2uffa2nua2qxhurgzrxhir43anoxas756cao7nbli772xmi4aibacwboaaczskqg"
 
 [acme]
 # Enable automatic certificate management

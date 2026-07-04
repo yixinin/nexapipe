@@ -3,7 +3,7 @@ use crate::http;
 use crate::shutdown::ShutdownSignal;
 use iroh::endpoint::Connection;
 use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointAddr};
+use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -114,6 +114,7 @@ pub async fn run_local_proxy(
     let listen_addr = config.listen_addr.clone();
     let proxy_domains = Arc::new(config.proxy_domains);
     let server_ticket = config.server_ticket;
+    let server_node_id = config.server_node_id;
 
     tracing::info!("Starting local proxy on: {}", listen_addr);
     tracing::info!("Proxy domains: {:?}", proxy_domains);
@@ -125,19 +126,40 @@ pub async fn run_local_proxy(
     let node_id = ep.id();
     tracing::info!("Iroh client endpoint started, node ID: {}", node_id);
 
-    let ticket_str = if let Some(ticket) = server_ticket {
-        ticket
+    // Build the EndpointAddr to connect to the server.
+    // Priority: server_node_id (stable, preferred) > server_ticket > interactive input
+    let endpoint_addr: EndpointAddr = if let Some(node_id_str) = server_node_id {
+        // Connect using only the Node ID - relies on iroh's discovery service
+        // (DNS/Pkarr) to resolve the server's current addresses.
+        // This is stable across server restarts when the server uses a fixed secret_key.
+        let endpoint_id: EndpointId = node_id_str
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Failed to parse server_node_id: {}", e))?;
+        tracing::info!("Connecting to server by Node ID: {} (using discovery service)", endpoint_id);
+        endpoint_id.into()
     } else {
-        println!("Enter server ticket:");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        input.trim().to_string()
-    };
+        // Connect using a full ticket (contains Node ID + addresses + relay URL)
+        let ticket_str = if let Some(ticket) = server_ticket {
+            ticket
+        } else {
+            println!("Enter server ticket or node ID:");
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            input.trim().to_string()
+        };
 
-    let ticket: EndpointTicket = ticket_str
-        .parse()
-        .map_err(|e| anyhow::anyhow!("Failed to parse ticket: {}", e))?;
-    let endpoint_addr: EndpointAddr = ticket.into();
+        // Try parsing as a ticket first, then as a Node ID
+        if let Ok(ticket) = ticket_str.parse::<EndpointTicket>() {
+            tracing::info!("Connecting to server using full ticket");
+            ticket.into()
+        } else {
+            let endpoint_id: EndpointId = ticket_str
+                .parse()
+                .map_err(|e| anyhow::anyhow!("Failed to parse as ticket or node ID: {}", e))?;
+            tracing::info!("Connecting to server by Node ID: {} (using discovery service)", endpoint_id);
+            endpoint_id.into()
+        }
+    };
 
     let conn_pool = Arc::new(IrohConnectionPool::new(ep, endpoint_addr));
 
