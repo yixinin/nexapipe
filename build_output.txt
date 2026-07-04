@@ -1,0 +1,1 @@
+﻿[1m[91merror[0m: could not compile `nexapipe-client` (lib) due to 2 previous errors

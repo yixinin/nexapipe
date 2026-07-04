@@ -1,48 +1,13 @@
-[package]
-name = "nexapipe"
+[workspace]
+members = [
+    "crates/nexapipe",
+    "crates/nexapipe-client",
+]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-
-[dependencies]
-clap = { version = "4.6.1", features = ["derive"] }
-iroh = { version = "1.0.1", default-features = false, features = ["tls-ring"] }
-iroh-tickets = { version = "1.0.0" }
-quinn = { version = "0.16", package = "iroh-quinn" }
-rand = "0.10.1"
-tokio = { version = "1.52.3", features = ["full"] }
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-anyhow = "1.0.103"
-http = "1.4.2"
-url = "2.5.8"
-toml = "1.1.2"
-serde = { version = "1.0.228", features = ["derive"] }
-rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
-rustls-native-certs = "0.8.4"
-webpki-roots = "1.0.8"
-rustls-pemfile = "2.0"
-rustls-pki-types = "1.15.0"
-instant-acme = { version = "0.8.5", default-features = false, features = ["hyper-rustls", "ring"] }
-cloudflare = { version = "0.14.0", default-features = false, features = ["rustls-tls"] }
-x509-parser = "0.18.1"
-chrono = { version = "0.4.45", features = ["serde"] }
-futures-util = "0.3.32"
-base64 = "0.22.1"
-hyper = { version = "1.10.1", features = ["full", "http2"] }
-hyper-util = { version = "0.1", features = ["full"] }
-hyper-rustls = { version = "0.27.9", default-features = false, features = ["ring", "http1", "http2", "native-tokio"] }
-http-body-util = "0.1"
-tokio-stream = "0.1"
-flate2 = "1.0"
-bytes = "1.12.0"
-lazy_static = "1.4"
-hex = "0.4"
-
-[dev-dependencies]
-duct = "1.1.1"
-nix = { version = "0.31.3", features = ["signal", "process"] }
-tempfile = "3.8"
 
 [profile.release]
 panic = "abort"
@@ -51,3 +16,24 @@ codegen-units = 1
 lto = true
 debug = "none"
 strip = true
+
+[workspace.dependencies]
+iroh = { version = "1.0.1", default-features = false, features = ["tls-ring"] }
+iroh-tickets = { version = "1.0.0" }
+quinn = { version = "0.16", package = "iroh-quinn" }
+tokio = { version = "1.52.3", features = ["full"] }
+anyhow = "1.0.103"
+http = "1.4.2"
+url = "2.5.8"
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
+rustls-native-certs = "0.8.4"
+webpki-roots = "1.0.8"
+hyper = { version = "1.10.1", features = ["full", "http2"] }
+hyper-util = { version = "0.1", features = ["full"] }
+hyper-rustls = { version = "0.27.9", default-features = false, features = ["ring", "http1", "http2"] }
+http-body-util = "0.1"
+tokio-stream = "0.1"
+bytes = "1.12.0"
+futures-util = "0.3.32"
+
