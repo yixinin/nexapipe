@@ -39,12 +39,29 @@ key_path = ""
 [local_proxy]
 enabled = true
 listen_addr = "127.0.0.1:8081"
-proxy_domains = ["fn.iroh.iakl.top"]
-# 连接方式二选一：
-# 1. server_node_id（推荐）：只使用 Node ID，通过 discovery 服务自动查找地址
-#    当服务端配置了固定 secret_key 时，Node ID 不变，无需每次更新
-# 2. server_ticket：完整 ticket，包含地址信息，但服务端重启后会变化
+proxy_domains = ["fn.iroh.iakl.top", "api.example.com"]
+# 全局负载均衡策略（可选），默认 round_robin
+# strategy = "round_robin"
+# strategy = "random"
+
+# 多节点配置（推荐）
+# 每个节点配置自己的 server_node_id/server_ticket 和服务的域名
+# 同一个域名可以配置在多个节点上，实现负载均衡
+[[local_proxy.nodes]]
 server_node_id = "319c6a852834da0350b9e91366373a23cd81aeb825fef84077da15a3ffd5d88e"
+domains = ["fn.iroh.iakl.top", "api.example.com"]
+
+[[local_proxy.nodes]]
+server_node_id = "abc123def456ghi789jkl012mno345pqr678stu901vwx234yz"
+domains = ["fn.iroh.iakl.top"]
+
+[[local_proxy.nodes]]
+server_ticket = "endpointaayzy2uffa2nua2qxhurgzrxhir43anoxas756cao7nbli772xmi4aibacwboaaczskqg"
+domains = ["api.example.com"]
+
+# 单一节点配置（兼容旧版本）
+# 当不配置 [[local_proxy.nodes]] 时，使用以下配置
+# server_node_id = "319c6a852834da0350b9e91366373a23cd81aeb825fef84077da15a3ffd5d88e"
 # server_ticket = "endpointaayzy2uffa2nua2qxhurgzrxhir43anoxas756cao7nbli772xmi4aibacwboaaczskqg"
 
 [acme]

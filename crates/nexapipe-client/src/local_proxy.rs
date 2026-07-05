@@ -1,7 +1,9 @@
 use crate::connection_pool::IrohConnectionPool;
+use crate::endpoint_group::{EndpointGroup, PooledConnection};
 use crate::http::{parse_http_request_legacy, is_websocket_request_static};
 use crate::ClientError;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -13,54 +15,108 @@ const MAX_RESPONSE_SIZE: usize = 1024 * 1024 * 10;
 const MAX_CONNECTIONS: usize = 10;
 
 pub struct LocalProxy {
-    listener: Option<TcpListener>,
-    conn_pool: Arc<IrohConnectionPool>,
+    listener: Arc<TcpListener>,
+    endpoint_group: Arc<EndpointGroup>,
     proxy_domains: Arc<Vec<String>>,
+    stopped: Arc<AtomicBool>,
 }
 
 impl LocalProxy {
     pub async fn new(
         listen_addr: &str,
         proxy_domains: Vec<String>,
-        conn_pool: IrohConnectionPool,
+        endpoint_group: EndpointGroup,
     ) -> Result<Self, ClientError> {
         let listener = TcpListener::bind(listen_addr).await?;
+        #[cfg(feature = "tracing")]
+        tracing::info!("Local proxy listening on: {}", listen_addr);
         Ok(Self {
-            listener: Some(listener),
-            conn_pool: Arc::new(conn_pool),
+            listener: Arc::new(listener),
+            endpoint_group: Arc::new(endpoint_group),
             proxy_domains: Arc::new(proxy_domains),
+            stopped: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    pub async fn run(self) -> Result<(), ClientError> {
-        let listener = self.listener.ok_or_else(|| ClientError::InvalidConfig("Listener not initialized".to_string()))?;
-
-        loop {
-            let (stream, addr) = listener.accept().await?;
-            #[cfg(feature = "tracing")]
-            tracing::debug!("New connection from: {}", addr);
-
-            let proxy_domains_clone = self.proxy_domains.clone();
-            let conn_pool_clone = self.conn_pool.clone();
-
-            tokio::spawn(async move {
-                if let Err(e) = handle_local_connection(stream, proxy_domains_clone, conn_pool_clone).await {
-                    #[cfg(feature = "tracing")]
-                    tracing::error!("Failed to handle local connection: {}", e);
-                }
-            });
-        }
+    pub async fn new_with_single_pool(
+        listen_addr: &str,
+        proxy_domains: Vec<String>,
+        conn_pool: IrohConnectionPool,
+    ) -> Result<Self, ClientError> {
+        let listener = TcpListener::bind(listen_addr).await?;
+        let endpoint_group = EndpointGroup::new_with_single_pool(conn_pool).await;
+        #[cfg(feature = "tracing")]
+        tracing::info!("Local proxy listening on: {}", listen_addr);
+        Ok(Self {
+            listener: Arc::new(listener),
+            endpoint_group: Arc::new(endpoint_group),
+            proxy_domains: Arc::new(proxy_domains),
+            stopped: Arc::new(AtomicBool::new(false)),
+        })
     }
 
-    pub fn stop(&mut self) {
-        self.listener = None;
+    pub async fn run(&self) -> Result<(), ClientError> {
+        let stopped = self.stopped.clone();
+        let listener = self.listener.clone();
+        let proxy_domains = self.proxy_domains.clone();
+        let endpoint_group = self.endpoint_group.clone();
+
+        loop {
+            if stopped.load(Ordering::Acquire) {
+                #[cfg(feature = "tracing")]
+                tracing::info!("Local proxy stopping");
+                break;
+            }
+
+            match tokio::time::timeout(
+                tokio::time::Duration::from_millis(100),
+                listener.accept(),
+            ).await {
+                Ok(Ok((stream, addr))) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!("New connection from: {}", addr);
+
+                    let proxy_domains_clone = proxy_domains.clone();
+                    let endpoint_group_clone = endpoint_group.clone();
+
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_local_connection(stream, proxy_domains_clone, endpoint_group_clone).await {
+                            #[cfg(feature = "tracing")]
+                            tracing::error!("Failed to handle local connection: {}", e);
+                        }
+                    });
+                }
+                Ok(Err(e)) => {
+                    if stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+                    #[cfg(feature = "tracing")]
+                    tracing::error!("Local proxy accept error: {}", e);
+                    break;
+                }
+                Err(_) => {
+                    continue;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn stop(&self) {
+        #[cfg(feature = "tracing")]
+        tracing::info!("Stopping local proxy");
+        self.stopped.store(true, Ordering::Release);
+    }
+
+    pub async fn close_all(&self) {
+        self.endpoint_group.close_all().await;
     }
 }
 
 async fn handle_local_connection(
     mut stream: tokio::net::TcpStream,
     proxy_domains: Arc<Vec<String>>,
-    conn_pool: Arc<IrohConnectionPool>,
+    endpoint_group: Arc<EndpointGroup>,
 ) -> Result<(), ClientError> {
     let mut buf = [0u8; 8192];
     let n = stream.read(&mut buf).await?;
@@ -89,11 +145,12 @@ async fn handle_local_connection(
 
         stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
-        let conn = conn_pool.get_connection().await?;
+        let pooled_conn = endpoint_group.get_connection(&host).await?;
+        let conn = pooled_conn.conn().clone();
         let (send, recv) = conn.open_bi().await.map_err(|e| anyhow::anyhow!(e))?;
 
         handle_connect_tunnel(stream, send, recv).await?;
-        conn_pool.return_connection(conn).await;
+        endpoint_group.return_connection(&host, pooled_conn).await;
         return Ok(());
     }
 
@@ -114,7 +171,8 @@ async fn handle_local_connection(
 
     let host = target_host.unwrap();
 
-    let conn = conn_pool.get_connection().await?;
+    let pooled_conn = endpoint_group.get_connection(&host).await?;
+    let conn = pooled_conn.conn().clone();
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow::anyhow!(e))?;
 
     let mut modified_request = Vec::with_capacity(n);
@@ -160,7 +218,7 @@ async fn handle_local_connection(
         stream.write_all(&response).await?;
     }
 
-    conn_pool.return_connection(conn).await;
+    endpoint_group.return_connection(&host, pooled_conn).await;
     Ok(())
 }
 

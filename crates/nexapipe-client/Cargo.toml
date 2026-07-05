@@ -34,6 +34,7 @@ uniffi = { version = "0.25", optional = true }
 tracing = { version = "0.1.44", optional = true }
 jni = { version = "0.21", features = ["invocation"], optional = true }
 once_cell = "1.19"
+fastrand = "2.1"
 
 [features]
 default = ["native-certs", "tracing"]

@@ -47,16 +47,27 @@ pub struct RouteConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct LocalProxyNode {
+    pub server_node_id: Option<String>,
+    pub server_ticket: Option<String>,
+    pub domains: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct LocalProxyConfig {
     pub enabled: bool,
     pub listen_addr: String,
     pub proxy_domains: Vec<String>,
+    pub nodes: Option<Vec<LocalProxyNode>>,
+    pub strategy: Option<String>,
     /// Full server ticket (contains Node ID + addresses)
     /// Ticket changes when addresses change, but connection info is complete
+    /// Deprecated: use `nodes` for multi-endpoint support
     pub server_ticket: Option<String>,
     /// Server Node ID only (stable across restarts when using secret_key)
     /// When set, uses discovery service to find server addresses
     /// Preferred for long-term configurations
+    /// Deprecated: use `nodes` for multi-endpoint support
     pub server_node_id: Option<String>,
 }
 

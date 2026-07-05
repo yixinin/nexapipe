@@ -25,34 +25,43 @@ pub struct IrohConnectionPool {
 
 struct IrohConnectionPoolInner {
     connections: Mutex<Vec<PooledConnection>>,
-    ep: Endpoint,
+    ep: Arc<Mutex<Option<Endpoint>>>,
     endpoint_addr: EndpointAddr,
 }
 
 impl IrohConnectionPool {
     pub async fn new(endpoint_addr: EndpointAddr) -> Result<Self, crate::error::ClientError> {
-        let ep = Endpoint::builder(presets::N0).bind().await.map_err(|e| anyhow::anyhow!(e))?;
+        let ep = Endpoint::builder(presets::N0)
+            .bind()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
         Ok(Self {
             inner: Arc::new(IrohConnectionPoolInner {
                 connections: Mutex::new(Vec::new()),
-                ep,
+                ep: Arc::new(Mutex::new(Some(ep))),
                 endpoint_addr,
             }),
         })
     }
 
-    pub async fn new_with_endpoint(ep: Endpoint, endpoint_addr: EndpointAddr) -> Self {
+    pub fn new_with_endpoint(ep: Endpoint, endpoint_addr: EndpointAddr) -> Self {
         Self {
             inner: Arc::new(IrohConnectionPoolInner {
                 connections: Mutex::new(Vec::new()),
-                ep,
+                ep: Arc::new(Mutex::new(Some(ep))),
                 endpoint_addr,
             }),
         }
     }
 
     pub fn node_id(&self) -> EndpointId {
-        self.inner.ep.id()
+        match self.inner.ep.try_lock() {
+            Ok(ep) => ep
+                .as_ref()
+                .map(|e| e.id())
+                .unwrap_or_else(|| EndpointId::from_bytes(&[0u8; 32]).unwrap()),
+            Err(_) => EndpointId::from_bytes(&[0u8; 32]).unwrap(),
+        }
     }
 
     pub async fn get_connection(&self) -> Result<Connection, crate::error::ClientError> {
@@ -66,9 +75,14 @@ impl IrohConnectionPool {
 
         drop(connections);
 
+        let ep = self.inner.ep.lock().await;
+        let ep = ep.as_ref().ok_or_else(|| {
+            crate::error::ClientError::InvalidConfig("Endpoint has been closed".to_string())
+        })?;
+
         let conn = tokio::time::timeout(
             CONNECTION_TIMEOUT,
-            self.inner.ep.connect(self.inner.endpoint_addr.clone(), ALPN_NEXAPIPE),
+            ep.connect(self.inner.endpoint_addr.clone(), ALPN_NEXAPIPE),
         )
         .await
         .map_err(|_| crate::error::ClientError::TimeoutError)?
@@ -118,6 +132,13 @@ impl IrohConnectionPool {
     pub async fn close_all(&self) {
         let mut connections = self.inner.connections.lock().await;
         connections.clear();
+
+        let mut ep = self.inner.ep.lock().await;
+        if let Some(endpoint) = ep.take() {
+            #[cfg(feature = "tracing")]
+            tracing::info!("Closing iroh endpoint");
+            endpoint.close().await;
+        }
     }
 }
 
@@ -126,17 +147,20 @@ pub fn parse_endpoint_addr(
     server_ticket: Option<&str>,
 ) -> Result<EndpointAddr, crate::error::ClientError> {
     if let Some(node_id_str) = server_node_id {
-        let endpoint_id: EndpointId = node_id_str
-            .parse()
-            .map_err(|e| crate::error::ClientError::ParseError(format!("Failed to parse server_node_id: {}", e)))?;
+        let endpoint_id: EndpointId = node_id_str.parse().map_err(|e| {
+            crate::error::ClientError::ParseError(format!("Failed to parse server_node_id: {}", e))
+        })?;
         Ok(endpoint_id.into())
     } else if let Some(ticket_str) = server_ticket {
         if let Ok(ticket) = ticket_str.parse::<EndpointTicket>() {
             Ok(ticket.into())
         } else {
-            let endpoint_id: EndpointId = ticket_str
-                .parse()
-                .map_err(|e| crate::error::ClientError::ParseError(format!("Failed to parse as ticket or node ID: {}", e)))?;
+            let endpoint_id: EndpointId = ticket_str.parse().map_err(|e| {
+                crate::error::ClientError::ParseError(format!(
+                    "Failed to parse as ticket or node ID: {}",
+                    e
+                ))
+            })?;
             Ok(endpoint_id.into())
         }
     } else {

@@ -1,0 +1,2 @@
+cargo ndk --target aarch64-linux-android --manifest-path crates/nexapipe-client/Cargo.toml build --release --features "jni local-proxy"
+copy target\aarch64-linux-android\release\libnexapipe_client.so c:\Users\eason\AndroidStudioProjects\nexa\app\src\main\jniLibs\arm64-v8a\libnexa_iroh_proxy.so
