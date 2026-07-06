@@ -2,6 +2,7 @@ use crate::routes::{BackendInfo, RouteConfig};
 use ::http::{Request, Response, StatusCode};
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use futures_util::StreamExt;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper_rustls::HttpsConnectorBuilder;
@@ -272,6 +273,7 @@ pub fn is_websocket_request_static(req: &Request<()>) -> bool {
     false
 }
 
+#[deprecated(note = "Use proxy_to_backend_streaming for large file support")]
 pub async fn proxy_to_backend_using_client(
     client: &HttpClient,
     req: &Request<()>,
@@ -333,6 +335,95 @@ pub async fn proxy_to_backend_using_client(
     builder = builder.header("content-length", bytes.len());
 
     Ok(builder.body(bytes.to_vec())?)
+}
+
+pub async fn proxy_to_backend_streaming(
+    client: &HttpClient,
+    req: &Request<()>,
+    backend_url: &str,
+    body_data: Vec<u8>,
+    send: &mut iroh::endpoint::SendStream,
+) -> Result<(), anyhow::Error> {
+    let url =
+        url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("backend URL missing host"))?
+        .to_string();
+    let port = url.port_or_known_default().unwrap_or(80);
+
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or(req.uri().path());
+
+    let new_uri = format!(
+        "{}://{}:{}{}",
+        url.scheme(), host, port, path
+    )
+    .parse::<http::Uri>()
+    .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
+
+    let mut builder = Request::builder().method(req.method()).uri(new_uri);
+
+    for (name, value) in req.headers() {
+        if name.as_str().to_lowercase() != "host" {
+            builder = builder.header(name, value);
+        }
+    }
+    builder = builder.header("host", host);
+
+    let proxied_req = builder.body(Full::new(body_data.into()))?;
+
+    tracing::debug!(
+        "Proxying request via client (streaming): {} {}",
+        proxied_req.method(),
+        proxied_req.uri()
+    );
+
+    let response = client.request(proxied_req).await?;
+
+    let (parts, body) = response.into_parts();
+
+    let status = parts.status;
+    let status_text = status.canonical_reason().unwrap_or("Unknown");
+
+    let mut response_buf = Vec::new();
+    response_buf
+        .extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), status_text).as_bytes());
+
+    for (name, value) in parts.headers.iter() {
+        let name_lower = name.as_str().to_lowercase();
+        if name_lower == "transfer-encoding" || name_lower == "content-length" {
+            continue;
+        }
+        response_buf.extend_from_slice(name.as_str().as_bytes());
+        response_buf.extend_from_slice(b": ");
+        response_buf.extend_from_slice(value.as_bytes());
+        response_buf.extend_from_slice(b"\r\n");
+    }
+    response_buf.extend_from_slice(b"\r\n");
+
+    send.write_all(&response_buf).await?;
+
+    let mut body_stream = http_body_util::BodyExt::into_data_stream(body);
+    while let Some(chunk) = body_stream.next().await {
+        match chunk {
+            Ok(data) => {
+                send.write_all(&data).await?;
+            }
+            Err(e) => {
+                tracing::debug!("Streaming response read error: {}", e);
+                return Err(e.into());
+            }
+        }
+    }
+
+    send.finish()?;
+
+    Ok(())
 }
 
 pub async fn proxy_to_backend_legacy(

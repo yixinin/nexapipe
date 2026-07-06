@@ -99,11 +99,8 @@ pub async fn handle_bidi_stream(
         handle_websocket_stream(send, recv, &request, &backend_info.url).await?;
     } else {
         let mut send = send;
-        let response =
-            http::proxy_to_backend_using_client(client, &request, &backend_info.url, body_data)
-                .await?;
-        tracing::debug!("Proxy response status: {}", response.status());
-        http::send_response_legacy(&mut send, &response).await?;
+        http::proxy_to_backend_streaming(client, &request, &backend_info.url, body_data, &mut send)
+            .await?;
     }
 
     Ok(())

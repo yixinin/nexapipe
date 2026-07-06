@@ -45,6 +45,12 @@ impl From<iroh::endpoint::WriteError> for ClientError {
     }
 }
 
+impl From<iroh::endpoint::ReadError> for ClientError {
+    fn from(e: iroh::endpoint::ReadError) -> Self {
+        ClientError::ReceiveError(e.to_string())
+    }
+}
+
 impl From<http::Error> for ClientError {
     fn from(e: http::Error) -> Self {
         ClientError::ParseError(e.to_string())

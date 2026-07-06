@@ -51,19 +51,6 @@ proxy_domains = ["fn.iroh.iakl.top", "api.example.com"]
 server_node_id = "319c6a852834da0350b9e91366373a23cd81aeb825fef84077da15a3ffd5d88e"
 domains = ["fn.iroh.iakl.top", "api.example.com"]
 
-[[local_proxy.nodes]]
-server_node_id = "abc123def456ghi789jkl012mno345pqr678stu901vwx234yz"
-domains = ["fn.iroh.iakl.top"]
-
-[[local_proxy.nodes]]
-server_ticket = "endpointaayzy2uffa2nua2qxhurgzrxhir43anoxas756cao7nbli772xmi4aibacwboaaczskqg"
-domains = ["api.example.com"]
-
-# 单一节点配置（兼容旧版本）
-# 当不配置 [[local_proxy.nodes]] 时，使用以下配置
-# server_node_id = "319c6a852834da0350b9e91366373a23cd81aeb825fef84077da15a3ffd5d88e"
-# server_ticket = "endpointaayzy2uffa2nua2qxhurgzrxhir43anoxas756cao7nbli772xmi4aibacwboaaczskqg"
-
 [acme]
 # Enable automatic certificate management
 enabled = false

@@ -10,9 +10,7 @@ use tokio::net::TcpListener;
 #[cfg(feature = "tracing")]
 use tracing;
 
-const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
-const MAX_RESPONSE_SIZE: usize = 1024 * 1024 * 10;
-const MAX_CONNECTIONS: usize = 10;
+
 
 pub struct LocalProxy {
     listener: Arc<TcpListener>,
@@ -173,7 +171,7 @@ async fn handle_local_connection(
 
     let pooled_conn = endpoint_group.get_connection(&host).await?;
     let conn = pooled_conn.conn().clone();
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow::anyhow!(e))?;
+    let (mut send, recv) = conn.open_bi().await.map_err(|e| anyhow::anyhow!(e))?;
 
     let mut modified_request = Vec::with_capacity(n);
     let request_str = String::from_utf8_lossy(&buf[..n]);
@@ -214,8 +212,7 @@ async fn handle_local_connection(
     } else {
         send.write_all(&modified_request).await?;
         send.finish().map_err(|e| anyhow::anyhow!(e))?;
-        let response = recv.read_to_end(MAX_RESPONSE_SIZE).await.map_err(|e| anyhow::anyhow!(e))?;
-        stream.write_all(&response).await?;
+        stream_response_to_client(stream, recv).await?;
     }
 
     endpoint_group.return_connection(&host, pooled_conn).await;
@@ -348,6 +345,36 @@ async fn handle_connect_tunnel(
         _ = iroh_to_client => (),
     }
 
+    Ok(())
+}
+
+async fn stream_response_to_client(
+    mut client_stream: tokio::net::TcpStream,
+    mut recv: iroh::endpoint::RecvStream,
+) -> Result<(), ClientError> {
+    let mut buf = [0u8; 8192];
+    loop {
+        match recv.read(&mut buf).await {
+            Ok(None) => break,
+            Ok(Some(n)) => {
+                if let Err(e) = client_stream.write_all(&buf[..n]).await {
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!("Stream response write error: {}", e);
+                    break;
+                }
+                if let Err(e) = client_stream.flush().await {
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!("Stream response flush error: {}", e);
+                    break;
+                }
+            }
+            Err(e) => {
+                #[cfg(feature = "tracing")]
+                tracing::debug!("Stream response read error: {}", e);
+                return Err(e.into());
+            }
+        }
+    }
     Ok(())
 }
 
