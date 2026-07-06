@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use ::http::{Request, Response, StatusCode};
+use ::http::Request;
 
 #[derive(Debug, Clone)]
 pub struct HttpRequest {

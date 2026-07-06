@@ -307,7 +307,7 @@ impl AcmeManager {
             .unwrap(),
         );
 
-        let expires_at = DateTime::from_utc(naive_not_after, Utc);
+        let expires_at = DateTime::from_naive_utc_and_offset(naive_not_after, Utc);
         let days_remaining = self.calculate_days_remaining(expires_at);
 
         Ok(Some(CertificateInfo {
@@ -335,7 +335,7 @@ impl AcmeManager {
             )
             .unwrap(),
         );
-        Ok(DateTime::from_utc(naive_not_after, Utc))
+        Ok(DateTime::from_naive_utc_and_offset(naive_not_after, Utc))
     }
 
     fn calculate_days_remaining(&self, expires_at: DateTime<Utc>) -> i64 {

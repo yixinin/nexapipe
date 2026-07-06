@@ -1,5 +1,5 @@
 use crate::connection_pool::IrohConnectionPool;
-use crate::endpoint_group::{EndpointGroup, PooledConnection};
+use crate::endpoint_group::EndpointGroup;
 use crate::http::{parse_http_request_legacy, is_websocket_request_static};
 use crate::ClientError;
 use std::sync::Arc;
