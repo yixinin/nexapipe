@@ -10,7 +10,7 @@ use tokio::net::TcpListener;
 #[cfg(feature = "tracing")]
 use tracing;
 
-
+const STREAM_BUF_SIZE: usize = 128 * 1024;
 
 pub struct LocalProxy {
     listener: Arc<TcpListener>,
@@ -116,7 +116,7 @@ async fn handle_local_connection(
     proxy_domains: Arc<Vec<String>>,
     endpoint_group: Arc<EndpointGroup>,
 ) -> Result<(), ClientError> {
-    let mut buf = [0u8; 8192];
+    let mut buf = [0u8; STREAM_BUF_SIZE];
     let n = stream.read(&mut buf).await?;
 
     if n == 0 {
@@ -230,7 +230,7 @@ async fn handle_local_websocket(
     let (client_read, mut client_write) = tokio::io::split(client_stream);
 
     let client_to_iroh = async {
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; STREAM_BUF_SIZE];
         let mut client_read = client_read;
         loop {
             match client_read.read(&mut buf).await {
@@ -252,7 +252,7 @@ async fn handle_local_websocket(
     };
 
     let iroh_to_client = async {
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; STREAM_BUF_SIZE];
         loop {
             match recv.read(&mut buf).await {
                 Ok(None) => break,
@@ -293,7 +293,7 @@ async fn handle_connect_tunnel(
     let (client_read, mut client_write) = tokio::io::split(client_stream);
 
     let client_to_iroh = async {
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; STREAM_BUF_SIZE];
         let mut client_read = client_read;
         loop {
             match client_read.read(&mut buf).await {
@@ -315,7 +315,7 @@ async fn handle_connect_tunnel(
     };
 
     let iroh_to_client = async {
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; STREAM_BUF_SIZE];
         loop {
             match recv.read(&mut buf).await {
                 Ok(None) => break,
@@ -352,7 +352,7 @@ async fn stream_response_to_client(
     mut client_stream: tokio::net::TcpStream,
     mut recv: iroh::endpoint::RecvStream,
 ) -> Result<(), ClientError> {
-    let mut buf = [0u8; 8192];
+    let mut buf = [0u8; STREAM_BUF_SIZE];
     loop {
         match recv.read(&mut buf).await {
             Ok(None) => break,
