@@ -67,8 +67,10 @@ impl IrohConnectionPool {
     pub async fn get_connection(&self) -> Result<Connection, crate::error::ClientError> {
         let mut connections = self.inner.connections.lock().await;
 
+        const MAX_CONNECTION_AGE: tokio::time::Duration = tokio::time::Duration::from_secs(25);
+
         while let Some(pooled) = connections.pop() {
-            if pooled.created_at.elapsed() < tokio::time::Duration::from_secs(60) {
+            if pooled.created_at.elapsed() < MAX_CONNECTION_AGE {
                 return Ok(pooled.conn);
             }
         }

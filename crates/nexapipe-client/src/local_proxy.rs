@@ -1,7 +1,7 @@
+use crate::ClientError;
 use crate::connection_pool::IrohConnectionPool;
 use crate::endpoint_group::EndpointGroup;
-use crate::http::{parse_http_request_legacy, is_websocket_request_static};
-use crate::ClientError;
+use crate::http::{is_websocket_request_static, parse_http_request_legacy};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,6 +11,7 @@ use tokio::net::TcpListener;
 use tracing;
 
 const STREAM_BUF_SIZE: usize = 128 * 1024;
+const STREAM_OPERATION_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
 pub struct LocalProxy {
     listener: Arc<TcpListener>,
@@ -66,10 +67,9 @@ impl LocalProxy {
                 break;
             }
 
-            match tokio::time::timeout(
-                tokio::time::Duration::from_millis(100),
-                listener.accept(),
-            ).await {
+            match tokio::time::timeout(tokio::time::Duration::from_millis(100), listener.accept())
+                .await
+            {
                 Ok(Ok((stream, addr))) => {
                     #[cfg(feature = "tracing")]
                     tracing::debug!("New connection from: {}", addr);
@@ -78,7 +78,13 @@ impl LocalProxy {
                     let endpoint_group_clone = endpoint_group.clone();
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle_local_connection(stream, proxy_domains_clone, endpoint_group_clone).await {
+                        if let Err(e) = handle_local_connection(
+                            stream,
+                            proxy_domains_clone,
+                            endpoint_group_clone,
+                        )
+                        .await
+                        {
                             #[cfg(feature = "tracing")]
                             tracing::error!("Failed to handle local connection: {}", e);
                         }
@@ -141,11 +147,19 @@ async fn handle_local_connection(
             return Ok(());
         }
 
-        stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
 
         let pooled_conn = endpoint_group.get_connection(&host).await?;
         let conn = pooled_conn.conn().clone();
-        let (send, recv) = conn.open_bi().await.map_err(|e| anyhow::anyhow!(e))?;
+        let (send, recv) = tokio::time::timeout(
+            STREAM_OPERATION_TIMEOUT,
+            conn.open_bi(),
+        )
+        .await
+        .map_err(|_| crate::error::ClientError::TimeoutError)?
+        .map_err(|e| anyhow::anyhow!(e))?;
 
         handle_connect_tunnel(stream, send, recv).await?;
         endpoint_group.return_connection(&host, pooled_conn).await;
@@ -171,7 +185,13 @@ async fn handle_local_connection(
 
     let pooled_conn = endpoint_group.get_connection(&host).await?;
     let conn = pooled_conn.conn().clone();
-    let (mut send, recv) = conn.open_bi().await.map_err(|e| anyhow::anyhow!(e))?;
+    let (mut send, recv) = tokio::time::timeout(
+        STREAM_OPERATION_TIMEOUT,
+        conn.open_bi(),
+    )
+    .await
+    .map_err(|_| crate::error::ClientError::TimeoutError)?
+    .map_err(|e| anyhow::anyhow!(e))?;
 
     let mut modified_request = Vec::with_capacity(n);
     let request_str = String::from_utf8_lossy(&buf[..n]);
