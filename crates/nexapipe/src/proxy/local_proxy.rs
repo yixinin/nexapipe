@@ -58,13 +58,14 @@ pub async fn run_local_proxy(
     let node_ids = endpoint_group.node_ids();
     tracing::info!("Connected to {} endpoint(s): {:?}", node_ids.len(), node_ids);
 
-    let local_proxy = LocalProxy::new(&listen_addr, proxy_domains, endpoint_group).await?;
+    let local_proxy = Arc::new(LocalProxy::new(&listen_addr, proxy_domains, endpoint_group).await?);
     
+    let local_proxy_clone = local_proxy.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         loop {
             if shutdown_signal.is_shutdown_requested() {
                 tracing::info!("Shutdown signal received, stopping local proxy");
+                local_proxy_clone.stop();
                 break;
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -72,6 +73,7 @@ pub async fn run_local_proxy(
     });
 
     local_proxy.run().await?;
+    local_proxy.close_all().await;
 
     Ok(())
 }

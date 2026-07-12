@@ -60,17 +60,21 @@ impl IrohConnectionPool {
                 if let Some(e) = ep.as_ref() {
                     e.id()
                 } else {
-                    EndpointId::from_bytes(&[0u8; 32]).expect("Failed to create default endpoint id")
+                    EndpointId::from_bytes(&[0u8; 32])
+                        .expect("Failed to create default endpoint id")
                 }
             }
-            Err(_) => EndpointId::from_bytes(&[0u8; 32]).expect("Failed to create default endpoint id"),
+            Err(_) => {
+                EndpointId::from_bytes(&[0u8; 32]).expect("Failed to create default endpoint id")
+            }
         }
     }
 
     pub async fn get_connection(&self) -> Result<Connection, crate::error::ClientError> {
         let mut connections = self.inner.connections.lock().await;
 
-        connections.retain(|pooled| pooled.created_at.elapsed() < tokio::time::Duration::from_secs(60));
+        connections
+            .retain(|pooled| pooled.created_at.elapsed() < tokio::time::Duration::from_secs(60));
 
         if let Some(pooled) = connections.pop() {
             return Ok(pooled.conn);

@@ -39,9 +39,9 @@ key_path = ""
 [local_proxy]
 enabled = true
 listen_addr = "127.0.0.1:8081"
-proxy_domains = ["fn.iroh.iakl.top", "api.example.com"]
+proxy_domains = ["fn.iroh.iakl.top"]
 # 全局负载均衡策略（可选），默认 round_robin
-# strategy = "round_robin"
+strategy = "round_robin"
 # strategy = "random"
 
 # 多节点配置（推荐）
@@ -49,7 +49,7 @@ proxy_domains = ["fn.iroh.iakl.top", "api.example.com"]
 # 同一个域名可以配置在多个节点上，实现负载均衡
 [[local_proxy.nodes]]
 server_node_id = "319c6a852834da0350b9e91366373a23cd81aeb825fef84077da15a3ffd5d88e"
-domains = ["fn.iroh.iakl.top", "api.example.com"]
+domains = ["fn.iroh.iakl.top"]
 
 [acme]
 # Enable automatic certificate management
