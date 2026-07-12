@@ -10,7 +10,7 @@ version = "0.1.0"
 edition = "2024"
 
 [profile.release]
-panic = "abort"
+panic = "unwind"
 opt-level = "s"
 codegen-units = 1
 lto = true

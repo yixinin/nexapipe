@@ -33,6 +33,8 @@ webpki-roots = { version = "1.0.8", optional = true }
 uniffi = { version = "0.25", optional = true }
 tracing = { version = "0.1.44", optional = true }
 jni = { version = "0.21", features = ["invocation"], optional = true }
+log = { version = "0.4", optional = true }
+android_logger = { version = "0.14", optional = true }
 once_cell = "1.19"
 fastrand = "2.1"
 
@@ -43,10 +45,7 @@ webpki-roots = ["dep:webpki-roots"]
 local-proxy = ["tokio/net"]
 uniffi = ["dep:uniffi"]
 tracing = ["dep:tracing"]
-jni = ["dep:jni"]
-
-[target.'cfg(target_os = "android")'.dependencies]
-webpki-roots = "1.0.8"
+jni = ["dep:jni", "dep:log", "dep:android_logger"]
 
 [target.'cfg(target_os = "ios")'.dependencies]
 webpki-roots = "1.0.8"

@@ -10,6 +10,14 @@ use tokio::net::TcpListener;
 #[cfg(feature = "tracing")]
 use tracing;
 
+#[cfg(feature = "jni")]
+use crate::jni_log;
+
+#[cfg(not(feature = "jni"))]
+macro_rules! jni_log {
+    ($($arg:tt)*) => {};
+}
+
 const STREAM_BUF_SIZE: usize = 128 * 1024;
 
 pub struct LocalProxy {
@@ -25,7 +33,20 @@ impl LocalProxy {
         proxy_domains: Vec<String>,
         endpoint_group: EndpointGroup,
     ) -> Result<Self, ClientError> {
-        let listener = TcpListener::bind(listen_addr).await?;
+        #[cfg(feature = "jni")]
+        jni_log!("[DEBUG:local-proxy] Binding to {}", listen_addr);
+        let listener = match TcpListener::bind(listen_addr).await {
+            Ok(l) => {
+                #[cfg(feature = "jni")]
+                jni_log!("[DEBUG:local-proxy] Bound successfully to {}", listen_addr);
+                l
+            }
+            Err(e) => {
+                #[cfg(feature = "jni")]
+                jni_log!("[DEBUG:local-proxy] Failed to bind to {}: {}", listen_addr, e);
+                return Err(e.into());
+            }
+        };
         #[cfg(feature = "tracing")]
         tracing::info!("Local proxy listening on: {}", listen_addr);
         Ok(Self {

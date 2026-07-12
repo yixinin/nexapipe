@@ -56,21 +56,24 @@ impl IrohConnectionPool {
 
     pub fn node_id(&self) -> EndpointId {
         match self.inner.ep.try_lock() {
-            Ok(ep) => ep
-                .as_ref()
-                .map(|e| e.id())
-                .unwrap_or_else(|| EndpointId::from_bytes(&[0u8; 32]).unwrap()),
-            Err(_) => EndpointId::from_bytes(&[0u8; 32]).unwrap(),
+            Ok(ep) => {
+                if let Some(e) = ep.as_ref() {
+                    e.id()
+                } else {
+                    EndpointId::from_bytes(&[0u8; 32]).expect("Failed to create default endpoint id")
+                }
+            }
+            Err(_) => EndpointId::from_bytes(&[0u8; 32]).expect("Failed to create default endpoint id"),
         }
     }
 
     pub async fn get_connection(&self) -> Result<Connection, crate::error::ClientError> {
         let mut connections = self.inner.connections.lock().await;
 
-        while let Some(pooled) = connections.pop() {
-            if pooled.created_at.elapsed() < tokio::time::Duration::from_secs(60) {
-                return Ok(pooled.conn);
-            }
+        connections.retain(|pooled| pooled.created_at.elapsed() < tokio::time::Duration::from_secs(60));
+
+        if let Some(pooled) = connections.pop() {
+            return Ok(pooled.conn);
         }
 
         drop(connections);
