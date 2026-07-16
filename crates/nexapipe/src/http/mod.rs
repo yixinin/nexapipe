@@ -394,23 +394,37 @@ pub async fn proxy_to_backend_streaming(
     response_buf
         .extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), status_text).as_bytes());
 
+    // Check if the backend used chunked encoding (meaning there was no
+    // Content-Length). Hyper decodes chunked responses automatically, so
+    // we must re-apply chunked framing if the original was chunked.
+    let original_was_chunked = parts
+        .headers
+        .get("transfer-encoding")
+        .and_then(|h| h.to_str().ok())
+        .map(|v| v.to_lowercase().contains("chunked"))
+        .unwrap_or(false);
+    let has_content_length = parts.headers.get("content-length").is_some();
+
     for (name, value) in parts.headers.iter() {
         let name_lower = name.as_str().to_lowercase();
-        // Strip both Content-Length and Transfer-Encoding: we will re-apply
-        // our own chunked transfer encoding for reliable framing.
-        if name_lower == "transfer-encoding" || name_lower == "content-length" {
+        // Strip Transfer-Encoding: hyper already decoded the chunks.
+        if name_lower == "transfer-encoding" {
             continue;
         }
+        // Preserve Content-Length: the body bytes we forward are the
+        // same bytes the backend sent, so the original value is correct.
         response_buf.extend_from_slice(name.as_str().as_bytes());
         response_buf.extend_from_slice(b": ");
         response_buf.extend_from_slice(value.as_bytes());
         response_buf.extend_from_slice(b"\r\n");
     }
 
-    // Always use chunked transfer encoding so the browser can reliably
-    // determine response boundaries regardless of Content-Length mismatches
-    // or connection-close timing differences.
-    response_buf.extend_from_slice(b"transfer-encoding: chunked\r\n");
+    // If the original was chunked (no Content-Length), re-apply chunked
+    // encoding to give the browser proper framing.
+    let use_chunked = original_was_chunked && !has_content_length;
+    if use_chunked {
+        response_buf.extend_from_slice(b"transfer-encoding: chunked\r\n");
+    }
     response_buf.extend_from_slice(b"\r\n");
 
     send.write_all(&response_buf).await?;
@@ -419,10 +433,14 @@ pub async fn proxy_to_backend_streaming(
     while let Some(chunk) = body_stream.next().await {
         match chunk {
             Ok(data) => {
-                let size_line = format!("{:x}\r\n", data.len());
-                send.write_all(size_line.as_bytes()).await?;
-                send.write_all(&data).await?;
-                send.write_all(b"\r\n").await?;
+                if use_chunked {
+                    let size_line = format!("{:x}\r\n", data.len());
+                    send.write_all(size_line.as_bytes()).await?;
+                    send.write_all(&data).await?;
+                    send.write_all(b"\r\n").await?;
+                } else {
+                    send.write_all(&data).await?;
+                }
             }
             Err(e) => {
                 tracing::debug!("Streaming response read error: {}", e);
@@ -431,7 +449,10 @@ pub async fn proxy_to_backend_streaming(
         }
     }
 
-    send.write_all(b"0\r\n\r\n").await?;
+    if use_chunked {
+        send.write_all(b"0\r\n\r\n").await?;
+    }
+
     send.finish()?;
 
     Ok(())

@@ -396,7 +396,7 @@ async fn handle_local_connection(
 
         let _ = client_task.await;
         let _ = tokio::time::timeout(
-            tokio::time::Duration::from_secs(60),
+            tokio::time::Duration::from_secs(300),
             &mut backend_task
         ).await;
     }
