@@ -212,7 +212,7 @@ async fn handle_local_connection(
             return Ok(());
         }
 
-        let (mut client_read, mut client_write) = stream.into_split();
+        let (mut client_read, mut client_write) = tokio::io::split(stream);
         client_write.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
         let pooled_conn = endpoint_group.get_connection(&host).await?;
@@ -311,7 +311,7 @@ async fn handle_local_connection(
     .map_err(|_| crate::error::ClientError::TimeoutError)?
     .map_err(|e| anyhow::anyhow!(e))?;
 
-    let (mut client_read, mut client_write) = stream.into_split();
+    let (mut client_read, mut client_write) = tokio::io::split(stream);
 
     // Remove cache validation headers to prevent 304 responses with empty body
     let filtered_headers = remove_cache_validation_headers(&request_buf[..header_end]);
@@ -388,22 +388,17 @@ async fn handle_local_connection(
             _ = &mut backend_task => (),
         }
     } else {
-        // HTTP: drain the full response first (so OwnedWriteHalf's drop sends FIN
-        // to the VPN immediately), then wait for the client to finish.
+        // HTTP: forward the full request first, then drain the full response.
+        // This prevents the request body from being truncated when the backend
+        // returns an early error response.
         let client_task = tokio::spawn(client_to_backend);
         let mut backend_task = tokio::spawn(backend_to_client);
 
-        // Wait for the backend response to complete first — when backend_task
-        // finishes, OwnedWriteHalf is dropped which calls shutdown(Write),
-        // sending FIN to the VPN. The VPN then forwards FIN to the browser,
-        // so the browser knows the response is complete even without Content-Length.
+        let _ = client_task.await;
         let _ = tokio::time::timeout(
             tokio::time::Duration::from_secs(60),
             &mut backend_task
         ).await;
-
-        // Now the VPN sees EOF and closes, so client_task completes quickly
-        let _ = client_task.await;
     }
 
     endpoint_group.return_connection(&host, pooled_conn).await;
