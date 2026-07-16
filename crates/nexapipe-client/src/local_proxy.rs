@@ -412,6 +412,10 @@ async fn handle_local_connection(
 }
 
 fn remove_cache_validation_headers(header_bytes: &[u8]) -> Vec<u8> {
+    // The input always ends with \r\n\r\n (the HTTP header terminator,
+    // up to header_end). We iterate over each header line, strip the cache
+    // validation headers, and preserve the original \r\n\r\n terminator
+    // so the body (appended separately) starts at the right position.
     let mut result = Vec::with_capacity(header_bytes.len());
     let mut start = 0;
 
@@ -432,7 +436,7 @@ fn remove_cache_validation_headers(header_bytes: &[u8]) -> Vec<u8> {
         start = line_end + 2;
     }
 
-    result.extend_from_slice(b"\r\n");
+    // Loop already preserved the \r\n\r\n terminator — don't add an extra one
     result
 }
 
