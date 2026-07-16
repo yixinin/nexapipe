@@ -21,6 +21,7 @@ macro_rules! jni_log {
 const STREAM_BUF_SIZE: usize = 128 * 1024;
 const STREAM_OPERATION_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
+#[derive(Clone)]
 pub struct LocalProxy {
     listener: Arc<TcpListener>,
     endpoint_group: Arc<EndpointGroup>,
@@ -32,7 +33,7 @@ impl LocalProxy {
     pub async fn new(
         listen_addr: &str,
         proxy_domains: Vec<String>,
-        endpoint_group: EndpointGroup,
+        endpoint_group: Arc<EndpointGroup>,
     ) -> Result<Self, ClientError> {
         #[cfg(feature = "jni")]
         jni_log!("[DEBUG:local-proxy] Binding to {}", listen_addr);
@@ -52,7 +53,7 @@ impl LocalProxy {
         tracing::info!("Local proxy listening on: {}", listen_addr);
         Ok(Self {
             listener: Arc::new(listener),
-            endpoint_group: Arc::new(endpoint_group),
+            endpoint_group,
             proxy_domains: Arc::new(proxy_domains),
             stopped: Arc::new(AtomicBool::new(false)),
         })
@@ -143,18 +144,61 @@ async fn handle_local_connection(
     proxy_domains: Arc<Vec<String>>,
     endpoint_group: Arc<EndpointGroup>,
 ) -> Result<(), ClientError> {
-    let mut buf = [0u8; STREAM_BUF_SIZE];
-    let n = stream.read(&mut buf).await?;
+    jni_log!("[DEBUG:local-proxy] New local connection received");
 
-    if n == 0 {
+    // Step 1: Read the complete HTTP request header (up to \r\n\r\n)
+    let mut request_buf = Vec::new();
+    let mut temp_buf = [0u8; STREAM_BUF_SIZE];
+    let mut header_end: Option<usize> = None;
+
+    while header_end.is_none() {
+        let n = match tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            stream.read(&mut temp_buf)
+        ).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                jni_log!("[DEBUG:local-proxy] Read error: {}", e);
+                return Ok(());
+            }
+            Err(_) => {
+                jni_log!("[DEBUG:local-proxy] Read timeout, closing connection");
+                return Ok(());
+            }
+        };
+
+        let prev_len = request_buf.len();
+        request_buf.extend_from_slice(&temp_buf[..n]);
+
+        // Search for \r\n\r\n, starting a few bytes before the new data
+        let search_start = prev_len.saturating_sub(3);
+        if let Some(pos) = request_buf[search_start..].windows(4).position(|w| w == b"\r\n\r\n") {
+            header_end = Some(search_start + pos + 4);
+        }
+    }
+
+    if request_buf.is_empty() {
+        jni_log!("[DEBUG:local-proxy] Empty request, closing connection");
         return Ok(());
     }
 
-    let request = match parse_http_request_legacy(&buf[..n]) {
-        Ok(req) => req,
+    let header_end = match header_end {
+        Some(pos) => pos,
+        None => {
+            jni_log!("[DEBUG:local-proxy] HTTP header end not found, closing connection");
+            return Ok(());
+        }
+    };
+
+    let request = match parse_http_request_legacy(&request_buf[..header_end]) {
+        Ok(req) => {
+            jni_log!("[DEBUG:local-proxy] Parsed HTTP request: {} {}", req.method(), req.uri());
+            req
+        },
         Err(e) => {
-            #[cfg(feature = "tracing")]
-            tracing::warn!("Failed to parse HTTP request: {}", e);
+            jni_log!("[DEBUG:local-proxy] Failed to parse HTTP request: {}", e);
+            jni_log!("[DEBUG:local-proxy] First 16 bytes: {:?}", &request_buf[..std::cmp::min(request_buf.len(), 16)]);
             return Ok(());
         }
     };
@@ -168,13 +212,12 @@ async fn handle_local_connection(
             return Ok(());
         }
 
-        stream
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await?;
+        let (mut client_read, mut client_write) = stream.into_split();
+        client_write.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
         let pooled_conn = endpoint_group.get_connection(&host).await?;
         let conn = pooled_conn.conn().clone();
-        let (send, recv) = tokio::time::timeout(
+        let (mut send, mut recv) = tokio::time::timeout(
             STREAM_OPERATION_TIMEOUT,
             conn.open_bi(),
         )
@@ -182,7 +225,58 @@ async fn handle_local_connection(
         .map_err(|_| crate::error::ClientError::TimeoutError)?
         .map_err(|e| anyhow::anyhow!(e))?;
 
-        handle_connect_tunnel(stream, send, recv).await?;
+        let client_to_iroh = async {
+            let mut buf = [0u8; STREAM_BUF_SIZE];
+            loop {
+                match client_read.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Err(e) = send.write_all(&buf[..n]).await {
+                            #[cfg(feature = "tracing")]
+                            tracing::debug!("Tunnel client_to_iroh write error: {}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!("Tunnel client_to_iroh read error: {}", e);
+                        break;
+                    }
+                }
+            }
+        };
+
+        let iroh_to_client = async {
+            let mut buf = [0u8; STREAM_BUF_SIZE];
+            loop {
+                match recv.read(&mut buf).await {
+                    Ok(None) => break,
+                    Ok(Some(n)) => {
+                        if let Err(e) = client_write.write_all(&buf[..n]).await {
+                            #[cfg(feature = "tracing")]
+                            tracing::debug!("Tunnel iroh_to_client write error: {}", e);
+                            break;
+                        }
+                        if let Err(e) = client_write.flush().await {
+                            #[cfg(feature = "tracing")]
+                            tracing::debug!("Tunnel iroh_to_client flush error: {}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!("Tunnel iroh_to_client read error: {}", e);
+                        break;
+                    }
+                }
+            }
+        };
+
+        tokio::select! {
+            _ = client_to_iroh => (),
+            _ = iroh_to_client => (),
+        }
+
         endpoint_group.return_connection(&host, pooled_conn).await;
         return Ok(());
     }
@@ -191,6 +285,7 @@ async fn handle_local_connection(
     for header in request.headers().get_all("host") {
         if let Ok(h) = header.to_str() {
             let h = h.split(':').next().unwrap_or(h);
+            jni_log!("[DEBUG:local-proxy] Found Host header: '{}'", h);
             if should_proxy_domain(&h, &proxy_domains) {
                 target_host = Some(h.to_string());
                 break;
@@ -199,14 +294,16 @@ async fn handle_local_connection(
     }
 
     if target_host.is_none() {
+        jni_log!("[DEBUG:local-proxy] No matching Host header found");
         return Ok(());
     }
 
     let host = target_host.unwrap();
+    jni_log!("[DEBUG:local-proxy] Getting connection for domain: '{}'", host);
 
     let pooled_conn = endpoint_group.get_connection(&host).await?;
     let conn = pooled_conn.conn().clone();
-    let (mut send, recv) = tokio::time::timeout(
+    let (mut send, mut recv) = tokio::time::timeout(
         STREAM_OPERATION_TIMEOUT,
         conn.open_bi(),
     )
@@ -214,220 +311,141 @@ async fn handle_local_connection(
     .map_err(|_| crate::error::ClientError::TimeoutError)?
     .map_err(|e| anyhow::anyhow!(e))?;
 
-    let mut modified_request = Vec::with_capacity(n);
-    let request_str = String::from_utf8_lossy(&buf[..n]);
+    let (mut client_read, mut client_write) = stream.into_split();
 
-    let header_end = request_str.find("\r\n\r\n").map(|pos| pos + 4);
-    let (headers_part, body_part) = if let Some(pos) = header_end {
-        let headers = &request_str[..pos];
-        let body = &buf[pos..n];
-        (headers, Some(body))
-    } else {
-        (request_str.as_ref(), None)
+    // Remove cache validation headers to prevent 304 responses with empty body
+    let filtered_headers = remove_cache_validation_headers(&request_buf[..header_end]);
+    let mut request_to_send = filtered_headers;
+    request_to_send.extend_from_slice(&request_buf[header_end..]);
+
+    jni_log!("[DEBUG:local-proxy] Forwarding {} bytes to backend, Host: {}", request_to_send.len(), host);
+    send.write_all(&request_to_send).await?;
+
+    let client_to_backend = async move {
+        let mut buf = [0u8; STREAM_BUF_SIZE];
+        loop {
+            match client_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Err(e) = send.write_all(&buf[..n]).await {
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!("Client to backend write error: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!("Client read error: {}", e);
+                    break;
+                }
+            }
+        }
+        let _ = send.finish();
     };
 
-    let mut host_replaced = false;
-    for line in headers_part.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        if line.to_lowercase().starts_with("host:") {
-            if !host_replaced {
-                modified_request.extend_from_slice(format!("Host: {}\r\n", host).as_bytes());
-                host_replaced = true;
+    let backend_to_client = async move {
+        let mut buf = [0u8; STREAM_BUF_SIZE];
+        let mut total_bytes = 0;
+        let mut debug_preview = Vec::with_capacity(1500);
+        loop {
+            match recv.read(&mut buf).await {
+                Ok(None) => break,
+                Ok(Some(n)) => {
+                    total_bytes += n;
+                    if debug_preview.len() < 1500 {
+                        debug_preview.extend_from_slice(&buf[..std::cmp::min(n, 1500 - debug_preview.len())]);
+                    }
+                    if let Err(e) = client_write.write_all(&buf[..n]).await {
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!("Backend to client write error: {}", e);
+                        break;
+                    }
+                    if let Err(e) = client_write.flush().await {
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!("Backend to client flush error: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!("Backend read error: {}", e);
+                    break;
+                }
             }
-        } else {
-            modified_request.extend_from_slice(line.as_bytes());
-            modified_request.extend_from_slice(b"\r\n");
         }
-    }
-
-    modified_request.extend_from_slice(b"\r\n");
-
-    if let Some(body) = body_part {
-        modified_request.extend_from_slice(body);
-    }
+        jni_log!("[DEBUG:local-proxy] Response sent: {} bytes", total_bytes);
+        if !debug_preview.is_empty() {
+            jni_log!("[DEBUG:local-proxy] Response preview: {}", String::from_utf8_lossy(&debug_preview));
+        }
+    };
 
     if is_websocket_request_static(&request) {
-        handle_local_websocket(stream, send, recv, &modified_request).await?;
+        // WebSocket: run both directions until either side closes
+        let mut client_task = tokio::spawn(client_to_backend);
+        let mut backend_task = tokio::spawn(backend_to_client);
+        tokio::select! {
+            _ = &mut client_task => (),
+            _ = &mut backend_task => (),
+        }
     } else {
-        send.write_all(&modified_request).await?;
-        send.finish().map_err(|e| anyhow::anyhow!(e))?;
-        stream_response_to_client(stream, recv).await?;
+        // HTTP: drain the full response first (so OwnedWriteHalf's drop sends FIN
+        // to the VPN immediately), then wait for the client to finish.
+        let client_task = tokio::spawn(client_to_backend);
+        let mut backend_task = tokio::spawn(backend_to_client);
+
+        // Wait for the backend response to complete first — when backend_task
+        // finishes, OwnedWriteHalf is dropped which calls shutdown(Write),
+        // sending FIN to the VPN. The VPN then forwards FIN to the browser,
+        // so the browser knows the response is complete even without Content-Length.
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(60),
+            &mut backend_task
+        ).await;
+
+        // Now the VPN sees EOF and closes, so client_task completes quickly
+        let _ = client_task.await;
     }
 
     endpoint_group.return_connection(&host, pooled_conn).await;
+    jni_log!("[DEBUG:local-proxy] Connection closed");
     Ok(())
 }
 
-async fn handle_local_websocket(
-    client_stream: tokio::net::TcpStream,
-    mut send: iroh::endpoint::SendStream,
-    mut recv: iroh::endpoint::RecvStream,
-    initial_request: &[u8],
-) -> Result<(), ClientError> {
-    send.write_all(initial_request).await?;
+fn remove_cache_validation_headers(header_bytes: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(header_bytes.len());
+    let mut start = 0;
 
-    let (client_read, mut client_write) = tokio::io::split(client_stream);
+    while let Some(pos) = header_bytes[start..].windows(2).position(|w| w == b"\r\n") {
+        let line_end = start + pos;
+        let line = &header_bytes[start..line_end];
 
-    let client_to_iroh = async {
-        let mut buf = [0u8; STREAM_BUF_SIZE];
-        let mut client_read = client_read;
-        loop {
-            match client_read.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if let Err(e) = send.write_all(&buf[..n]).await {
-                        #[cfg(feature = "tracing")]
-                        tracing::debug!("WebSocket client_to_iroh error: {}", e);
-                        break;
-                    }
-                }
-                Err(e) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::debug!("WebSocket client_to_iroh read error: {}", e);
-                    break;
-                }
-            }
+        let is_cache_header = line.len() >= 18 && {
+            let lower = line.to_ascii_lowercase();
+            lower.starts_with(b"if-modified-since:") || lower.starts_with(b"if-none-match:")
+        };
+
+        if !is_cache_header {
+            result.extend_from_slice(line);
+            result.extend_from_slice(b"\r\n");
         }
-    };
 
-    let iroh_to_client = async {
-        let mut buf = [0u8; STREAM_BUF_SIZE];
-        loop {
-            match recv.read(&mut buf).await {
-                Ok(None) => break,
-                Ok(Some(n)) => {
-                    if let Err(e) = client_write.write_all(&buf[..n]).await {
-                        #[cfg(feature = "tracing")]
-                        tracing::debug!("WebSocket iroh_to_client error: {}", e);
-                        break;
-                    }
-                    if let Err(e) = client_write.flush().await {
-                        #[cfg(feature = "tracing")]
-                        tracing::debug!("WebSocket iroh_to_client flush error: {}", e);
-                        break;
-                    }
-                }
-                Err(e) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::debug!("WebSocket iroh_to_client read error: {}", e);
-                    break;
-                }
-            }
-        }
-    };
-
-    tokio::select! {
-        _ = client_to_iroh => (),
-        _ = iroh_to_client => (),
+        start = line_end + 2;
     }
 
-    Ok(())
-}
-
-async fn handle_connect_tunnel(
-    client_stream: tokio::net::TcpStream,
-    mut send: iroh::endpoint::SendStream,
-    mut recv: iroh::endpoint::RecvStream,
-) -> Result<(), ClientError> {
-    let (client_read, mut client_write) = tokio::io::split(client_stream);
-
-    let client_to_iroh = async {
-        let mut buf = [0u8; STREAM_BUF_SIZE];
-        let mut client_read = client_read;
-        loop {
-            match client_read.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if let Err(e) = send.write_all(&buf[..n]).await {
-                        #[cfg(feature = "tracing")]
-                        tracing::debug!("Tunnel client_to_iroh write error: {}", e);
-                        break;
-                    }
-                }
-                Err(e) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::debug!("Tunnel client_to_iroh read error: {}", e);
-                    break;
-                }
-            }
-        }
-    };
-
-    let iroh_to_client = async {
-        let mut buf = [0u8; STREAM_BUF_SIZE];
-        loop {
-            match recv.read(&mut buf).await {
-                Ok(None) => break,
-                Ok(Some(n)) => {
-                    if let Err(e) = client_write.write_all(&buf[..n]).await {
-                        #[cfg(feature = "tracing")]
-                        tracing::debug!("Tunnel iroh_to_client write error: {}", e);
-                        break;
-                    }
-                    if let Err(e) = client_write.flush().await {
-                        #[cfg(feature = "tracing")]
-                        tracing::debug!("Tunnel iroh_to_client flush error: {}", e);
-                        break;
-                    }
-                }
-                Err(e) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::debug!("Tunnel iroh_to_client read error: {}", e);
-                    break;
-                }
-            }
-        }
-    };
-
-    tokio::select! {
-        _ = client_to_iroh => (),
-        _ = iroh_to_client => (),
-    }
-
-    Ok(())
-}
-
-async fn stream_response_to_client(
-    mut client_stream: tokio::net::TcpStream,
-    mut recv: iroh::endpoint::RecvStream,
-) -> Result<(), ClientError> {
-    let mut buf = [0u8; STREAM_BUF_SIZE];
-    loop {
-        match recv.read(&mut buf).await {
-            Ok(None) => break,
-            Ok(Some(n)) => {
-                if let Err(e) = client_stream.write_all(&buf[..n]).await {
-                    #[cfg(feature = "tracing")]
-                    tracing::debug!("Stream response write error: {}", e);
-                    break;
-                }
-                if let Err(e) = client_stream.flush().await {
-                    #[cfg(feature = "tracing")]
-                    tracing::debug!("Stream response flush error: {}", e);
-                    break;
-                }
-            }
-            Err(e) => {
-                #[cfg(feature = "tracing")]
-                tracing::debug!("Stream response read error: {}", e);
-                return Err(e.into());
-            }
-        }
-    }
-    Ok(())
+    result.extend_from_slice(b"\r\n");
+    result
 }
 
 fn should_proxy_domain(host: &str, proxy_domains: &[String]) -> bool {
     let host_lower = host.to_lowercase();
     for domain in proxy_domains {
-        if domain.starts_with('*') {
-            let suffix = &domain[1..];
+        let domain_lower = domain.to_lowercase();
+        if domain_lower.starts_with('*') {
+            let suffix = &domain_lower[1..];
             if host_lower.ends_with(suffix) {
                 return true;
             }
-        } else if host_lower == domain.to_lowercase() {
+        } else if host_lower == domain_lower || host_lower.ends_with(&format!(".{}", domain_lower)) {
             return true;
         }
     }

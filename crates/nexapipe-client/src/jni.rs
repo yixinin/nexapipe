@@ -1,22 +1,25 @@
-use crate::{IrohConnectionPool, LocalProxy, EndpointGroup, NodeConfig, LoadBalancingStrategy};
+use crate::{IrohConnectionPool, LocalProxy, EndpointGroup, NodeConfig, DomainMapping, LoadBalancingStrategy};
 use iroh::Endpoint;
 use iroh::endpoint::presets;
 use jni::objects::{JClass, JString};
 use jni::sys::{jint, jstring};
 use jni::JNIEnv;
+use ndk_context;
 use once_cell::sync::OnceCell;
 use std::panic;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::{Runtime, Builder};
 
 static RUNTIME: OnceCell<Runtime> = OnceCell::new();
-static ENDPOINT: OnceCell<Endpoint> = OnceCell::new();
+static ENDPOINT: Mutex<Option<Endpoint>> = Mutex::new(None);
 static STATE: OnceCell<Arc<Mutex<ProxyState>>> = OnceCell::new();
 
 struct ProxyState {
     conn_pool: Option<IrohConnectionPool>,
     endpoint_group: Option<Arc<EndpointGroup>>,
+    local_proxy: Option<LocalProxy>,
     nodes: Vec<NodeConfig>,
+    domain_mappings: Vec<DomainMapping>,
     domains: Vec<String>,
 }
 
@@ -24,8 +27,8 @@ fn get_runtime() -> Option<&'static Runtime> {
     RUNTIME.get_or_try_init(|| Runtime::new()).ok()
 }
 
-fn get_endpoint() -> Option<&'static Endpoint> {
-    ENDPOINT.get()
+fn get_endpoint() -> Option<Endpoint> {
+    ENDPOINT.lock().ok()?.clone()
 }
 
 fn get_state() -> Option<&'static Arc<Mutex<ProxyState>>> {
@@ -36,7 +39,9 @@ fn init_state() -> &'static Arc<Mutex<ProxyState>> {
     STATE.get_or_init(|| Arc::new(Mutex::new(ProxyState {
         conn_pool: None,
         endpoint_group: None,
+        local_proxy: None,
         nodes: Vec::new(),
+        domain_mappings: Vec::new(),
         domains: Vec::new(),
     })))
 }
@@ -62,12 +67,19 @@ macro_rules! jni_log {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeInit(_env: JNIEnv, _class: JClass) -> jint {
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeInit(env: JNIEnv, _class: JClass) -> jint {
     #[cfg(target_os = "android")]
     {
+        unsafe {
+            let raw_env = env.get_raw();
+            let mut raw_vm = std::ptr::null_mut();
+            (**raw_env).GetJavaVM.unwrap()(raw_env, &mut raw_vm);
+            ndk_context::initialize_android_context(raw_vm as *mut _, std::ptr::null_mut());
+        }
         android_logger::init_once(
             android_logger::Config::default()
-                .with_max_level(log::LevelFilter::Debug),
+                .with_max_level(log::LevelFilter::Debug)
+                .with_tag("NexaVpnService"),
         );
     }
 
@@ -119,25 +131,24 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartIroh(
     };
 
     let result = runtime.block_on(async {
-        if let Some(ep) = ENDPOINT.get() {
-            return Ok(ep.id().to_string());
-        }
+        if let Ok(mut guard) = ENDPOINT.lock() {
+            if let Some(ep) = guard.as_ref() {
+                return Ok(ep.id().to_string());
+            }
 
-        match Endpoint::builder(presets::N0).bind().await {
-            Ok(ep) => {
-                let node_id = ep.id().to_string();
-                match ENDPOINT.set(ep) {
-                    Ok(_) => Ok(node_id),
-                    Err(e) => {
-                        jni_log!("Endpoint already exists: {}", e.id());
-                        Ok(e.id().to_string())
-                    }
+            match Endpoint::builder(presets::N0).bind().await {
+                Ok(ep) => {
+                    let node_id = ep.id().to_string();
+                    *guard = Some(ep);
+                    Ok(node_id)
+                }
+                Err(e) => {
+                    jni_log!("Failed to start iroh endpoint: {}", e);
+                    Err(format!("Failed to start iroh endpoint: {}", e))
                 }
             }
-            Err(e) => {
-                jni_log!("Failed to start iroh endpoint: {}", e);
-                Err(format!("Failed to start iroh endpoint: {}", e))
-            }
+        } else {
+            Err("Failed to lock endpoint mutex".to_string())
         }
     });
 
@@ -181,6 +192,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
     };
 
     let nodes: Vec<NodeConfig>;
+    let domain_mappings: Vec<DomainMapping>;
     
     {
         let guard = match state.lock() {
@@ -191,20 +203,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
             }
         };
         nodes = guard.nodes.clone();
-    }
-
-    if nodes.is_empty() {
-        jni_log!("No nodes configured. Please add nodes with nativeAddNode");
-        return -1;
-    }
-
-    let proxy_domains: Vec<String> = nodes.iter()
-        .flat_map(|node| node.domains.iter().cloned())
-        .collect();
-
-    if proxy_domains.is_empty() {
-        jni_log!("No domains configured for nodes");
-        return -1;
+        domain_mappings = guard.domain_mappings.clone();
     }
 
     let listen_addr = format!("127.0.0.1:{}", listen_port);
@@ -213,36 +212,83 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         runtime.block_on(async move {
             let endpoint_group: EndpointGroup;
+            let proxy_domains: Vec<String>;
 
-            if let Some(ep) = get_endpoint() {
-                endpoint_group = match EndpointGroup::new_with_nodes_and_endpoint(
-                    nodes,
-                    None,
-                    LoadBalancingStrategy::RoundRobin,
-                    ep.clone(),
-                ).await {
-                    Ok(eg) => eg,
-                    Err(e) => {
-                        jni_log!("Failed to create endpoint group: {}", e);
-                        return Err(format!("Failed to create endpoint group: {}", e));
-                    }
-                };
+            if !domain_mappings.is_empty() {
+                jni_log!("[DEBUG:jni] Using domain_mappings ({} entries)", domain_mappings.len());
+                proxy_domains = domain_mappings.iter().map(|m| m.domain.clone()).collect();
+                
+                if let Some(ep) = get_endpoint() {
+                    endpoint_group = match EndpointGroup::new_with_domain_mappings_and_endpoint(
+                        domain_mappings,
+                        None,
+                        LoadBalancingStrategy::RoundRobin,
+                        ep.clone(),
+                    ).await {
+                        Ok(eg) => eg,
+                        Err(e) => {
+                            jni_log!("Failed to create endpoint group: {}", e);
+                            return Err(format!("Failed to create endpoint group: {}", e));
+                        }
+                    };
+                } else {
+                    endpoint_group = match EndpointGroup::new_with_domain_mappings(
+                        domain_mappings,
+                        None,
+                        LoadBalancingStrategy::RoundRobin,
+                    ).await {
+                        Ok(eg) => eg,
+                        Err(e) => {
+                            jni_log!("Failed to create endpoint group: {}", e);
+                            return Err(format!("Failed to create endpoint group: {}", e));
+                        }
+                    };
+                }
+            } else if !nodes.is_empty() {
+                jni_log!("[DEBUG:jni] Using nodes ({} entries)", nodes.len());
+                proxy_domains = nodes.iter()
+                    .flat_map(|node| node.domains.iter().cloned())
+                    .collect();
+
+                if proxy_domains.is_empty() {
+                    jni_log!("No domains configured for nodes");
+                    return Err("No domains configured for nodes".to_string());
+                }
+
+                if let Some(ep) = get_endpoint() {
+                    endpoint_group = match EndpointGroup::new_with_nodes_and_endpoint(
+                        nodes,
+                        None,
+                        LoadBalancingStrategy::RoundRobin,
+                        ep.clone(),
+                    ).await {
+                        Ok(eg) => eg,
+                        Err(e) => {
+                            jni_log!("Failed to create endpoint group: {}", e);
+                            return Err(format!("Failed to create endpoint group: {}", e));
+                        }
+                    };
+                } else {
+                    endpoint_group = match EndpointGroup::new_with_nodes(
+                        nodes,
+                        None,
+                        LoadBalancingStrategy::RoundRobin,
+                    ).await {
+                        Ok(eg) => eg,
+                        Err(e) => {
+                            jni_log!("Failed to create endpoint group: {}", e);
+                            return Err(format!("Failed to create endpoint group: {}", e));
+                        }
+                    };
+                }
             } else {
-                endpoint_group = match EndpointGroup::new_with_nodes(
-                    nodes,
-                    None,
-                    LoadBalancingStrategy::RoundRobin,
-                ).await {
-                    Ok(eg) => eg,
-                    Err(e) => {
-                        jni_log!("Failed to create endpoint group: {}", e);
-                        return Err(format!("Failed to create endpoint group: {}", e));
-                    }
-                };
+                jni_log!("No nodes or domain mappings configured");
+                return Err("No nodes or domain mappings configured".to_string());
             }
 
             jni_log!("[DEBUG:jni] Creating LocalProxy on {}", listen_addr);
-            let proxy = match LocalProxy::new(&listen_addr, proxy_domains, endpoint_group).await {
+            let endpoint_group_arc = Arc::new(endpoint_group);
+            let proxy = match LocalProxy::new(&listen_addr, proxy_domains, endpoint_group_arc.clone()).await {
                 Ok(p) => {
                     jni_log!("[DEBUG:jni] LocalProxy created successfully");
                     p
@@ -252,6 +298,18 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
                     return Err(format!("Failed to create local proxy: {}", e));
                 }
             };
+
+            {
+                let mut guard = match state.lock() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        jni_log!("Failed to lock state mutex (poisoned)");
+                        return Err("Failed to update state".to_string());
+                    }
+                };
+                guard.local_proxy = Some(proxy.clone());
+                guard.endpoint_group = Some(endpoint_group_arc);
+            }
 
             runtime.spawn(async move {
                 let proxy_run = match panic::catch_unwind(panic::AssertUnwindSafe(|| async move {
@@ -438,8 +496,13 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStopProxy(
         }
     };
 
-    jni_log!("[DEBUG:jni] Stop: endpoint_group exists = {}, conn_pool exists = {}",
-        guard.endpoint_group.is_some(), guard.conn_pool.is_some());
+    jni_log!("[DEBUG:jni] Stop: endpoint_group exists = {}, conn_pool exists = {}, local_proxy exists = {}",
+        guard.endpoint_group.is_some(), guard.conn_pool.is_some(), guard.local_proxy.is_some());
+
+    if let Some(proxy) = guard.local_proxy.as_ref() {
+        proxy.stop();
+        jni_log!("[DEBUG:jni] LocalProxy stopped");
+    }
 
     if let Some(group) = guard.endpoint_group.as_ref() {
         let runtime = get_runtime();
@@ -461,6 +524,11 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStopProxy(
     
     guard.conn_pool = None;
     guard.endpoint_group = None;
+    guard.local_proxy = None;
+    
+    if let Ok(mut guard) = ENDPOINT.lock() {
+        guard.take();
+    }
     jni_log!("[DEBUG:jni] nativeStopProxy returning after cleanup");
     0
 }
@@ -521,6 +589,55 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddNode(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddDomainMapping(
+    mut env: JNIEnv,
+    _class: JClass,
+    domain: JString,
+    node_id: JString,
+) -> jint {
+    if env.exception_check().unwrap_or(false) {
+        jni_log!("JNI exception pending before nativeAddDomainMapping");
+        env.exception_clear().unwrap();
+        return -1;
+    }
+    
+    let domain_str = match env.get_string(&domain) {
+        Ok(s) => match s.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return -1,
+        },
+        Err(_) => return -1,
+    };
+
+    let node_id_str = match env.get_string(&node_id) {
+        Ok(s) => match s.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return -1,
+        },
+        Err(_) => return -1,
+    };
+
+    let state = match get_state() {
+        Some(s) => s,
+        None => return -1,
+    };
+
+    let mut guard = match state.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+
+    let domain_mapping = DomainMapping {
+        domain: domain_str,
+        server_node_id: Some(node_id_str),
+        server_ticket: None,
+    };
+
+    guard.domain_mappings.push(domain_mapping);
+    0
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeRemoveNode(
     mut env: JNIEnv,
     _class: JClass,
@@ -570,6 +687,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeClearNodes(
     };
 
     guard.nodes.clear();
+    guard.domain_mappings.clear();
     0
 }
 

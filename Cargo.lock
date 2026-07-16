@@ -2631,6 +2631,7 @@ dependencies = [
  "iroh-tickets",
  "jni 0.21.1",
  "log",
+ "ndk-context",
  "once_cell",
  "rustls-native-certs",
  "tokio",

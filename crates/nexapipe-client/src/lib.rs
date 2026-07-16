@@ -16,7 +16,7 @@ pub mod jni;
 
 pub use client::IrohProxyClient;
 pub use connection_pool::IrohConnectionPool;
-pub use endpoint_group::{EndpointGroup, NodeConfig, PooledConnection};
+pub use endpoint_group::{EndpointGroup, NodeConfig, DomainMapping, PooledConnection};
 pub use error::ClientError;
 pub use http::{HttpRequest, HttpResponse};
 pub use lb::LoadBalancingStrategy;

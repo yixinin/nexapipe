@@ -28,11 +28,20 @@ cert_path = ""
 key_path = ""
 
 [[routes]]
+host_pattern = "mt.iroh.iakl.top"
+path_pattern = "/"
+path_is_prefix = true
+strategy = "round_robin"
+backends = ["http://host.docker.internal:8063"]
+cert_path = ""
+key_path = ""
+
+[[routes]]
 host_pattern = "fn.iroh.iakl.top"
 path_pattern = "/"
 path_is_prefix = true
 strategy = "round_robin"
-backends = ["http://10.0.0.72:15666"]
+backends = ["http://host.docker.internal:15666"]
 cert_path = ""
 key_path = ""
 
@@ -49,7 +58,7 @@ strategy = "round_robin"
 # 同一个域名可以配置在多个节点上，实现负载均衡
 [[local_proxy.nodes]]
 server_node_id = "319c6a852834da0350b9e91366373a23cd81aeb825fef84077da15a3ffd5d88e"
-domains = ["fn.iroh.iakl.top"]
+domains = ["fn.iroh.iakl.top", "mt.iroh.iakl.top"]
 
 [acme]
 # Enable automatic certificate management
