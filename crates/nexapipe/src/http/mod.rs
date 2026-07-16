@@ -394,35 +394,36 @@ pub async fn proxy_to_backend_streaming(
     response_buf
         .extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), status_text).as_bytes());
 
-    // Check if the backend used chunked encoding (meaning there was no
-    // Content-Length). Hyper decodes chunked responses automatically, so
-    // we must re-apply chunked framing if the original was chunked.
+    // Hyper auto-decodes chunked responses, so the body stream we get
+    // is the de-chunked payload. If the backend used chunked encoding,
+    // the original Content-Length (if any) is no longer valid because
+    // the decoding changes the body size. We must re-apply chunked
+    // framing and discard the stale Content-Length.
     let original_was_chunked = parts
         .headers
         .get("transfer-encoding")
         .and_then(|h| h.to_str().ok())
         .map(|v| v.to_lowercase().contains("chunked"))
         .unwrap_or(false);
-    let has_content_length = parts.headers.get("content-length").is_some();
 
     for (name, value) in parts.headers.iter() {
         let name_lower = name.as_str().to_lowercase();
-        // Strip Transfer-Encoding: hyper already decoded the chunks.
+        // Always strip Transfer-Encoding — hyper decoded it.
         if name_lower == "transfer-encoding" {
             continue;
         }
-        // Preserve Content-Length: the body bytes we forward are the
-        // same bytes the backend sent, so the original value is correct.
+        // If original was chunked, Content-Length is stale (body size
+        // changed after decoding). Strip it so we re-frame correctly.
+        if original_was_chunked && name_lower == "content-length" {
+            continue;
+        }
         response_buf.extend_from_slice(name.as_str().as_bytes());
         response_buf.extend_from_slice(b": ");
         response_buf.extend_from_slice(value.as_bytes());
         response_buf.extend_from_slice(b"\r\n");
     }
 
-    // If the original was chunked (no Content-Length), re-apply chunked
-    // encoding to give the browser proper framing.
-    let use_chunked = original_was_chunked && !has_content_length;
-    if use_chunked {
+    if original_was_chunked {
         response_buf.extend_from_slice(b"transfer-encoding: chunked\r\n");
     }
     response_buf.extend_from_slice(b"\r\n");
@@ -433,7 +434,7 @@ pub async fn proxy_to_backend_streaming(
     while let Some(chunk) = body_stream.next().await {
         match chunk {
             Ok(data) => {
-                if use_chunked {
+                if original_was_chunked {
                     let size_line = format!("{:x}\r\n", data.len());
                     send.write_all(size_line.as_bytes()).await?;
                     send.write_all(&data).await?;
@@ -449,7 +450,7 @@ pub async fn proxy_to_backend_streaming(
         }
     }
 
-    if use_chunked {
+    if original_was_chunked {
         send.write_all(b"0\r\n\r\n").await?;
     }
 
