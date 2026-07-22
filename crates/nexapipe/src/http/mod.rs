@@ -310,7 +310,7 @@ pub async fn proxy_to_backend_using_client(
             builder = builder.header(name, value);
         }
     }
-    builder = builder.header("host", &host);
+    builder = builder.header("host", host);
 
     let proxied_req = builder.body(Full::new(body_data.into()))?;
 
@@ -352,12 +352,22 @@ pub async fn proxy_to_backend_streaming(
         .ok_or_else(|| anyhow::anyhow!("backend URL missing host"))?
         .to_string();
     let port = url.port_or_known_default().unwrap_or(80);
+    let is_https = url.scheme() == "https";
 
     let path = req
         .uri()
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or(req.uri().path());
+
+    if is_websocket_request_static(req) {
+        tracing::debug!("WebSocket request detected, using direct TCP proxy");
+        return if is_https {
+            proxy_websocket_direct_https(send, recv, &req, &host, port).await
+        } else {
+            proxy_websocket_direct_http(send, recv, &req, &host, port).await
+        };
+    }
 
     let new_uri = format!(
         "{}://{}:{}{}",
@@ -373,7 +383,7 @@ pub async fn proxy_to_backend_streaming(
             builder = builder.header(name, value);
         }
     }
-    builder = builder.header("host", &host);
+    builder = builder.header("host", host);
 
     let proxied_req = builder.body(Full::new(body_data.into()))?;
 
@@ -383,7 +393,10 @@ pub async fn proxy_to_backend_streaming(
         proxied_req.uri()
     );
 
-    let response = client.request(proxied_req).await?;
+    let response = client.request(proxied_req).await.map_err(|e| {
+        tracing::error!("Failed to send request: {:?}", e);
+        anyhow::anyhow!("failed to send request: {:?}", e)
+    })?;
 
     let (parts, body) = response.into_parts();
 
@@ -400,13 +413,11 @@ pub async fn proxy_to_backend_streaming(
         .and_then(|h| h.to_str().ok())
         .map(|v| v.to_lowercase().contains("chunked"))
         .unwrap_or(false);
+    let has_content_length = parts.headers.get("content-length").is_some();
 
     for (name, value) in parts.headers.iter() {
         let name_lower = name.as_str().to_lowercase();
         if name_lower == "transfer-encoding" {
-            continue;
-        }
-        if original_was_chunked && name_lower == "content-length" {
             continue;
         }
         response_buf.extend_from_slice(name.as_str().as_bytes());
@@ -415,23 +426,19 @@ pub async fn proxy_to_backend_streaming(
         response_buf.extend_from_slice(b"\r\n");
     }
 
-    if original_was_chunked {
+    let use_chunked = !has_content_length && original_was_chunked;
+    if use_chunked {
         response_buf.extend_from_slice(b"transfer-encoding: chunked\r\n");
     }
     response_buf.extend_from_slice(b"\r\n");
 
     send.write_all(&response_buf).await?;
 
-    if status.as_u16() == 101 {
-        tracing::debug!("101 Switching Protocols detected, entering bidirectional stream mode");
-        return proxy_websocket_streaming(send, recv, body, host, port).await;
-    }
-
     let mut body_stream = http_body_util::BodyExt::into_data_stream(body);
     while let Some(chunk) = body_stream.next().await {
         match chunk {
             Ok(data) => {
-                if original_was_chunked {
+                if use_chunked {
                     let size_line = format!("{:x}\r\n", data.len());
                     send.write_all(size_line.as_bytes()).await?;
                     send.write_all(&data).await?;
@@ -447,7 +454,7 @@ pub async fn proxy_to_backend_streaming(
         }
     }
 
-    if original_was_chunked {
+    if use_chunked {
         send.write_all(b"0\r\n\r\n").await?;
     }
 
@@ -456,38 +463,90 @@ pub async fn proxy_to_backend_streaming(
     Ok(())
 }
 
-async fn proxy_websocket_streaming(
+async fn proxy_websocket_direct_http(
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,
-    body: hyper::body::Incoming,
-    host: String,
+    req: &Request<()>,
+    host: &str,
     port: u16,
 ) -> Result<(), anyhow::Error> {
-    let backend_stream = tokio::net::TcpStream::connect((host.as_str(), port))
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or(req.uri().path());
+
+    let request_line = format!("{} {} HTTP/1.1\r\n", req.method(), path);
+
+    let mut request_buf = Vec::new();
+    request_buf.extend_from_slice(request_line.as_bytes());
+    request_buf.extend_from_slice(b"Host: ");
+    request_buf.extend_from_slice(host.as_bytes());
+    request_buf.extend_from_slice(b"\r\n");
+
+    for (name, value) in req.headers() {
+        if name.as_str().to_lowercase() == "host" {
+            continue;
+        }
+        request_buf.extend_from_slice(name.as_str().as_bytes());
+        request_buf.extend_from_slice(b": ");
+        request_buf.extend_from_slice(value.as_bytes());
+        request_buf.extend_from_slice(b"\r\n");
+    }
+    request_buf.extend_from_slice(b"\r\n");
+
+    let tcp_stream = tokio::net::TcpStream::connect((host, port))
         .await
         .map_err(|e| anyhow::anyhow!("failed to connect to backend: {}", e))?;
 
-    let (mut backend_read, mut backend_write) = tokio::io::split(backend_stream);
+    let (mut backend_read, mut backend_write) = tokio::io::split(tcp_stream);
 
-    let mut body_stream = http_body_util::BodyExt::into_data_stream(body);
-    while let Some(chunk) = body_stream.next().await {
-        match chunk {
-            Ok(data) => {
-                backend_write.write_all(&data).await?;
-            }
-            Err(e) => {
-                tracing::debug!("Initial body read error: {}", e);
-                break;
-            }
+    backend_write.write_all(&request_buf).await?;
+
+    let mut response_buf = Vec::new();
+    let mut line_buf = Vec::new();
+    let mut in_body = false;
+    let mut response_sent = false;
+
+    loop {
+        let mut buf = [0u8; 1];
+        let n = backend_read.read(&mut buf).await?;
+        if n == 0 {
+            break;
         }
+
+        if !in_body {
+            line_buf.push(buf[0]);
+            if line_buf.ends_with(b"\r\n") {
+                if line_buf == b"\r\n" {
+                    in_body = true;
+                    response_buf.extend_from_slice(b"\r\n");
+                    send.write_all(&response_buf).await?;
+                    response_sent = true;
+                } else {
+                    response_buf.extend_from_slice(&line_buf);
+                }
+                line_buf.clear();
+            }
+        } else {
+            break;
+        }
+    }
+
+    if !response_sent {
+        send.write_all(&response_buf).await?;
     }
 
     let iroh_to_backend = async {
         let mut buf = [0u8; 8192];
         loop {
             match recv.read(&mut buf).await {
-                Ok(None) => break,
+                Ok(None) => {
+                    tracing::debug!("Iroh recv stream closed");
+                    break;
+                }
                 Ok(Some(n)) => {
+                    tracing::debug!("Received {} bytes from iroh", n);
                     if let Err(e) = backend_write.write_all(&buf[..n]).await {
                         tracing::debug!("Iroh to backend write error: {}", e);
                         break;
@@ -505,8 +564,156 @@ async fn proxy_websocket_streaming(
         let mut buf = [0u8; 8192];
         loop {
             match backend_read.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    tracing::debug!("Backend stream closed");
+                    break;
+                }
                 Ok(n) => {
+                    tracing::debug!("Received {} bytes from backend", n);
+                    if let Err(e) = send.write_all(&buf[..n]).await {
+                        tracing::debug!("Backend to iroh write error: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Backend read error: {}", e);
+                    break;
+                }
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = iroh_to_backend => (),
+        _ = backend_to_iroh => (),
+    }
+
+    Ok(())
+}
+
+async fn proxy_websocket_direct_https(
+    send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream,
+    req: &Request<()>,
+    host: &str,
+    port: u16,
+) -> Result<(), anyhow::Error> {
+    use tokio_rustls::TlsConnector;
+
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or(req.uri().path());
+
+    let request_line = format!("{} {} HTTP/1.1\r\n", req.method(), path);
+
+    let mut request_buf = Vec::new();
+    request_buf.extend_from_slice(request_line.as_bytes());
+    request_buf.extend_from_slice(b"Host: ");
+    request_buf.extend_from_slice(host.as_bytes());
+    request_buf.extend_from_slice(b"\r\n");
+
+    for (name, value) in req.headers() {
+        if name.as_str().to_lowercase() == "host" {
+            continue;
+        }
+        request_buf.extend_from_slice(name.as_str().as_bytes());
+        request_buf.extend_from_slice(b": ");
+        request_buf.extend_from_slice(value.as_bytes());
+        request_buf.extend_from_slice(b"\r\n");
+    }
+    request_buf.extend_from_slice(b"\r\n");
+
+    let tcp_stream = tokio::net::TcpStream::connect((host, port))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to connect to backend: {}", e))?;
+
+    let mut root_certs = rustls::RootCertStore::empty();
+    root_certs.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_certs)
+        .with_no_client_auth();
+
+    let connector = TlsConnector::from(Arc::new(config));
+    let host_str: &'static str = Box::leak(host.to_string().into_boxed_str());
+    let server_name = rustls_pki_types::ServerName::try_from(host_str)
+        .map_err(|e| anyhow::anyhow!("invalid server name: {}", e))?;
+
+    let tls_stream = connector.connect(server_name, tcp_stream).await?;
+
+    let (mut backend_read, mut backend_write) = tokio::io::split(tls_stream);
+
+    backend_write.write_all(&request_buf).await?;
+
+    let mut response_buf = Vec::new();
+    let mut line_buf = Vec::new();
+    let mut in_body = false;
+    let mut response_sent = false;
+
+    loop {
+        let mut buf = [0u8; 1];
+        let n = backend_read.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+
+        if !in_body {
+            line_buf.push(buf[0]);
+            if line_buf.ends_with(b"\r\n") {
+                if line_buf == b"\r\n" {
+                    in_body = true;
+                    response_buf.extend_from_slice(b"\r\n");
+                    send.write_all(&response_buf).await?;
+                    response_sent = true;
+                } else {
+                    response_buf.extend_from_slice(&line_buf);
+                }
+                line_buf.clear();
+            }
+        } else {
+            break;
+        }
+    }
+
+    if !response_sent {
+        send.write_all(&response_buf).await?;
+    }
+
+    let iroh_to_backend = async {
+        let mut buf = [0u8; 8192];
+        loop {
+            match recv.read(&mut buf).await {
+                Ok(None) => {
+                    tracing::debug!("Iroh recv stream closed");
+                    break;
+                }
+                Ok(Some(n)) => {
+                    tracing::debug!("Received {} bytes from iroh", n);
+                    if let Err(e) = backend_write.write_all(&buf[..n]).await {
+                        tracing::debug!("Iroh to backend write error: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Iroh read error: {}", e);
+                    break;
+                }
+            }
+        }
+    };
+
+    let backend_to_iroh = async {
+        let mut buf = [0u8; 8192];
+        loop {
+            match backend_read.read(&mut buf).await {
+                Ok(0) => {
+                    tracing::debug!("Backend stream closed");
+                    break;
+                }
+                Ok(n) => {
+                    tracing::debug!("Received {} bytes from backend", n);
                     if let Err(e) = send.write_all(&buf[..n]).await {
                         tracing::debug!("Backend to iroh write error: {}", e);
                         break;
