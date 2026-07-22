@@ -380,17 +380,18 @@ async fn handle_local_connection(
     };
 
     if is_websocket_request_static(&request) {
-        // WebSocket: run both directions until either side closes
+        jni_log!("[DEBUG:local-proxy] Detected WebSocket request, using bidirectional stream mode");
         let mut client_task = tokio::spawn(client_to_backend);
         let mut backend_task = tokio::spawn(backend_to_client);
         tokio::select! {
             _ = &mut client_task => (),
             _ = &mut backend_task => (),
         }
+        let _ = client_task.await;
+        let _ = backend_task.await;
     } else {
-        // HTTP: forward the full request first, then drain the full response.
-        // This prevents the request body from being truncated when the backend
-        // returns an early error response.
+        jni_log!("[DEBUG:local-proxy] Detected HTTP request, using request-response mode");
+        jni_log!("[DEBUG:local-proxy] Request headers: {:?}", request.headers());
         let client_task = tokio::spawn(client_to_backend);
         let mut backend_task = tokio::spawn(backend_to_client);
 

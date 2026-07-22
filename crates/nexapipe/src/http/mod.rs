@@ -8,6 +8,7 @@ use hyper::body::Incoming;
 use hyper_rustls::HttpsConnectorBuilder;
 use std::io::Write;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub type HttpClient = hyper_util::client::legacy::Client<
     hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
@@ -309,7 +310,7 @@ pub async fn proxy_to_backend_using_client(
             builder = builder.header(name, value);
         }
     }
-    builder = builder.header("host", host);
+    builder = builder.header("host", &host);
 
     let proxied_req = builder.body(Full::new(body_data.into()))?;
 
@@ -326,12 +327,10 @@ pub async fn proxy_to_backend_using_client(
 
     let mut builder = Response::builder().status(parts.status);
     for (name, value) in parts.headers.iter() {
-        // Skip Transfer-Encoding header since hyper auto-decodes chunked responses
         if name.as_str().to_lowercase() != "transfer-encoding" {
             builder = builder.header(name, value);
         }
     }
-    // Add Content-Length since body is already fully collected
     builder = builder.header("content-length", bytes.len());
 
     Ok(builder.body(bytes.to_vec())?)
@@ -343,6 +342,7 @@ pub async fn proxy_to_backend_streaming(
     backend_url: &str,
     body_data: Vec<u8>,
     send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream,
 ) -> Result<(), anyhow::Error> {
     let url =
         url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
@@ -373,7 +373,7 @@ pub async fn proxy_to_backend_streaming(
             builder = builder.header(name, value);
         }
     }
-    builder = builder.header("host", host);
+    builder = builder.header("host", &host);
 
     let proxied_req = builder.body(Full::new(body_data.into()))?;
 
@@ -394,11 +394,6 @@ pub async fn proxy_to_backend_streaming(
     response_buf
         .extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), status_text).as_bytes());
 
-    // Hyper auto-decodes chunked responses, so the body stream we get
-    // is the de-chunked payload. If the backend used chunked encoding,
-    // the original Content-Length (if any) is no longer valid because
-    // the decoding changes the body size. We must re-apply chunked
-    // framing and discard the stale Content-Length.
     let original_was_chunked = parts
         .headers
         .get("transfer-encoding")
@@ -408,12 +403,9 @@ pub async fn proxy_to_backend_streaming(
 
     for (name, value) in parts.headers.iter() {
         let name_lower = name.as_str().to_lowercase();
-        // Always strip Transfer-Encoding — hyper decoded it.
         if name_lower == "transfer-encoding" {
             continue;
         }
-        // If original was chunked, Content-Length is stale (body size
-        // changed after decoding). Strip it so we re-frame correctly.
         if original_was_chunked && name_lower == "content-length" {
             continue;
         }
@@ -429,6 +421,11 @@ pub async fn proxy_to_backend_streaming(
     response_buf.extend_from_slice(b"\r\n");
 
     send.write_all(&response_buf).await?;
+
+    if status.as_u16() == 101 {
+        tracing::debug!("101 Switching Protocols detected, entering bidirectional stream mode");
+        return proxy_websocket_streaming(send, recv, body, host, port).await;
+    }
 
     let mut body_stream = http_body_util::BodyExt::into_data_stream(body);
     while let Some(chunk) = body_stream.next().await {
@@ -455,6 +452,78 @@ pub async fn proxy_to_backend_streaming(
     }
 
     send.finish()?;
+
+    Ok(())
+}
+
+async fn proxy_websocket_streaming(
+    send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream,
+    body: hyper::body::Incoming,
+    host: String,
+    port: u16,
+) -> Result<(), anyhow::Error> {
+    let backend_stream = tokio::net::TcpStream::connect((host.as_str(), port))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to connect to backend: {}", e))?;
+
+    let (mut backend_read, mut backend_write) = tokio::io::split(backend_stream);
+
+    let mut body_stream = http_body_util::BodyExt::into_data_stream(body);
+    while let Some(chunk) = body_stream.next().await {
+        match chunk {
+            Ok(data) => {
+                backend_write.write_all(&data).await?;
+            }
+            Err(e) => {
+                tracing::debug!("Initial body read error: {}", e);
+                break;
+            }
+        }
+    }
+
+    let iroh_to_backend = async {
+        let mut buf = [0u8; 8192];
+        loop {
+            match recv.read(&mut buf).await {
+                Ok(None) => break,
+                Ok(Some(n)) => {
+                    if let Err(e) = backend_write.write_all(&buf[..n]).await {
+                        tracing::debug!("Iroh to backend write error: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Iroh read error: {}", e);
+                    break;
+                }
+            }
+        }
+    };
+
+    let backend_to_iroh = async {
+        let mut buf = [0u8; 8192];
+        loop {
+            match backend_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Err(e) = send.write_all(&buf[..n]).await {
+                        tracing::debug!("Backend to iroh write error: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Backend read error: {}", e);
+                    break;
+                }
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = iroh_to_backend => (),
+        _ = backend_to_iroh => (),
+    }
 
     Ok(())
 }

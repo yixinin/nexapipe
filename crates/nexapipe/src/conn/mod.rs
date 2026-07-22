@@ -1,4 +1,4 @@
-use crate::http;
+﻿use crate::http;
 use crate::routes::{BackendInfo, RouteConfig};
 use ::http::Request;
 use hyper_util::client::legacy;
@@ -99,7 +99,7 @@ pub async fn handle_bidi_stream(
         handle_websocket_stream(send, recv, &request, &backend_info.url).await?;
     } else {
         let mut send = send;
-        http::proxy_to_backend_streaming(client, &request, &backend_info.url, body_data, &mut send)
+        http::proxy_to_backend_streaming(client, &request, &backend_info.url, body_data, &mut send, &mut recv)
             .await?;
     }
 
