@@ -45,7 +45,11 @@ impl LocalProxy {
             }
             Err(e) => {
                 #[cfg(feature = "jni")]
-                jni_log!("[DEBUG:local-proxy] Failed to bind to {}: {}", listen_addr, e);
+                jni_log!(
+                    "[DEBUG:local-proxy] Failed to bind to {}: {}",
+                    listen_addr,
+                    e
+                );
                 return Err(e.into());
             }
         };
@@ -154,8 +158,10 @@ async fn handle_local_connection(
     while header_end.is_none() {
         let n = match tokio::time::timeout(
             tokio::time::Duration::from_secs(30),
-            stream.read(&mut temp_buf)
-        ).await {
+            stream.read(&mut temp_buf),
+        )
+        .await
+        {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => n,
             Ok(Err(e)) => {
@@ -173,7 +179,10 @@ async fn handle_local_connection(
 
         // Search for \r\n\r\n, starting a few bytes before the new data
         let search_start = prev_len.saturating_sub(3);
-        if let Some(pos) = request_buf[search_start..].windows(4).position(|w| w == b"\r\n\r\n") {
+        if let Some(pos) = request_buf[search_start..]
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+        {
             header_end = Some(search_start + pos + 4);
         }
     }
@@ -193,12 +202,19 @@ async fn handle_local_connection(
 
     let request = match parse_http_request_legacy(&request_buf[..header_end]) {
         Ok(req) => {
-            jni_log!("[DEBUG:local-proxy] Parsed HTTP request: {} {}", req.method(), req.uri());
+            jni_log!(
+                "[DEBUG:local-proxy] Parsed HTTP request: {} {}",
+                req.method(),
+                req.uri()
+            );
             req
-        },
+        }
         Err(e) => {
             jni_log!("[DEBUG:local-proxy] Failed to parse HTTP request: {}", e);
-            jni_log!("[DEBUG:local-proxy] First 16 bytes: {:?}", &request_buf[..std::cmp::min(request_buf.len(), 16)]);
+            jni_log!(
+                "[DEBUG:local-proxy] First 16 bytes: {:?}",
+                &request_buf[..std::cmp::min(request_buf.len(), 16)]
+            );
             return Ok(());
         }
     };
@@ -213,17 +229,16 @@ async fn handle_local_connection(
         }
 
         let (mut client_read, mut client_write) = tokio::io::split(stream);
-        client_write.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+        client_write
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
 
         let pooled_conn = endpoint_group.get_connection(&host).await?;
         let conn = pooled_conn.conn().clone();
-        let (mut send, mut recv) = tokio::time::timeout(
-            STREAM_OPERATION_TIMEOUT,
-            conn.open_bi(),
-        )
-        .await
-        .map_err(|_| crate::error::ClientError::TimeoutError)?
-        .map_err(|e| anyhow::anyhow!(e))?;
+        let (mut send, mut recv) = tokio::time::timeout(STREAM_OPERATION_TIMEOUT, conn.open_bi())
+            .await
+            .map_err(|_| crate::error::ClientError::TimeoutError)?
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         let client_to_iroh = async {
             let mut buf = [0u8; STREAM_BUF_SIZE];
@@ -299,17 +314,17 @@ async fn handle_local_connection(
     }
 
     let host = target_host.unwrap();
-    jni_log!("[DEBUG:local-proxy] Getting connection for domain: '{}'", host);
+    jni_log!(
+        "[DEBUG:local-proxy] Getting connection for domain: '{}'",
+        host
+    );
 
     let pooled_conn = endpoint_group.get_connection(&host).await?;
     let conn = pooled_conn.conn().clone();
-    let (mut send, mut recv) = tokio::time::timeout(
-        STREAM_OPERATION_TIMEOUT,
-        conn.open_bi(),
-    )
-    .await
-    .map_err(|_| crate::error::ClientError::TimeoutError)?
-    .map_err(|e| anyhow::anyhow!(e))?;
+    let (mut send, mut recv) = tokio::time::timeout(STREAM_OPERATION_TIMEOUT, conn.open_bi())
+        .await
+        .map_err(|_| crate::error::ClientError::TimeoutError)?
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let (mut client_read, mut client_write) = tokio::io::split(stream);
 
@@ -318,9 +333,14 @@ async fn handle_local_connection(
     let mut request_to_send = filtered_headers;
     request_to_send.extend_from_slice(&request_buf[header_end..]);
 
-    jni_log!("[DEBUG:local-proxy] Forwarding {} bytes to backend, Host: {}", request_to_send.len(), host);
+    jni_log!(
+        "[DEBUG:local-proxy] Forwarding {} bytes to backend, Host: {}",
+        request_to_send.len(),
+        host
+    );
     send.write_all(&request_to_send).await?;
 
+    let is_ws = is_websocket_request_static(&request);
     let client_to_backend = async move {
         let mut buf = [0u8; STREAM_BUF_SIZE];
         loop {
@@ -340,7 +360,9 @@ async fn handle_local_connection(
                 }
             }
         }
-        let _ = send.finish();
+        if !is_ws {
+            let _ = send.finish();
+        }
     };
 
     let backend_to_client = async move {
@@ -353,7 +375,9 @@ async fn handle_local_connection(
                 Ok(Some(n)) => {
                     total_bytes += n;
                     if debug_preview.len() < 1500 {
-                        debug_preview.extend_from_slice(&buf[..std::cmp::min(n, 1500 - debug_preview.len())]);
+                        debug_preview.extend_from_slice(
+                            &buf[..std::cmp::min(n, 1500 - debug_preview.len())],
+                        );
                     }
                     if let Err(e) = client_write.write_all(&buf[..n]).await {
                         #[cfg(feature = "tracing")]
@@ -375,7 +399,10 @@ async fn handle_local_connection(
         }
         jni_log!("[DEBUG:local-proxy] Response sent: {} bytes", total_bytes);
         if !debug_preview.is_empty() {
-            jni_log!("[DEBUG:local-proxy] Response preview: {}", String::from_utf8_lossy(&debug_preview));
+            jni_log!(
+                "[DEBUG:local-proxy] Response preview: {}",
+                String::from_utf8_lossy(&debug_preview)
+            );
         }
     };
 
@@ -391,15 +418,15 @@ async fn handle_local_connection(
         let _ = backend_task.await;
     } else {
         jni_log!("[DEBUG:local-proxy] Detected HTTP request, using request-response mode");
-        jni_log!("[DEBUG:local-proxy] Request headers: {:?}", request.headers());
+        jni_log!(
+            "[DEBUG:local-proxy] Request headers: {:?}",
+            request.headers()
+        );
         let client_task = tokio::spawn(client_to_backend);
         let mut backend_task = tokio::spawn(backend_to_client);
 
         let _ = client_task.await;
-        let _ = tokio::time::timeout(
-            tokio::time::Duration::from_secs(60),
-            &mut backend_task
-        ).await;
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(60), &mut backend_task).await;
     }
 
     endpoint_group.return_connection(&host, pooled_conn).await;
@@ -445,7 +472,8 @@ fn should_proxy_domain(host: &str, proxy_domains: &[String]) -> bool {
             if host_lower.ends_with(suffix) {
                 return true;
             }
-        } else if host_lower == domain_lower || host_lower.ends_with(&format!(".{}", domain_lower)) {
+        } else if host_lower == domain_lower || host_lower.ends_with(&format!(".{}", domain_lower))
+        {
             return true;
         }
     }
