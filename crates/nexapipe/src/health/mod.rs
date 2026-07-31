@@ -87,7 +87,10 @@ impl HealthChecker {
         match tokio::time::timeout(self.timeout, self.client.request(request)).await {
             Ok(Ok(response)) => {
                 let status = response.status();
-                let healthy = status.is_success();
+                // Treat 2xx and 404 as healthy: some backends don't implement
+                // a dedicated health endpoint and return 404 for unknown paths,
+                // which still indicates the server is up and responding.
+                let healthy = status.is_success() || status.as_u16() == 404;
                 if healthy {
                     tracing::debug!("Backend {} health check passed: {}", url, status);
                 } else {

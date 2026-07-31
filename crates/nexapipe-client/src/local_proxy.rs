@@ -158,6 +158,67 @@ fn websocket_frame_preview(data: &[u8]) -> String {
     format!("{} bytes: {}", data.len(), preview)
 }
 
+fn parse_websocket_frames(buffer: &mut Vec<u8>, frames: &mut Vec<(u8, Vec<u8>)>) {
+    let mut pos = 0usize;
+    while buffer.len().saturating_sub(pos) >= 2 {
+        let b0 = buffer[pos];
+        let b1 = buffer[pos + 1];
+        let opcode = b0 & 0x0f;
+        let masked = b1 & 0x80 != 0;
+        let mut payload_len = (b1 & 0x7f) as u64;
+        let mut header_len = 2usize;
+
+        if payload_len == 126 {
+            if buffer.len() < pos + 4 {
+                break;
+            }
+            payload_len = u16::from_be_bytes([buffer[pos + 2], buffer[pos + 3]]) as u64;
+            header_len = 4;
+        } else if payload_len == 127 {
+            if buffer.len() < pos + 10 {
+                break;
+            }
+            payload_len = u64::from_be_bytes(
+                buffer[pos + 2..pos + 10]
+                    .try_into()
+                    .expect("slice length is 8"),
+            );
+            header_len = 10;
+        }
+
+        if masked {
+            header_len += 4;
+        }
+
+        let payload_start = pos + header_len;
+        let total = match payload_start.checked_add(payload_len as usize) {
+            Some(total) => total,
+            None => break,
+        };
+        if total > buffer.len() {
+            break;
+        }
+
+        let payload = if masked {
+            let mask = &buffer[payload_start - 4..payload_start];
+            buffer[payload_start..total]
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| b ^ mask[i % 4])
+                .collect()
+        } else {
+            buffer[payload_start..total].to_vec()
+        };
+
+        frames.push((opcode, payload));
+        pos = total;
+    }
+
+    if pos > 0 {
+        buffer.drain(..pos);
+    }
+}
+
 async fn handle_local_connection(
     mut stream: tokio::net::TcpStream,
     proxy_domains: Arc<Vec<String>>,
@@ -433,6 +494,7 @@ async fn handle_local_connection(
                     // Bidirectional forwarding (no send.finish() — keep stream open)
                     let client_to_iroh = async move {
                         let mut buf = [0u8; STREAM_BUF_SIZE];
+                        let mut ws_buffer = Vec::new();
                         loop {
                             match client_read.read(&mut buf).await {
                                 Ok(0) => {
@@ -444,6 +506,18 @@ async fn handle_local_connection(
                                         "[DEBUG:local-proxy] WS client->iroh: {}",
                                         websocket_frame_preview(&buf[..n])
                                     );
+                                    ws_buffer.extend_from_slice(&buf[..n]);
+                                    let mut frames = Vec::new();
+                                    parse_websocket_frames(&mut ws_buffer, &mut frames);
+                                    for (opcode, payload) in frames {
+                                        if opcode == 1 || opcode == 8 {
+                                            jni_log!(
+                                                "[DEBUG:local-proxy] WS client frame decoded (opcode {}): {}",
+                                                opcode,
+                                                String::from_utf8_lossy(&payload)
+                                            );
+                                        }
+                                    }
                                     if let Err(e) = send.write_all(&buf[..n]).await {
                                         jni_log!("[DEBUG:local-proxy] WS client->backend err: {}", e);
                                         return "client_write_error";
