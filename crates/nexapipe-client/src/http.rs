@@ -1,5 +1,13 @@
-use std::collections::HashMap;
 use ::http::Request;
+use std::collections::HashMap;
+
+#[cfg(feature = "jni")]
+use crate::jni_log;
+
+#[cfg(not(feature = "jni"))]
+macro_rules! jni_log {
+    ($($arg:tt)*) => {};
+}
 
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
@@ -35,15 +43,15 @@ impl HttpRequest {
         let mut buf = Vec::new();
         buf.extend_from_slice(format!("{} {} HTTP/1.1\r\n", self.method, self.path).as_bytes());
         buf.extend_from_slice(format!("Host: {}\r\n", self.host).as_bytes());
-        
+
         for (name, value) in &self.headers {
             buf.extend_from_slice(format!("{}: {}\r\n", name, value).as_bytes());
         }
-        
+
         if !self.body.is_empty() {
             buf.extend_from_slice(format!("Content-Length: {}\r\n", self.body.len()).as_bytes());
         }
-        
+
         buf.extend_from_slice(b"\r\n");
         buf.extend_from_slice(&self.body);
         buf
@@ -83,18 +91,20 @@ impl HttpResponse {
         let response_str = String::from_utf8_lossy(response);
         let mut lines = response_str.split("\r\n");
 
-        let status_line = lines
-            .next()
-            .ok_or_else(|| crate::error::ClientError::ParseError("Missing status line".to_string()))?;
+        let status_line = lines.next().ok_or_else(|| {
+            crate::error::ClientError::ParseError("Missing status line".to_string())
+        })?;
 
         let status_parts: Vec<&str> = status_line.split_whitespace().collect();
         if status_parts.len() < 2 {
-            return Err(crate::error::ClientError::ParseError("Invalid status line".to_string()));
+            return Err(crate::error::ClientError::ParseError(
+                "Invalid status line".to_string(),
+            ));
         }
 
-        let status_code = status_parts[1]
-            .parse::<u16>()
-            .map_err(|e| crate::error::ClientError::ParseError(format!("Invalid status code: {}", e)))?;
+        let status_code = status_parts[1].parse::<u16>().map_err(|e| {
+            crate::error::ClientError::ParseError(format!("Invalid status code: {}", e))
+        })?;
 
         let status_text = if status_parts.len() > 2 {
             status_parts[2..].join(" ")
@@ -135,18 +145,24 @@ pub fn parse_http_request_legacy(buf: &[u8]) -> Result<Request<()>, crate::error
     let request_str = String::from_utf8_lossy(buf);
     let mut lines = request_str.split("\r\n");
 
-    let request_line = lines
-        .next()
-        .ok_or_else(|| crate::error::ClientError::ParseError("Invalid HTTP request: missing request line".to_string()))?;
+    let request_line = lines.next().ok_or_else(|| {
+        crate::error::ClientError::ParseError(
+            "Invalid HTTP request: missing request line".to_string(),
+        )
+    })?;
 
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
-        return Err(crate::error::ClientError::ParseError("Invalid HTTP request line".to_string()));
+        return Err(crate::error::ClientError::ParseError(
+            "Invalid HTTP request line".to_string(),
+        ));
     }
 
-    let method = http::Method::from_bytes(parts[0].as_bytes())
-        .map_err(|e| crate::error::ClientError::ParseError(format!("Invalid HTTP method: {}", e)))?;
-    let uri = http::Uri::try_from(parts[1]).map_err(|e| crate::error::ClientError::ParseError(format!("Invalid URI: {}", e)))?;
+    let method = http::Method::from_bytes(parts[0].as_bytes()).map_err(|e| {
+        crate::error::ClientError::ParseError(format!("Invalid HTTP method: {}", e))
+    })?;
+    let uri = http::Uri::try_from(parts[1])
+        .map_err(|e| crate::error::ClientError::ParseError(format!("Invalid URI: {}", e)))?;
 
     let mut builder = Request::builder().method(method).uri(uri);
 
@@ -163,16 +179,39 @@ pub fn parse_http_request_legacy(buf: &[u8]) -> Result<Request<()>, crate::error
 }
 
 pub fn is_websocket_request_static(req: &Request<()>) -> bool {
-    if let Some(upgrade) = req.headers().get("upgrade") {
+    let upgrade_header = req.headers().get("upgrade");
+    let connection_header = req.headers().get("connection");
+
+    jni_log!(
+        "[DEBUG:http] WebSocket detection - upgrade header: {:?}",
+        upgrade_header.map(|h| h.to_str().ok())
+    );
+    jni_log!(
+        "[DEBUG:http] WebSocket detection - connection header: {:?}",
+        connection_header.map(|h| h.to_str().ok())
+    );
+
+    if let Some(upgrade) = upgrade_header {
         if let Ok(upgrade_str) = upgrade.to_str() {
             if upgrade_str.to_lowercase() == "websocket" {
-                if let Some(connection) = req.headers().get("connection") {
+                jni_log!("[DEBUG:http] WebSocket detection - upgrade header is websocket");
+                if let Some(connection) = connection_header {
                     if let Ok(connection_str) = connection.to_str() {
-                        return connection_str.to_lowercase().contains("upgrade");
+                        jni_log!(
+                            "[DEBUG:http] WebSocket detection - connection header: {}",
+                            connection_str
+                        );
+                        let contains_upgrade = connection_str.to_lowercase().contains("upgrade");
+                        jni_log!(
+                            "[DEBUG:http] WebSocket detection - contains upgrade: {}",
+                            contains_upgrade
+                        );
+                        return contains_upgrade;
                     }
                 }
             }
         }
     }
+    jni_log!("[DEBUG:http] WebSocket detection - returning false");
     false
 }

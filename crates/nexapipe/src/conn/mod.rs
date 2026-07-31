@@ -119,6 +119,12 @@ async fn handle_websocket_stream(
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("backend URL missing host"))?;
     let port = url.port_or_known_default().unwrap_or(80);
+    let original_host = req
+        .headers()
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .map(|h| h.to_string())
+        .unwrap_or_else(|| host.to_string());
 
     let mut backend_stream = tokio::net::TcpStream::connect((host, port))
         .await
@@ -135,7 +141,7 @@ async fn handle_websocket_stream(
     let mut request_buf = Vec::new();
     request_buf.extend_from_slice(request_line.as_bytes());
     request_buf.extend_from_slice(b"Host: ");
-    request_buf.extend_from_slice(host.as_bytes());
+    request_buf.extend_from_slice(original_host.as_bytes());
     request_buf.extend_from_slice(b"\r\n");
 
     for (name, value) in req.headers() {
@@ -152,6 +158,7 @@ async fn handle_websocket_stream(
     backend_stream.write_all(&request_buf).await?;
 
     let mut response_buf = Vec::with_capacity(8192);
+    let mut trailing_ws_data = Vec::new();
     let mut read_buf = [0u8; 8192];
 
     loop {
@@ -159,12 +166,16 @@ async fn handle_websocket_stream(
             Ok(0) => break,
             Ok(n) => {
                 response_buf.extend_from_slice(&read_buf[..n]);
-                
+
                 if let Some(pos) = find_headers_end(&response_buf) {
-                    response_buf.truncate(pos + 4);
+                    let headers_end = pos + 4;
+                    if response_buf.len() > headers_end {
+                        trailing_ws_data.extend_from_slice(&response_buf[headers_end..]);
+                    }
+                    response_buf.truncate(headers_end);
                     break;
                 }
-                
+
                 if response_buf.len() > 64 * 1024 {
                     tracing::warn!("WebSocket handshake response too large");
                     break;
@@ -181,6 +192,13 @@ async fn handle_websocket_stream(
     if response.status().as_u16() == 101 {
         tracing::debug!("WebSocket handshake successful with backend");
         send.write_all(&response_buf).await?;
+        if !trailing_ws_data.is_empty() {
+            tracing::debug!(
+                "WebSocket handshake response contained {} trailing bytes",
+                trailing_ws_data.len()
+            );
+            send.write_all(&trailing_ws_data).await?;
+        }
 
         let (backend_read, mut backend_write) = tokio::io::split(backend_stream);
 
@@ -188,16 +206,19 @@ async fn handle_websocket_stream(
             let mut buf = [0u8; 8192];
             loop {
                 match recv.read(&mut buf).await {
-                    Ok(None) => break,
+                    Ok(None) => {
+                        tracing::debug!("WebSocket iroh stream finished");
+                        return "iroh_finished";
+                    }
                     Ok(Some(n)) => {
                         if let Err(e) = backend_write.write_all(&buf[..n]).await {
                             tracing::debug!("WebSocket iroh_to_backend error: {}", e);
-                            break;
+                            return "backend_write_error";
                         }
                     }
                     Err(e) => {
                         tracing::debug!("WebSocket iroh_to_backend read error: {}", e);
-                        break;
+                        return "iroh_read_error";
                     }
                 }
             }
@@ -208,25 +229,33 @@ async fn handle_websocket_stream(
             let mut backend_read = backend_read;
             loop {
                 match backend_read.read(&mut buf).await {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        tracing::debug!("WebSocket backend stream closed");
+                        return "backend_finished";
+                    }
                     Ok(n) => {
                         if let Err(e) = send.write_all(&buf[..n]).await {
                             tracing::debug!("WebSocket backend_to_iroh error: {}", e);
-                            break;
+                            return "iroh_write_error";
                         }
                     }
                     Err(e) => {
                         tracing::debug!("WebSocket backend_to_iroh read error: {}", e);
-                        break;
+                        return "backend_read_error";
                     }
                 }
             }
         };
 
-        tokio::select! {
-            _ = iroh_to_backend => (),
-            _ = backend_to_iroh => (),
-        }
+        let (closed_direction, close_reason) = tokio::select! {
+            reason = iroh_to_backend => ("iroh_to_backend", reason),
+            reason = backend_to_iroh => ("backend_to_iroh", reason),
+        };
+        tracing::debug!(
+            "WebSocket tunnel closed first by {}, reason: {}",
+            closed_direction,
+            close_reason
+        );
     } else {
         tracing::debug!(
             "WebSocket handshake failed with backend, status: {}",
