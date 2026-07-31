@@ -385,7 +385,17 @@ pub async fn proxy_to_backend_streaming(
     }
     builder = builder.header("host", host);
 
-    let proxied_req = builder.body(Full::new(body_data.into()))?;
+    let mut full_body = body_data;
+    if let Some(content_length) = req
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        read_remaining_request_body(recv, &mut full_body, content_length).await?;
+    }
+
+    let proxied_req = builder.body(Full::new(full_body.into()))?;
 
     tracing::debug!(
         "Proxying request via client (streaming): {} {}",
@@ -460,6 +470,40 @@ pub async fn proxy_to_backend_streaming(
 
     send.finish()?;
 
+    Ok(())
+}
+
+async fn read_remaining_request_body(
+    recv: &mut iroh::endpoint::RecvStream,
+    body: &mut Vec<u8>,
+    content_length: usize,
+) -> Result<(), anyhow::Error> {
+    let mut remaining = content_length.saturating_sub(body.len());
+    let mut buf = [0u8; 8192];
+
+    while remaining > 0 {
+        let n = recv
+            .read(&mut buf)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read request body from iroh: {}", e))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "request body ended before content-length: expected {} bytes, got {}",
+                    content_length,
+                    body.len()
+                )
+            })?;
+
+        let take = n.min(remaining);
+        body.extend_from_slice(&buf[..take]);
+        remaining -= take;
+    }
+
+    tracing::debug!(
+        "Read request body from iroh: {} bytes (content-length {})",
+        body.len(),
+        content_length
+    );
     Ok(())
 }
 
