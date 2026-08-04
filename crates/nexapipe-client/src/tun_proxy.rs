@@ -271,9 +271,7 @@ impl TunProxy {
                                 let eg = eg.clone();
                                 let pd = pd.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) =
-                                        handle_local_connection(stream, pd, eg).await
-                                    {
+                                    if let Err(e) = handle_local_connection(stream, pd, eg).await {
                                         jni_log!(
                                             "[tun-proxy] handle_local_connection error: {}",
                                             e
@@ -311,36 +309,45 @@ impl TunProxy {
         }
 
         // 8. DNS handler（UDP 53）— 处理 DNS 查询，劫持代理/portal 域名到虚拟 IP
+        //
+        // 并发处理：每个 DNS 查询 spawn 一个独立 task，避免串行阻塞。
+        // 原串行实现在 DNS 转发超时（~1.6s）时会阻塞所有后续查询，导致 APP DNS 超时。
         if let Some(udp_socket) = udp_socket {
             let (udp_rx, udp_tx) = udp_socket.split();
             let proxy_vec = Arc::new(proxy_domains.clone());
-            let portal_set: HashSet<String> = captive_portal_domains
-                .into_iter()
-                .map(|d| d.to_lowercase())
-                .collect();
+            let portal_set: Arc<HashSet<String>> = Arc::new(
+                captive_portal_domains
+                    .into_iter()
+                    .map(|d| d.to_lowercase())
+                    .collect(),
+            );
             let dns_servers = Arc::new(custom_dns_servers);
             let stopped_clone = stopped.clone();
+            // udp_tx 需要 Arc<Mutex> 共享给并发 task
+            let tx = Arc::new(tokio::sync::Mutex::new(udp_tx));
             tasks.push(tokio::spawn(async move {
                 let mut rx = udp_rx;
-                let mut tx = udp_tx;
                 loop {
                     if stopped_clone.load(Ordering::Acquire) {
                         break;
                     }
                     match rx.next().await {
                         Some((data, src_addr, dst_addr)) => {
-                            // dst_addr 应为 10.0.1.2:53（DNS 服务器虚拟 IP）
-                            let response = handle_dns_query(
-                                &data,
-                                &proxy_vec,
-                                &portal_set,
-                                &dns_servers,
-                            )
-                            .await;
-                            if let Some(resp) = response {
-                                // 回送：src=10.0.1.2:53(查询的 dst), dst=客户端(查询的 src)
-                                let _ = tx.send((resp, dst_addr, src_addr)).await;
-                            }
+                            // 并发处理每个 DNS 查询，不阻塞后续查询
+                            let tx = tx.clone();
+                            let proxy_vec = proxy_vec.clone();
+                            let portal_set = portal_set.clone();
+                            let dns_servers = dns_servers.clone();
+                            tokio::spawn(async move {
+                                let response =
+                                    handle_dns_query(&data, &proxy_vec, &portal_set, &dns_servers)
+                                        .await;
+                                if let Some(resp) = response {
+                                    // 回送：src=10.0.1.2:53(查询的 dst), dst=客户端(查询的 src)
+                                    let mut tx = tx.lock().await;
+                                    let _ = tx.send((resp, dst_addr, src_addr)).await;
+                                }
+                            });
                         }
                         None => {
                             jni_log!("[tun-proxy] UDP stream ended");
@@ -377,11 +384,7 @@ impl TunProxy {
             task.abort();
             // 等待任务结束（drop future → drop AsyncFd → close fd）
             let _ = runtime.block_on(async {
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    task,
-                )
-                .await;
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(500), task).await;
             });
         }
         jni_log!("[tun-proxy] Shutdown complete (all tasks joined)");
@@ -424,7 +427,7 @@ fn set_nonblocking(fd: RawFd) -> Result<(), ClientError> {
 async fn handle_dns_query(
     query: &[u8],
     proxy_domains: &Arc<Vec<String>>,
-    portal_domains: &HashSet<String>,
+    portal_domains: &Arc<HashSet<String>>,
     dns_servers: &Arc<Vec<SocketAddr>>,
 ) -> Option<Vec<u8>> {
     let (domain, qtype) = match parse_dns_query(query) {
@@ -567,30 +570,60 @@ fn build_empty_dns_response(query: &[u8]) -> Vec<u8> {
 }
 
 /// 将 DNS 查询转发到真实 DNS 服务器，原样返回响应。
-/// 使用 tokio UdpSocket，超时 3s。超时返回 None（客户端会重试）。
-async fn forward_dns_query(
-    query: &[u8],
-    dns_servers: &Arc<Vec<SocketAddr>>,
-) -> Option<Vec<u8>> {
+///
+/// 遍历所有配置的 DNS 服务器，**IPv4 优先**，按地址族绑定 socket
+/// （IPv4→0.0.0.0:0，IPv6→[::]:0）。每个服务器单独 800ms 超时，整体 3s 限制。
+///
+/// 解决：系统 DNS 列表前几个是 IPv6（如 2408:8888::8）导致
+/// 绑定 0.0.0.0:0 后 connect() 失败，且原代码只尝试 dns_servers[0] 不会 fallback。
+async fn forward_dns_query(query: &[u8], dns_servers: &Arc<Vec<SocketAddr>>) -> Option<Vec<u8>> {
     if dns_servers.is_empty() {
         jni_log!("[tun-proxy] No DNS servers configured, dropping query");
         return None;
     }
 
+    // IPv4 优先：先尝试 IPv4 DNS（更快更可靠），再尝试 IPv6
+    let mut ordered: Vec<&SocketAddr> = dns_servers.iter().collect();
+    ordered.sort_by_key(|s| !s.is_ipv4() as u8); // false(=IPv4) 排前
+
+    let per_server_timeout = Duration::from_millis(800);
+
     let result = tokio::time::timeout(DNS_FORWARD_TIMEOUT, async {
-        let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
-        sock.connect(dns_servers[0]).await.ok()?;
-        sock.send(query).await.ok()?;
-        let mut buf = vec![0u8; 4096];
-        let n = sock.recv(&mut buf).await.ok()?;
-        Some(buf[..n].to_vec())
+        for dns_server in ordered.iter() {
+            // 按地址族绑定：IPv4 DNS → 0.0.0.0:0，IPv6 DNS → [::]:0
+            let bind_addr = if dns_server.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            };
+
+            // 每个服务器单独超时，避免卡在不可达的 IPv6 DNS 上
+            let server_result = tokio::time::timeout(per_server_timeout, async {
+                let sock = tokio::net::UdpSocket::bind(bind_addr).await.ok()?;
+                sock.connect(**dns_server).await.ok()?;
+                sock.send(query).await.ok()?;
+                let mut buf = vec![0u8; 4096];
+                let n = sock.recv(&mut buf).await.ok()?;
+                Some(buf[..n].to_vec())
+            })
+            .await;
+
+            match server_result {
+                Ok(Some(resp)) => return Some(resp),
+                _ => continue,
+            }
+        }
+        None
     })
     .await;
 
     match result {
         Ok(Some(resp)) => Some(resp),
         Ok(None) => {
-            jni_log!("[tun-proxy] DNS forward failed (io error)");
+            jni_log!(
+                "[tun-proxy] DNS forward failed (all {} servers failed)",
+                dns_servers.len()
+            );
             None
         }
         Err(_) => {
