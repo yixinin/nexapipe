@@ -39,6 +39,11 @@ android_logger = { version = "0.14", optional = true }
 once_cell = "1.19"
 fastrand = "2.1"
 
+# TUN 代理：用 smoltcp 在 Rust 侧实现用户态 TCP/IP 栈，替代 Kotlin 手写 TCP 栈。
+# 仅 Android (jni + local-proxy) 使用。
+netstack-smoltcp = { version = "0.2", optional = true }
+libc = { version = "0.2", optional = true }
+
 [features]
 default = ["native-certs", "tracing"]
 native-certs = ["dep:rustls-native-certs"]
@@ -47,6 +52,7 @@ local-proxy = ["tokio/net"]
 uniffi = ["dep:uniffi"]
 tracing = ["dep:tracing"]
 jni = ["dep:jni", "dep:log", "dep:android_logger"]
+tun-proxy = ["local-proxy", "dep:netstack-smoltcp", "dep:libc"]
 
 [target.'cfg(target_os = "ios")'.dependencies]
 webpki-roots = "1.0.8"

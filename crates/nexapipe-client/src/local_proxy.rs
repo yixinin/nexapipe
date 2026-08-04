@@ -4,7 +4,7 @@ use crate::endpoint_group::EndpointGroup;
 use crate::http::{is_websocket_request_static, parse_http_request_legacy};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 #[cfg(feature = "tracing")]
@@ -219,11 +219,14 @@ fn parse_websocket_frames(buffer: &mut Vec<u8>, frames: &mut Vec<(u8, Vec<u8>)>)
     }
 }
 
-async fn handle_local_connection(
-    mut stream: tokio::net::TcpStream,
+pub(crate) async fn handle_local_connection<S>(
+    mut stream: S,
     proxy_domains: Arc<Vec<String>>,
     endpoint_group: Arc<EndpointGroup>,
-) -> Result<(), ClientError> {
+) -> Result<(), ClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     jni_log!("[DEBUG:local-proxy] New local connection received");
 
     // Step 1: Read the first chunk of data to determine protocol (HTTP vs TLS)
@@ -726,12 +729,15 @@ async fn handle_local_connection(
 /// between). This function extracts the SNI hostname from the ClientHello,
 /// establishes an iroh tunnel to the appropriate backend, and forwards raw TCP
 /// data bidirectionally — no HTTP parsing involved.
-async fn handle_tls_tunnel(
-    mut stream: tokio::net::TcpStream,
+pub(crate) async fn handle_tls_tunnel<S>(
+    mut stream: S,
     initial_data: Vec<u8>,
     endpoint_group: Arc<EndpointGroup>,
     proxy_domains: Arc<Vec<String>>,
-) -> Result<(), ClientError> {
+) -> Result<(), ClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     jni_log!("[DEBUG:local-proxy] TLS tunnel mode");
 
     // Ensure we have enough data for the full TLS record (ClientHello)
@@ -1018,7 +1024,7 @@ fn remove_cache_validation_headers(header_bytes: &[u8]) -> Vec<u8> {
     result
 }
 
-fn should_proxy_domain(host: &str, proxy_domains: &[String]) -> bool {
+pub(crate) fn should_proxy_domain(host: &str, proxy_domains: &[String]) -> bool {
     let host_lower = host.to_lowercase();
     for domain in proxy_domains {
         let domain_lower = domain.to_lowercase();
