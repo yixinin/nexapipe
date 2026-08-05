@@ -1,11 +1,11 @@
+#[cfg(all(feature = "tun-proxy", target_os = "android"))]
+use crate::tun_proxy::TunProxy;
 use crate::{
     DomainMapping, EndpointGroup, IrohConnectionPool, LoadBalancingStrategy, LocalProxy, NodeConfig,
 };
-#[cfg(all(feature = "tun-proxy", target_os = "android"))]
-use crate::tun_proxy::TunProxy;
-use iroh::Endpoint;
 use iroh::dns::{DnsError, DnsProtocol, DnsResolver, Resolver, TxtRecordData};
 use iroh::endpoint::presets;
+use iroh::{Endpoint, RelayMode, RelayUrl};
 use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::{jint, jstring};
@@ -59,6 +59,17 @@ const IROH_BIND_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_sec
 const START_PROXY_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(15);
 const CLOSE_ALL_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(8);
 const PROXY_RUN_JOIN_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_millis(500);
+
+/// 固定使用的 relay 服务器（亚太南 aps1-1，新加坡）——国内最近的 N0 relay。
+///
+/// iroh 默认从 4 个 N0 relay 中按延迟选 home relay，国内环境下 aps1-1(亚太) 和
+/// euc1-1(欧洲) 延迟接近，iroh 会在两者间反复切换。每次切换 home relay 会导致
+/// 正在通过 relay 路由的连接（WebSocket 等）断线重连。
+///
+/// 固定到 aps1-1 后 iroh 不会再切换，WS 连接稳定。
+/// 副作用：若 aps1-1 宕机则 relay 路径不可用（直连不受影响）。
+/// DNS 仍由 Kotlin 侧 resolveIrohDnsOverrides 预解析 aps1-1 的 IP 注入 OverrideResolver。
+const PINNED_RELAY_URL: &str = "https://aps1-1.relay.n0.iroh.link.";
 
 struct ProxyState {
     conn_pool: Option<IrohConnectionPool>,
@@ -494,7 +505,13 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartIroh(
         DNS_OVERRIDES.lock().map(|g| g.clone()).unwrap_or_default();
 
     let bind_result: Result<Endpoint, ()> = runtime.block_on(async move {
-        let builder = Endpoint::builder(presets::N0);
+        // 固定 relay 到 aps1-1（亚太南），防止 iroh 在多个 relay 间切换导致 WS 断线。
+        // 见 PINNED_RELAY_URL 注释。
+        let relay_url: RelayUrl = PINNED_RELAY_URL
+            .parse()
+            .expect("PINNED_RELAY_URL must be a valid relay URL");
+        jni_log!("[iroh] pinning relay to {}", PINNED_RELAY_URL);
+        let builder = Endpoint::builder(presets::N0).relay_mode(RelayMode::custom([relay_url]));
         // 始终用 OverrideResolver 包装 hickory：
         // - 对 DNS_OVERRIDES 中的 iroh 基础设施域名（dns.iroh.link, *.relay.n0.iroh.link）
         //   直接返回 Kotlin 预解析的 IP，绕过 GFW 对 iroh.link UDP DNS 响应的阻断。
@@ -1295,7 +1312,6 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDestroy(
 ///
 /// 参数：
 /// - `tun_fd`: TUN 文件描述符（detachFd 返回值）
-/// - `proxy_port`: 代理端口（保留参数，TUN 模式下不使用，local_proxy 仍在监听）
 /// - `proxy_domains`: 逗号分隔的代理域名列表
 /// - `captive_portal_domains`: 逗号分隔的 captive portal 校验域名列表
 ///
@@ -1306,7 +1322,6 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartTunProxy(
     mut env: JNIEnv,
     _class: JClass,
     tun_fd: jint,
-    _proxy_port: jint,
     proxy_domains: JString,
     captive_portal_domains: JString,
 ) -> jint {
@@ -1391,9 +1406,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartTunProxy(
         match guard.endpoint_group.clone() {
             Some(eg) => eg,
             None => {
-                jni_log!(
-                    "[DEBUG:jni] endpoint_group is None — nativeStartProxy not called yet?"
-                );
+                jni_log!("[DEBUG:jni] endpoint_group is None — nativeStartProxy not called yet?");
                 return -1;
             }
         }

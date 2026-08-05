@@ -279,17 +279,25 @@ impl TunProxy {
                                     }
                                 });
                             } else if dest_ip == IpAddr::V4(VIRTUAL_CAPTIVE_PORTAL_IP) {
-                                // captive portal → 返回硬编码 204
+                                // captive portal 校验：
+                                // - port 80 (HTTP): 返回 204 No Content，让系统判定网络已验证
+                                // - port 443 (HTTPS): 直接关闭连接。不能发 plain HTTP 204——
+                                //   客户端期望 TLS 握手，收到明文 HTTP 会导致 TLS 协议错误，
+                                //   Android 可能把 HTTPS 失败解读为 captive portal 拦截 → 感叹号。
+                                //   关闭连接让系统回退到 HTTP 校验（port 80 已返回 204）。
                                 tokio::spawn(async move {
                                     let mut s = stream;
-                                    let _ = s
-                                        .write_all(
-                                            b"HTTP/1.1 204 No Content\r\n\
-                                             Content-Length: 0\r\n\
-                                             Connection: close\r\n\
-                                             \r\n",
-                                        )
-                                        .await;
+                                    if dest_port == 80 {
+                                        let _ = s
+                                            .write_all(
+                                                b"HTTP/1.1 204 No Content\r\n\
+                                                 Content-Length: 0\r\n\
+                                                 Connection: close\r\n\
+                                                 \r\n",
+                                            )
+                                            .await;
+                                    }
+                                    // port 443 or other: 直接 drop，stream 关闭时发 FIN
                                 });
                             } else {
                                 jni_log!(
