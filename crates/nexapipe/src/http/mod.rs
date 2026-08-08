@@ -111,11 +111,9 @@ pub async fn proxy_request(
     let mut builder = Request::builder().method(method).uri(new_uri);
 
     for (name, value) in headers_clone.iter() {
-        if name.as_str().to_lowercase() != "host" {
-            builder = builder.header(name, value);
-        }
+        // 保留客户端原始 Host 头，确保后端虚拟主机路由正确
+        builder = builder.header(name, value);
     }
-    builder = builder.header("host", backend_host);
 
     let proxied_req = builder.body(Full::new(body))?;
 
@@ -296,12 +294,9 @@ pub async fn proxy_to_backend_using_client(
         .map(|pq| pq.as_str())
         .unwrap_or(req.uri().path());
 
-    let new_uri = format!(
-        "{}://{}:{}{}",
-        url.scheme(), host, port, path
-    )
-    .parse::<http::Uri>()
-    .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
+    let new_uri = format!("{}://{}:{}{}", url.scheme(), host, port, path)
+        .parse::<http::Uri>()
+        .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
 
     let mut builder = Request::builder().method(req.method()).uri(new_uri);
 
@@ -369,21 +364,16 @@ pub async fn proxy_to_backend_streaming(
         };
     }
 
-    let new_uri = format!(
-        "{}://{}:{}{}",
-        url.scheme(), host, port, path
-    )
-    .parse::<http::Uri>()
-    .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
+    let new_uri = format!("{}://{}:{}{}", url.scheme(), host, port, path)
+        .parse::<http::Uri>()
+        .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
 
     let mut builder = Request::builder().method(req.method()).uri(new_uri);
 
     for (name, value) in req.headers() {
-        if name.as_str().to_lowercase() != "host" {
-            builder = builder.header(name, value);
-        }
+        // 保留客户端原始 Host 头，确保后端虚拟主机路由正确
+        builder = builder.header(name, value);
     }
-    builder = builder.header("host", host);
 
     let mut full_body = body_data;
     if let Some(content_length) = req
@@ -522,10 +512,18 @@ async fn proxy_websocket_direct_http(
 
     let request_line = format!("{} {} HTTP/1.1\r\n", req.method(), path);
 
+    // 保留客户端原始 Host 头，确保后端虚拟主机路由正确
+    let original_host = req
+        .headers()
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .map(|h| h.to_string())
+        .unwrap_or_else(|| format!("{}:{}", host, port));
+
     let mut request_buf = Vec::new();
     request_buf.extend_from_slice(request_line.as_bytes());
     request_buf.extend_from_slice(b"Host: ");
-    request_buf.extend_from_slice(host.as_bytes());
+    request_buf.extend_from_slice(original_host.as_bytes());
     request_buf.extend_from_slice(b"\r\n");
 
     for (name, value) in req.headers() {
@@ -652,10 +650,18 @@ async fn proxy_websocket_direct_https(
 
     let request_line = format!("{} {} HTTP/1.1\r\n", req.method(), path);
 
+    // 保留客户端原始 Host 头，确保后端虚拟主机路由正确
+    let original_host = req
+        .headers()
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .map(|h| h.to_string())
+        .unwrap_or_else(|| format!("{}:{}", host, port));
+
     let mut request_buf = Vec::new();
     request_buf.extend_from_slice(request_line.as_bytes());
     request_buf.extend_from_slice(b"Host: ");
-    request_buf.extend_from_slice(host.as_bytes());
+    request_buf.extend_from_slice(original_host.as_bytes());
     request_buf.extend_from_slice(b"\r\n");
 
     for (name, value) in req.headers() {

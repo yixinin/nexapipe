@@ -1,7 +1,8 @@
 use crate::ClientError;
 use crate::connection_pool::IrohConnectionPool;
-use crate::endpoint_group::EndpointGroup;
+use crate::endpoint_group::{EndpointGroup, PooledConnection};
 use crate::http::{is_websocket_request_static, parse_http_request_legacy};
+use iroh::endpoint::{RecvStream, SendStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -20,6 +21,11 @@ macro_rules! jni_log {
 
 const STREAM_BUF_SIZE: usize = 128 * 1024;
 const STREAM_OPERATION_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+/// Number of attempts for opening a fresh iroh bi-stream for a new request.
+/// If the pooled connection is stale (already closed by the peer), `open_bi` or
+/// the initial `write_all` can fail; we discard that connection and retry with a
+/// fresh one instead of failing the whole request.
+const REQUEST_OPEN_ATTEMPTS: usize = 3;
 
 #[derive(Clone)]
 pub struct LocalProxy {
@@ -219,6 +225,69 @@ fn parse_websocket_frames(buffer: &mut Vec<u8>, frames: &mut Vec<(u8, Vec<u8>)>)
     }
 }
 
+/// Open a new iroh bi-stream for `host`, optionally writing `initial_data` as
+/// the first bytes of the request/tunnel payload.
+///
+/// Retries `open_bi` / initial-write failures up to [`REQUEST_OPEN_ATTEMPTS`]
+/// times, discarding the stale pooled connection on each failure so the retry
+/// gets a fresh connection.
+async fn open_stream_with_retry(
+    endpoint_group: &Arc<EndpointGroup>,
+    host: &str,
+    initial_data: Option<&[u8]>,
+) -> Result<(PooledConnection, SendStream, RecvStream), ClientError> {
+    let mut last_err: Option<ClientError> = None;
+
+    for _attempt in 1..=REQUEST_OPEN_ATTEMPTS {
+        let pooled_conn = endpoint_group.get_connection(host).await?;
+        let conn = pooled_conn.conn().clone();
+
+        let (mut send, recv) = match tokio::time::timeout(STREAM_OPERATION_TIMEOUT, conn.open_bi())
+            .await
+        {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(e)) => {
+                jni_log!(
+                    "[DEBUG:local-proxy] open_bi failed (attempt {}/{}): {}, retrying on a fresh connection",
+                    _attempt,
+                    REQUEST_OPEN_ATTEMPTS,
+                    e
+                );
+                last_err = Some(anyhow::anyhow!(e).into());
+                endpoint_group.return_connection(host, pooled_conn).await;
+                continue;
+            }
+            Err(_) => {
+                endpoint_group.return_connection(host, pooled_conn).await;
+                return Err(ClientError::TimeoutError);
+            }
+        };
+
+        if let Some(data) = initial_data
+            && let Err(e) = send.write_all(data).await
+        {
+            jni_log!(
+                "[DEBUG:local-proxy] initial write failed (attempt {}/{}): {}, retrying on a fresh connection",
+                _attempt,
+                REQUEST_OPEN_ATTEMPTS,
+                e
+            );
+            last_err = Some(e.into());
+            endpoint_group.return_connection(host, pooled_conn).await;
+            continue;
+        }
+
+        return Ok((pooled_conn, send, recv));
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        ClientError::ConnectionError(format!(
+            "Failed to open stream to {} after {} attempts",
+            host, REQUEST_OPEN_ATTEMPTS
+        ))
+    }))
+}
+
 pub(crate) async fn handle_local_connection<S>(
     mut stream: S,
     proxy_domains: Arc<Vec<String>>,
@@ -344,12 +413,8 @@ where
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
 
-        let pooled_conn = endpoint_group.get_connection(&host).await?;
-        let conn = pooled_conn.conn().clone();
-        let (mut send, mut recv) = tokio::time::timeout(STREAM_OPERATION_TIMEOUT, conn.open_bi())
-            .await
-            .map_err(|_| crate::error::ClientError::TimeoutError)?
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let (pooled_conn, mut send, mut recv) =
+            open_stream_with_retry(&endpoint_group, &host, None).await?;
 
         let client_to_iroh = async {
             let mut buf = [0u8; STREAM_BUF_SIZE];
@@ -480,15 +545,11 @@ where
                     );
 
                     // Open iroh bi-stream and send the modified request
-                    let pooled_conn = endpoint_group.get_connection(&host).await?;
-                    let conn = pooled_conn.conn().clone();
-                    let (mut send, mut recv) = tokio::time::timeout(STREAM_OPERATION_TIMEOUT, conn.open_bi())
-                        .await
-                        .map_err(|_| crate::error::ClientError::TimeoutError)?
-                        .map_err(|e| anyhow::anyhow!(e))?;
+                    let (pooled_conn, mut send, mut recv) =
+                        open_stream_with_retry(&endpoint_group, &host, Some(&request_to_send))
+                            .await?;
 
                     let (mut client_read, mut client_write) = tokio::io::split(stream);
-                    send.write_all(&request_to_send).await?;
                     jni_log!(
                         "[DEBUG:local-proxy] WebSocket request sent to iroh: {} bytes",
                         request_to_send.len()
@@ -607,15 +668,6 @@ where
     }
 
     // Regular HTTP path
-    let pooled_conn = endpoint_group.get_connection(&host).await?;
-    let conn = pooled_conn.conn().clone();
-    let (mut send, mut recv) = tokio::time::timeout(STREAM_OPERATION_TIMEOUT, conn.open_bi())
-        .await
-        .map_err(|_| crate::error::ClientError::TimeoutError)?
-        .map_err(|e| anyhow::anyhow!(e))?;
-
-    let (mut client_read, mut client_write) = tokio::io::split(stream);
-
     // Remove cache validation headers to prevent 304 responses with empty body
     let filtered_headers = remove_cache_validation_headers(&request_buf[..header_end]);
     let mut request_to_send = filtered_headers;
@@ -626,7 +678,10 @@ where
         request_to_send.len(),
         host
     );
-    send.write_all(&request_to_send).await?;
+    let (pooled_conn, mut send, mut recv) =
+        open_stream_with_retry(&endpoint_group, &host, Some(&request_to_send)).await?;
+
+    let (mut client_read, mut client_write) = tokio::io::split(stream);
 
     let client_to_backend = async move {
         let mut buf = [0u8; STREAM_BUF_SIZE];
@@ -714,8 +769,20 @@ where
     let client_task = tokio::spawn(client_to_backend);
     let mut backend_task = tokio::spawn(backend_to_client);
 
-    let _ = client_task.await;
+    // Wait for the backend response to be fully relayed back to the client
+    // (bounded for streaming/long-lived responses). We must NOT wait for the
+    // client to close its TCP connection first: HTTP clients routinely keep the
+    // connection alive (keep-alive) after reading the response, so client_task
+    // would block indefinitely and the iroh connection would never be returned
+    // to the pool -- which defeats pre-connect/connection warm-up and leaks
+    // pooled connections.
     let _ = tokio::time::timeout(tokio::time::Duration::from_secs(60), &mut backend_task).await;
+
+    // Response has been delivered; stop the client->backend relay so the pooled
+    // iroh connection is released immediately. Aborting also closes the client
+    // TCP socket (HTTP/1.1 allows the server to close after the response),
+    // so a keep-alive client socket can't pin this task.
+    client_task.abort();
 
     endpoint_group.return_connection(&host, pooled_conn).await;
     jni_log!("[DEBUG:local-proxy] Connection closed");
@@ -781,19 +848,15 @@ where
         sni
     );
 
-    let pooled_conn = endpoint_group.get_connection(&sni).await?;
-    let conn = pooled_conn.conn().clone();
-    let (mut send, mut recv) = tokio::time::timeout(STREAM_OPERATION_TIMEOUT, conn.open_bi())
-        .await
-        .map_err(|_| crate::error::ClientError::TimeoutError)?
-        .map_err(|e| anyhow::anyhow!(e))?;
-
-    // Forward the initial TLS ClientHello through the iroh stream
+    // Open a fresh iroh bi-stream and forward the initial TLS ClientHello. If
+    // the pooled connection is stale, open_bi / write fails and we retry on a
+    // fresh connection.
     jni_log!(
         "[DEBUG:local-proxy] TLS tunnel: forwarding initial {} bytes",
         data.len()
     );
-    send.write_all(&data).await?;
+    let (pooled_conn, mut send, mut recv) =
+        open_stream_with_retry(&endpoint_group, &sni, Some(&data)).await?;
 
     let (mut client_read, mut client_write) = tokio::io::split(stream);
 

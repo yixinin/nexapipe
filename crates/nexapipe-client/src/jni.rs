@@ -59,6 +59,8 @@ const IROH_BIND_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_sec
 const START_PROXY_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(15);
 const CLOSE_ALL_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(8);
 const PROXY_RUN_JOIN_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_millis(500);
+/// Pre-connect / warm-up timeout for establishing iroh connections to all backends.
+const PRECONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(15);
 
 /// 固定使用的 relay 服务器（亚太南 aps1-1，新加坡）——国内最近的 N0 relay。
 ///
@@ -800,6 +802,80 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
     }
 }
 
+/// Pre-connect / warm-up: establish one iroh connection per configured backend
+/// and cache it in the connection pool, so the first real request does not pay
+/// the QUIC/relay handshake latency. Must be called after `nativeStartProxy`
+/// (which creates the `EndpointGroup`). Returns the number of backends warmed,
+/// or -1 on error.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativePreconnect(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    jni_log!("[DEBUG:jni] nativePreconnect called");
+
+    let runtime = match get_runtime() {
+        Some(r) => r,
+        None => {
+            jni_log!("[DEBUG:jni] nativePreconnect: runtime not initialized");
+            return -1;
+        }
+    };
+
+    let state = match get_state() {
+        Some(s) => s,
+        None => {
+            jni_log!("[DEBUG:jni] nativePreconnect: state not initialized");
+            return -1;
+        }
+    };
+
+    let endpoint_group = {
+        let guard = match state.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                jni_log!("[DEBUG:jni] nativePreconnect: failed to lock state (poisoned)");
+                return -1;
+            }
+        };
+        match guard.endpoint_group.clone() {
+            Some(eg) => eg,
+            None => {
+                jni_log!(
+                    "[DEBUG:jni] nativePreconnect: endpoint_group is None - call nativeStartProxy first"
+                );
+                return -1;
+            }
+        }
+    };
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        runtime.block_on(async move {
+            match tokio::time::timeout(PRECONNECT_TIMEOUT, endpoint_group.preconnect_all()).await {
+                Ok(count) => count as jint,
+                Err(_) => {
+                    jni_log!("[DEBUG:jni] nativePreconnect timed out");
+                    -1
+                }
+            }
+        })
+    }));
+
+    match result {
+        Ok(count) => {
+            jni_log!(
+                "[DEBUG:jni] nativePreconnect finished: {} backend(s) warmed",
+                count
+            );
+            count
+        }
+        Err(_) => {
+            jni_log!("[DEBUG:jni] Panic occurred during nativePreconnect");
+            -1
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxyLegacy(
     mut env: JNIEnv,
@@ -1288,17 +1364,34 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDestroy(
     jni_log!("[DEBUG:jni] nativeDestroy called (full teardown: endpoint + proxy)");
     // Phase 1：短暂锁 ENDPOINT，代际自增并取出 endpoint，使下次 nativeStartIroh 重建。
     // nativeStartIroh 的 bind() 不持 ENDPOINT 锁，故此处不会因 startIroh 卡死而死锁。
-    {
+    let endpoint = {
         if let Ok(mut guard) = ENDPOINT.lock() {
             ENDPOINT_GEN.fetch_add(1, Ordering::AcqRel);
-            let _ = guard.take();
-            jni_log!("[DEBUG:jni] Endpoint released (generation bumped)");
+            let ep = guard.take();
+            jni_log!(
+                "[DEBUG:jni] Endpoint released (generation bumped), present={}",
+                ep.is_some()
+            );
+            ep
         } else {
             jni_log!("[DEBUG:jni] Failed to lock ENDPOINT, continuing with proxy cleanup");
+            None
+        }
+    };
+    // Phase 2+3：停止本地代理 / endpoint_group / conn_pool / proxy_task（不触碰 ENDPOINT）。
+    let result = Java_com_nexa_pipe_IrohProxy_nativeStopProxy(_env, _class);
+
+    // Phase 4：显式关闭 endpoint。conn_pool.close_all() 现在只关闭池自建的
+    // endpoint（new()），共享的全局 endpoint 由这里负责关闭。
+    if let Some(ep) = endpoint {
+        if let Some(r) = get_runtime() {
+            let _ = r.block_on(async {
+                let _ = tokio::time::timeout(CLOSE_ALL_TIMEOUT, ep.close()).await;
+            });
+            jni_log!("[DEBUG:jni] Endpoint closed");
         }
     }
-    // Phase 2+3：停止本地代理 / endpoint_group / conn_pool / proxy_task（不触碰 ENDPOINT）。
-    Java_com_nexa_pipe_IrohProxy_nativeStopProxy(_env, _class)
+    result
 }
 
 // ============================================================

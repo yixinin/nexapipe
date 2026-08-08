@@ -272,6 +272,29 @@ impl EndpointGroup {
         }
     }
 
+    /// Warm up one iroh connection per backend pool (and the default pool if
+    /// configured), returning them to the pool immediately so the first real
+    /// request does not pay the QUIC/relay handshake latency. Returns the
+    /// number of pools that have a connection available afterwards.
+    pub async fn preconnect_all(&self) -> usize {
+        let mut warmed = 0usize;
+        for pools in self.domains.values() {
+            for pool in &pools.pools {
+                if pool.preconnect().await {
+                    warmed += 1;
+                }
+            }
+        }
+        if let Some(default) = &self.default_pools {
+            for pool in &default.pools {
+                if pool.preconnect().await {
+                    warmed += 1;
+                }
+            }
+        }
+        warmed
+    }
+
     pub fn node_ids(&self) -> Vec<EndpointId> {
         let mut ids = Vec::new();
         for pools in self.domains.values() {

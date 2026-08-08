@@ -2,7 +2,7 @@ use iroh::endpoint::Connection;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 
@@ -12,10 +12,21 @@ use tracing;
 const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
 const MAX_CONNECTIONS: usize = 10;
 const CONNECTION_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+/// Idle connections older than this are evicted when a new connection is requested.
+const CONNECTION_IDLE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(60);
+/// Interval of the background watcher that removes closed/stale connections from the pool.
+const CONNECTION_CLEANUP_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(5);
 
 struct PooledConnection {
     conn: Connection,
     created_at: std::time::Instant,
+}
+
+impl PooledConnection {
+    /// True if the underlying iroh connection is still open (not closed by either side).
+    fn is_live(&self) -> bool {
+        self.conn.close_reason().is_none()
+    }
 }
 
 #[derive(Clone)]
@@ -27,6 +38,14 @@ struct IrohConnectionPoolInner {
     connections: Mutex<Vec<PooledConnection>>,
     ep: Arc<Mutex<Option<Endpoint>>>,
     endpoint_addr: EndpointAddr,
+    /// Whether this pool created (and therefore owns) its iroh endpoint.
+    ///
+    /// `new()` binds a dedicated endpoint, so `close_all` must close it.
+    /// `new_with_endpoint()` shares a caller-owned endpoint (e.g. the global
+    /// ENDPOINT in the Android JNI layer); closing it here would break the
+    /// next `nativeStartProxy`/`nativePreconnect` with "Endpoint is closed"
+    /// and tear down a running tunnel on proxy restart / reconnect.
+    owns_endpoint: bool,
 }
 
 impl IrohConnectionPool {
@@ -35,23 +54,25 @@ impl IrohConnectionPool {
             .bind()
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
-        Ok(Self {
-            inner: Arc::new(IrohConnectionPoolInner {
-                connections: Mutex::new(Vec::new()),
-                ep: Arc::new(Mutex::new(Some(ep))),
-                endpoint_addr,
-            }),
-        })
+        let inner = Arc::new(IrohConnectionPoolInner {
+            connections: Mutex::new(Vec::new()),
+            ep: Arc::new(Mutex::new(Some(ep))),
+            endpoint_addr,
+            owns_endpoint: true,
+        });
+        spawn_cleanup_task(Arc::downgrade(&inner));
+        Ok(Self { inner })
     }
 
     pub fn new_with_endpoint(ep: Endpoint, endpoint_addr: EndpointAddr) -> Self {
-        Self {
-            inner: Arc::new(IrohConnectionPoolInner {
-                connections: Mutex::new(Vec::new()),
-                ep: Arc::new(Mutex::new(Some(ep))),
-                endpoint_addr,
-            }),
-        }
+        let inner = Arc::new(IrohConnectionPoolInner {
+            connections: Mutex::new(Vec::new()),
+            ep: Arc::new(Mutex::new(Some(ep))),
+            endpoint_addr,
+            owns_endpoint: false,
+        });
+        spawn_cleanup_task(Arc::downgrade(&inner));
+        Self { inner }
     }
 
     pub fn node_id(&self) -> EndpointId {
@@ -73,8 +94,11 @@ impl IrohConnectionPool {
     pub async fn get_connection(&self) -> Result<Connection, crate::error::ClientError> {
         let mut connections = self.inner.connections.lock().await;
 
-        connections
-            .retain(|pooled| pooled.created_at.elapsed() < tokio::time::Duration::from_secs(60));
+        // Drop stale connections before handing one out: anything already closed
+        // by the peer, or idle for longer than CONNECTION_IDLE_TIMEOUT.
+        connections.retain(|pooled| {
+            pooled.created_at.elapsed() < CONNECTION_IDLE_TIMEOUT && pooled.is_live()
+        });
 
         if let Some(pooled) = connections.pop() {
             return Ok(pooled.conn);
@@ -126,7 +150,58 @@ impl IrohConnectionPool {
         Ok(conn)
     }
 
+    /// Ensure at least one live connection to the backend is cached in the
+    /// pool, establishing one if the pool is empty. Used for pre-connect /
+    /// warm-up so the first real request does not pay the QUIC/relay handshake
+    /// latency. Returns true if a connection is available in the pool
+    /// afterwards.
+    pub async fn preconnect(&self) -> bool {
+        {
+            let connections = self.inner.connections.lock().await;
+            if let Some(pooled) = connections.last() {
+                if pooled.is_live() {
+                    return true;
+                }
+            }
+        }
+
+        let conn = {
+            let ep = self.inner.ep.lock().await;
+            let Some(ep) = ep.as_ref() else {
+                return false;
+            };
+            match tokio::time::timeout(
+                CONNECTION_TIMEOUT,
+                ep.connect(self.inner.endpoint_addr.clone(), ALPN_NEXAPIPE),
+            )
+            .await
+            {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(e)) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!("preconnect failed: {}", e);
+                    return false;
+                }
+                Err(_) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!("preconnect timed out");
+                    return false;
+                }
+            }
+        };
+
+        self.return_connection(conn).await;
+        true
+    }
+
     pub async fn return_connection(&self, conn: Connection) {
+        // Never pool a connection that has already been closed: handing it out
+        // again would just fail on the next request. The background watcher also
+        // reaps such connections, but checking here avoids re-inserting them.
+        if conn.close_reason().is_some() {
+            return;
+        }
+
         let mut connections = self.inner.connections.lock().await;
         if connections.len() < MAX_CONNECTIONS {
             connections.push(PooledConnection {
@@ -140,6 +215,15 @@ impl IrohConnectionPool {
         let mut connections = self.inner.connections.lock().await;
         connections.clear();
 
+        // Only close the endpoint if this pool owns it (created via `new()`).
+        // Pools created via `new_with_endpoint()` share a caller-owned endpoint
+        // (e.g. the global ENDPOINT in the Android JNI layer); closing it here
+        // would break the next `nativeStartProxy`/`nativePreconnect` with
+        // "Endpoint is closed" and tear down a running tunnel on reconnect.
+        if !self.inner.owns_endpoint {
+            return;
+        }
+
         let mut ep = self.inner.ep.lock().await;
         if let Some(endpoint) = ep.take() {
             #[cfg(feature = "tracing")]
@@ -147,6 +231,34 @@ impl IrohConnectionPool {
             endpoint.close().await;
         }
     }
+}
+
+/// Spawn a background task that periodically drops closed connections from the
+/// pool. It holds only a [`Weak`] reference so it exits once the pool itself is
+/// dropped (e.g. on shutdown), and never keeps the pool alive on its own.
+fn spawn_cleanup_task(inner: Weak<IrohConnectionPoolInner>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(CONNECTION_CLEANUP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let Some(inner) = inner.upgrade() else {
+                // Pool dropped; nothing left to clean.
+                break;
+            };
+            let mut connections = inner.connections.lock().await;
+            let before = connections.len();
+            connections.retain(|pooled| pooled.is_live());
+            let removed = before - connections.len();
+            if removed > 0 {
+                #[cfg(feature = "tracing")]
+                tracing::info!(
+                    "Connection pool cleanup: removed {} closed connection(s)",
+                    removed
+                );
+            }
+        }
+    });
 }
 
 pub fn parse_endpoint_addr(

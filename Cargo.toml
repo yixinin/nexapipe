@@ -9,6 +9,15 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 
+# Vendor smoltcp 0.12.0 with a minimal patch guarding the unguarded
+# `remote_last_seq - local_seq_no` subtraction in the TCP transmit path.
+# Without it, real-world traffic (e.g. retransmissions) can trigger
+# `panic: attempt to subtract sequence numbers with underflow` in
+# smoltcp-0.12.0/src/wire/tcp.rs, which kills the TUN proxy stack and
+# disconnects the tunnel a few seconds after connecting.
+[patch.crates-io]
+smoltcp = { path = "third_party/smoltcp" }
+
 [profile.release]
 panic = "unwind"
 opt-level = "s"
