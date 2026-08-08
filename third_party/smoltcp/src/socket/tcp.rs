@@ -695,7 +695,15 @@ impl<'a> Socket<'a> {
         let next_ack = self.remote_seq_no + self.rx_buffer.len();
 
         let last_win = (self.remote_last_win as usize) << self.remote_win_shift;
+        // Guard against underflow: when the remote has advanced past
+        // `last_ack + last_win` (e.g. due to retransmissions or stale
+        // segments) the SeqNumber subtraction wraps to a value whose
+        // i32 sign bit is set.  In that case the advertised window has
+        // been fully consumed and the adjusted window is 0.
         let last_win_adjusted = last_ack + last_win - next_ack;
+        if (last_win_adjusted as i32) < 0 {
+            return Some(0);
+        }
 
         Some(u16::try_from(last_win_adjusted >> self.remote_win_shift).unwrap_or(u16::MAX))
     }

@@ -76,11 +76,11 @@ impl ops::Sub for SeqNumber {
     type Output = usize;
 
     fn sub(self, rhs: SeqNumber) -> usize {
-        let result = self.0.wrapping_sub(rhs.0);
-        if result < 0 {
-            panic!("attempt to subtract sequence numbers with underflow")
-        }
-        result as usize
+        // TCP sequence numbers are modular 2^32 — there is no meaningful
+        // "underflow".  Return the wrapping difference cast to usize so
+        // callers can still detect the direction via the sign bit of the
+        // underlying i32 (result as i32 < 0 means rhs was ahead of self).
+        self.0.wrapping_sub(rhs.0) as usize
     }
 }
 

@@ -20,9 +20,18 @@ tearing down the whole TUN tunnel a few seconds after connecting.
 
 ## Local changes vs upstream 0.12.0
 
+- `src/wire/tcp.rs` (`Sub for SeqNumber`): removed the bogus `result < 0` panic.
+  TCP sequence numbers are modular 2^32 — there is no meaningful underflow.
+  The subtraction now returns the wrapping difference as `usize`, matching
+  the wrapping comparison used by `PartialOrd`.
+- `src/socket/tcp.rs` (`last_scaled_window`): added an underflow guard.
+  When `next_ack` has advanced past `last_ack + last_win` (possible with
+  retransmissions or stale segments), the adjusted window is clamped to 0
+  instead of wrapping to a huge value.
 - `src/socket/tcp.rs` (transmit path): guard the `remote_last_seq - local_seq_no`
-  subtraction so an underflow yields `0` (nothing new to send) instead of panicking.
-- `src/socket/tcp.rs` (trace log): the same subtraction is repeated in a `tcp_trace!`;
-  it now uses the same guarded expression.
+  subtraction so an underflow yields `0` (nothing new to send) instead of
+  calling the now-safe `Sub`.
+- `src/socket/tcp.rs` (trace log): the same subtraction is repeated in a
+  `tcp_trace!`; it now uses the same guarded expression.
 
 Everything else is byte-for-byte upstream 0.12.0.
