@@ -1,0 +1,6 @@
+[submodule "ui-android"]
+	path = ui-android
+	url = https://github.com/yixinin/Nexapipe-Android.git
+[submodule "ui-desktop"]
+	path = ui-desktop
+	url = https://github.com/yixinin/nexa-desktop.git
