@@ -1,8 +1,6 @@
 [workspace]
-members = [
-    "crates/nexapipe",
-    "crates/nexapipe-client",
-]
+members = ["crates/nexapipe", "crates/nexapipe-client"]
+exclude = ["ui-desktop/src-tauri"]
 resolver = "3"
 
 [workspace.package]
@@ -34,15 +32,24 @@ tokio = { version = "1.52.3", features = ["full"] }
 anyhow = "1.0.103"
 http = "1.4.2"
 url = "2.5.8"
-rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
+rustls = { version = "0.23.40", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = [
+    "ring",
+] }
 rustls-native-certs = "0.8.4"
 webpki-roots = "1.0.8"
 hyper = { version = "1.10.1", features = ["full", "http2"] }
 hyper-util = { version = "0.1", features = ["full"] }
-hyper-rustls = { version = "0.27.9", default-features = false, features = ["ring", "http1", "http2"] }
+hyper-rustls = { version = "0.27.9", default-features = false, features = [
+    "ring",
+    "http1",
+    "http2",
+] }
 http-body-util = "0.1"
 tokio-stream = "0.1"
 bytes = "1.12.0"
 futures-util = "0.3.32"
-

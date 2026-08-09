@@ -1,4 +1,4 @@
-use crate::connection_pool::IrohConnectionPool;
+use crate::connection_pool::{IrohConnectionPool, PRECONNECT_TIMEOUT};
 use crate::lb::{LoadBalancingStrategy, RoundRobinBalancer, RandomBalancer, LoadBalancer};
 use crate::ClientError;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
@@ -272,26 +272,99 @@ impl EndpointGroup {
         }
     }
 
-    /// Warm up one iroh connection per backend pool (and the default pool if
-    /// configured), returning them to the pool immediately so the first real
-    /// request does not pay the QUIC/relay handshake latency. Returns the
-    /// number of pools that have a connection available afterwards.
+    /// Test iroh-level connectivity to each unique backend node, in parallel.
+    ///
+    /// Unlike the old sequential preconnect, this:
+    /// - Deduplicates pools by node ID (same node serving multiple domains is tested once)
+    /// - Runs all connectivity tests in parallel via `JoinSet`
+    /// - Applies a short per-pool timeout (PRECONNECT_TIMEOUT = 5s)
+    /// - Caps the overall phase at 10s
+    ///
+    /// This ensures that a single unreachable backend node does not block the
+    /// entire connection flow. Returns the number of nodes that are reachable.
     pub async fn preconnect_all(&self) -> usize {
+        // Collect unique pools by node ID. Multiple domains pointing to the
+        // same node share a single connection pool, so we only need to test
+        // each node once.
+        let mut seen_nodes: Vec<EndpointId> = Vec::new();
+        let mut unique_pools: Vec<Arc<IrohConnectionPool>> = Vec::new();
+
+        let all_pools: Vec<&Arc<IrohConnectionPool>> = self
+            .domains
+            .values()
+            .flat_map(|dp| dp.pools.iter())
+            .chain(
+                self.default_pools
+                    .as_ref()
+                    .map(|dp| dp.pools.iter())
+                    .into_iter()
+                    .flatten(),
+            )
+            .collect();
+
+        for pool in all_pools {
+            let node_id = pool.node_id();
+            if !seen_nodes.iter().any(|id| *id == node_id) {
+                seen_nodes.push(node_id);
+                unique_pools.push(pool.clone());
+            }
+        }
+
+        jni_log!(
+            "[preconnect] Testing connectivity to {} unique node(s) in parallel",
+            unique_pools.len()
+        );
+
+        if unique_pools.is_empty() {
+            return 0;
+        }
+
+        // Run connectivity tests in parallel, each capped at PRECONNECT_TIMEOUT.
+        let mut join_set = tokio::task::JoinSet::new();
+        for pool in unique_pools {
+            join_set.spawn(async move {
+                match tokio::time::timeout(PRECONNECT_TIMEOUT, pool.preconnect()).await {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        jni_log!("[preconnect] Node unreachable (preconnect returned false)");
+                        false
+                    }
+                    Err(_) => {
+                        jni_log!(
+                            "[preconnect] Node timed out after {}s",
+                            PRECONNECT_TIMEOUT.as_secs()
+                        );
+                        false
+                    }
+                }
+            });
+        }
+
+        // Overall cap: 10s for the entire preconnect phase.
+        let overall_deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
         let mut warmed = 0usize;
-        for pools in self.domains.values() {
-            for pool in &pools.pools {
-                if pool.preconnect().await {
-                    warmed += 1;
+        while let Ok(result) = tokio::time::timeout_at(
+            overall_deadline,
+            join_set.join_next(),
+        )
+        .await
+        {
+            match result {
+                Some(Ok(true)) => warmed += 1,
+                Some(Ok(false)) => {}
+                Some(Err(_e)) => {
+                    jni_log!("[preconnect] Task failed");
                 }
+                None => break, // JoinSet empty
             }
         }
-        if let Some(default) = &self.default_pools {
-            for pool in &default.pools {
-                if pool.preconnect().await {
-                    warmed += 1;
-                }
-            }
-        }
+
+        jni_log!(
+            "[preconnect] Connectivity test done: {}/{} node(s) reachable",
+            warmed,
+            seen_nodes.len()
+        );
         warmed
     }
 

@@ -16,6 +16,9 @@ const CONNECTION_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_se
 const CONNECTION_IDLE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(60);
 /// Interval of the background watcher that removes closed/stale connections from the pool.
 const CONNECTION_CLEANUP_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+/// Per-pool timeout for preconnect / warm-up. Much shorter than CONNECTION_TIMEOUT
+/// so that a single unreachable node does not hold up the entire preconnect phase.
+pub(crate) const PRECONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(5);
 
 struct PooledConnection {
     conn: Connection,

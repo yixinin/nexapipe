@@ -300,7 +300,7 @@ where
 
     // Step 1: Read the first chunk of data to determine protocol (HTTP vs TLS)
     let mut request_buf = Vec::new();
-    let mut temp_buf = [0u8; STREAM_BUF_SIZE];
+    let mut temp_buf = vec![0u8; STREAM_BUF_SIZE];
 
     let n = match tokio::time::timeout(
         tokio::time::Duration::from_secs(30),
@@ -333,10 +333,7 @@ where
 
     // Step 2: HTTP — read the complete request header (up to \r\n\r\n)
     let mut header_end: Option<usize> = None;
-    if let Some(pos) = request_buf[..]
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-    {
+    if let Some(pos) = request_buf[..].windows(4).position(|w| w == b"\r\n\r\n") {
         header_end = Some(pos + 4);
     }
 
@@ -416,8 +413,11 @@ where
         let (pooled_conn, mut send, mut recv) =
             open_stream_with_retry(&endpoint_group, &host, None).await?;
 
-        let client_to_iroh = async {
-            let mut buf = [0u8; STREAM_BUF_SIZE];
+        // Spawn bidirectional forwarding as separate tasks to keep each
+        // task's async state machine small (avoids deep nesting that causes
+        // stack overflow on tokio worker threads).
+        let mut client_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; STREAM_BUF_SIZE];
             loop {
                 match client_read.read(&mut buf).await {
                     Ok(0) => break,
@@ -435,10 +435,10 @@ where
                     }
                 }
             }
-        };
+        });
 
-        let iroh_to_client = async {
-            let mut buf = [0u8; STREAM_BUF_SIZE];
+        let mut backend_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; STREAM_BUF_SIZE];
             loop {
                 match recv.read(&mut buf).await {
                     Ok(None) => break,
@@ -461,12 +461,15 @@ where
                     }
                 }
             }
-        };
+        });
 
         tokio::select! {
-            _ = client_to_iroh => (),
-            _ = iroh_to_client => (),
+            _ = &mut client_task => (),
+            _ = &mut backend_task => (),
         }
+
+        client_task.abort();
+        backend_task.abort();
 
         endpoint_group.return_connection(&host, pooled_conn).await;
         return Ok(());
@@ -521,7 +524,9 @@ where
             let line_str = String::from_utf8_lossy(request_line);
             if let Some((method_rest, version)) = line_str.rsplit_once(" HTTP/") {
                 if let Some(method) = method_rest.split_whitespace().next() {
-                    let path = request.uri().path_and_query()
+                    let path = request
+                        .uri()
+                        .path_and_query()
                         .map(|pq| pq.as_str())
                         .unwrap_or("/");
                     // Use http:// scheme (not ws://) — the backend handles
@@ -529,9 +534,8 @@ where
                     let absolute_uri = format!("http://{}{}", host, path);
                     let new_line = format!("{} {} HTTP/{}\r\n", method, absolute_uri, version);
 
-                    let mut request_to_send = Vec::with_capacity(
-                        new_line.len() + header_end - first_line_end,
-                    );
+                    let mut request_to_send =
+                        Vec::with_capacity(new_line.len() + header_end - first_line_end);
                     request_to_send.extend_from_slice(new_line.as_bytes());
                     // Copy the rest of headers (skip the original request line)
                     let rest_start = first_line_end + 2; // skip \r\n
@@ -557,7 +561,7 @@ where
 
                     // Bidirectional forwarding (no send.finish() — keep stream open)
                     let client_to_iroh = async move {
-                        let mut buf = [0u8; STREAM_BUF_SIZE];
+                        let mut buf = vec![0u8; STREAM_BUF_SIZE];
                         let mut ws_buffer = Vec::new();
                         loop {
                             match client_read.read(&mut buf).await {
@@ -583,7 +587,10 @@ where
                                         }
                                     }
                                     if let Err(e) = send.write_all(&buf[..n]).await {
-                                        jni_log!("[DEBUG:local-proxy] WS client->backend err: {}", e);
+                                        jni_log!(
+                                            "[DEBUG:local-proxy] WS client->backend err: {}",
+                                            e
+                                        );
                                         return "client_write_error";
                                     }
                                 }
@@ -596,7 +603,7 @@ where
                     };
 
                     let iroh_to_client = async move {
-                        let mut buf = [0u8; STREAM_BUF_SIZE];
+                        let mut buf = vec![0u8; STREAM_BUF_SIZE];
                         let mut first = true;
                         loop {
                             match recv.read(&mut buf).await {
@@ -608,8 +615,10 @@ where
                                     if first {
                                         first = false;
                                         let p = &buf[..std::cmp::min(n, 200)];
-                                        jni_log!("[DEBUG:local-proxy] WS first response: {}",
-                                            String::from_utf8_lossy(p));
+                                        jni_log!(
+                                            "[DEBUG:local-proxy] WS first response: {}",
+                                            String::from_utf8_lossy(p)
+                                        );
                                     }
                                     jni_log!(
                                         "[DEBUG:local-proxy] WS iroh->client: {}",
@@ -684,7 +693,7 @@ where
     let (mut client_read, mut client_write) = tokio::io::split(stream);
 
     let client_to_backend = async move {
-        let mut buf = [0u8; STREAM_BUF_SIZE];
+        let mut buf = vec![0u8; STREAM_BUF_SIZE];
         loop {
             match client_read.read(&mut buf).await {
                 Ok(0) => break,
@@ -706,7 +715,7 @@ where
     };
 
     let backend_to_client = async move {
-        let mut buf = [0u8; STREAM_BUF_SIZE];
+        let mut buf = vec![0u8; STREAM_BUF_SIZE];
         let mut total_bytes = 0;
         let mut debug_preview = Vec::with_capacity(1500);
         let mut response_sent = false;
@@ -749,7 +758,10 @@ where
             }
         }
         if !response_sent && total_bytes > 0 {
-            jni_log!("[DEBUG:local-proxy] Response sent (late): {} bytes", total_bytes);
+            jni_log!(
+                "[DEBUG:local-proxy] Response sent (late): {} bytes",
+                total_bytes
+            );
             if !debug_preview.is_empty() {
                 jni_log!(
                     "[DEBUG:local-proxy] Response preview: {}",
@@ -862,7 +874,7 @@ where
 
     // Bidirectional raw data forwarding (TCP tunnel)
     let client_to_iroh = async {
-        let mut buf = [0u8; STREAM_BUF_SIZE];
+        let mut buf = vec![0u8; STREAM_BUF_SIZE];
         loop {
             match client_read.read(&mut buf).await {
                 Ok(0) => break,
@@ -876,10 +888,7 @@ where
                     }
                 }
                 Err(e) => {
-                    jni_log!(
-                        "[DEBUG:local-proxy] TLS tunnel client read error: {}",
-                        e
-                    );
+                    jni_log!("[DEBUG:local-proxy] TLS tunnel client read error: {}", e);
                     break;
                 }
             }
@@ -887,7 +896,7 @@ where
     };
 
     let iroh_to_client = async {
-        let mut buf = [0u8; STREAM_BUF_SIZE];
+        let mut buf = vec![0u8; STREAM_BUF_SIZE];
         loop {
             match recv.read(&mut buf).await {
                 Ok(None) => break,
@@ -905,10 +914,7 @@ where
                     }
                 }
                 Err(e) => {
-                    jni_log!(
-                        "[DEBUG:local-proxy] TLS tunnel backend read error: {}",
-                        e
-                    );
+                    jni_log!("[DEBUG:local-proxy] TLS tunnel backend read error: {}", e);
                     break;
                 }
             }
@@ -972,9 +978,8 @@ fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
     if pos + 3 > data.len() {
         return None;
     }
-    let _hs_len = ((data[pos] as usize) << 16)
-        | ((data[pos + 1] as usize) << 8)
-        | (data[pos + 2] as usize);
+    let _hs_len =
+        ((data[pos] as usize) << 16) | ((data[pos + 1] as usize) << 8) | (data[pos + 2] as usize);
     pos += 3;
 
     // Skip protocol version (2 bytes) + random (32 bytes)
@@ -1044,8 +1049,7 @@ fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
                 let name_len = ((data[pos] as usize) << 8) | (data[pos + 1] as usize);
                 pos += 2;
 
-                if name_type == 0x00 && pos + name_len <= data.len() && pos + name_len <= ext_end
-                {
+                if name_type == 0x00 && pos + name_len <= data.len() && pos + name_len <= ext_end {
                     // Read host_name (ASCII/UTF-8 encoded hostname)
                     return String::from_utf8(data[pos..pos + name_len].to_vec()).ok();
                 }
