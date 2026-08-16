@@ -9,6 +9,9 @@ use tokio_stream::StreamExt;
 #[cfg(feature = "tracing")]
 use tracing;
 
+use crate::ClientError;
+use crate::auth::TwoFactorAuth;
+
 const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
 const MAX_CONNECTIONS: usize = 10;
 const CONNECTION_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
@@ -41,6 +44,9 @@ struct IrohConnectionPoolInner {
     connections: Mutex<Vec<PooledConnection>>,
     ep: Arc<Mutex<Option<Endpoint>>>,
     endpoint_addr: EndpointAddr,
+    /// Optional client 2FA credentials. When set, every freshly established
+    /// connection is authenticated with the server before it is pooled/used.
+    two_factor: Mutex<Option<TwoFactorAuth>>,
     /// Whether this pool created (and therefore owns) its iroh endpoint.
     ///
     /// `new()` binds a dedicated endpoint, so `close_all` must close it.
@@ -61,6 +67,7 @@ impl IrohConnectionPool {
             connections: Mutex::new(Vec::new()),
             ep: Arc::new(Mutex::new(Some(ep))),
             endpoint_addr,
+            two_factor: Mutex::new(None),
             owns_endpoint: true,
         });
         spawn_cleanup_task(Arc::downgrade(&inner));
@@ -72,6 +79,7 @@ impl IrohConnectionPool {
             connections: Mutex::new(Vec::new()),
             ep: Arc::new(Mutex::new(Some(ep))),
             endpoint_addr,
+            two_factor: Mutex::new(None),
             owns_endpoint: false,
         });
         spawn_cleanup_task(Arc::downgrade(&inner));
@@ -94,6 +102,45 @@ impl IrohConnectionPool {
         }
     }
 
+    /// Configure client 2FA credentials. Connections established afterwards
+    /// (including preconnect warm-ups) will run the 2FA handshake first.
+    pub async fn set_two_factor(&self, auth: Option<TwoFactorAuth>) {
+        *self.inner.two_factor.lock().await = auth;
+    }
+
+    /// Connect to the backend and run the 2FA handshake when configured.
+    async fn connect_and_auth(&self, ep: &Endpoint) -> Result<Connection, ClientError> {
+        let conn = tokio::time::timeout(
+            CONNECTION_TIMEOUT,
+            ep.connect(self.inner.endpoint_addr.clone(), ALPN_NEXAPIPE),
+        )
+        .await
+        .map_err(|_| ClientError::TimeoutError)?
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+        let two_factor = self.inner.two_factor.lock().await.clone();
+        if let Some(auth) = two_factor {
+            #[cfg(feature = "tracing")]
+            tracing::info!(
+                "Authenticating connection with 2FA as client '{}'",
+                auth.client_id()
+            );
+            if let Err(e) = auth.authenticate(&conn).await {
+                conn.close(0u32.into(), b"2FA authentication failed");
+                #[cfg(feature = "tracing")]
+                tracing::warn!("2FA authentication failed: {}", e);
+                return Err(e);
+            }
+            #[cfg(feature = "tracing")]
+            tracing::info!(
+                "2FA authentication succeeded for client '{}'",
+                auth.client_id()
+            );
+        }
+
+        Ok(conn)
+    }
+
     pub async fn get_connection(&self) -> Result<Connection, crate::error::ClientError> {
         let mut connections = self.inner.connections.lock().await;
 
@@ -114,13 +161,7 @@ impl IrohConnectionPool {
             crate::error::ClientError::InvalidConfig("Endpoint has been closed".to_string())
         })?;
 
-        let conn = tokio::time::timeout(
-            CONNECTION_TIMEOUT,
-            ep.connect(self.inner.endpoint_addr.clone(), ALPN_NEXAPIPE),
-        )
-        .await
-        .map_err(|_| crate::error::ClientError::TimeoutError)?
-        .map_err(|e| anyhow::anyhow!(e))?;
+        let conn = self.connect_and_auth(ep).await?;
 
         let conn_clone = conn.clone();
         tokio::spawn(async move {
@@ -173,12 +214,7 @@ impl IrohConnectionPool {
             let Some(ep) = ep.as_ref() else {
                 return false;
             };
-            match tokio::time::timeout(
-                CONNECTION_TIMEOUT,
-                ep.connect(self.inner.endpoint_addr.clone(), ALPN_NEXAPIPE),
-            )
-            .await
-            {
+            match tokio::time::timeout(CONNECTION_TIMEOUT, self.connect_and_auth(ep)).await {
                 Ok(Ok(conn)) => conn,
                 Ok(Err(e)) => {
                     #[cfg(feature = "tracing")]

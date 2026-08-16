@@ -1,11 +1,12 @@
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
 use crate::tun_proxy::TunProxy;
+use crate::auth::{TotpAlgorithm, TwoFactorAuth};
 use crate::{
     DomainMapping, EndpointGroup, IrohConnectionPool, LoadBalancingStrategy, LocalProxy, NodeConfig,
 };
 use iroh::dns::{DnsError, DnsProtocol, DnsResolver, Resolver, TxtRecordData};
 use iroh::endpoint::presets;
-use iroh::{Endpoint, RelayMode, RelayUrl};
+use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl};
 use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::{jint, jstring};
@@ -26,6 +27,8 @@ use tokio::task::JoinHandle;
 static RUNTIME: OnceCell<Runtime> = OnceCell::new();
 static ENDPOINT: Mutex<Option<Endpoint>> = Mutex::new(None);
 static STATE: OnceCell<Arc<Mutex<ProxyState>>> = OnceCell::new();
+// 2FA 配置：Kotlin 侧通过 nativeSetTwoFactor 在启动前注入 (client_id, secret, algorithm)。
+static TWO_FACTOR: Mutex<Option<(String, String, String)>> = Mutex::new(None);
 
 // 代际计数器：每次 nativeStopProxy 释放 endpoint 时自增。nativeStartIroh 在 bind()
 // 前后比对该值，若期间发生过 stop 则丢弃迟到的新 endpoint，避免孤立 bind 复活已释放的隧道。
@@ -72,6 +75,11 @@ const PRECONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_se
 /// 副作用：若 aps1-1 宕机则 relay 路径不可用（直连不受影响）。
 /// DNS 仍由 Kotlin 侧 resolveIrohDnsOverrides 预解析 aps1-1 的 IP 注入 OverrideResolver。
 const PINNED_RELAY_URL: &str = "https://aps1-1.relay.n0.iroh.link.";
+
+// Relay configuration: mode and custom URL from Kotlin settings.
+// "default" = iroh default (all N0 relays), "disabled" = no relay, "custom" = user-provided URL.
+static RELAY_MODE: Mutex<String> = Mutex::new(String::new());
+static CUSTOM_RELAY_URL: Mutex<String> = Mutex::new(String::new());
 
 struct ProxyState {
     conn_pool: Option<IrohConnectionPool>,
@@ -465,6 +473,121 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDnsOverride(
     0
 }
 
+/// 配置 relay 模式和自定义 URL。relay_mode: "default"/"disabled"/"custom"。
+/// relay_url 仅在 relay_mode="custom" 时使用。
+/// 必须在 nativeStartIroh 之前调用。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetRelayConfig(
+    mut env: JNIEnv,
+    _class: JClass,
+    relay_mode: JString,
+    relay_url: JString,
+) -> jint {
+    if env.exception_check().unwrap_or(false) {
+        jni_log!("JNI exception pending before nativeSetRelayConfig");
+        env.exception_clear().unwrap();
+        return -1;
+    }
+
+    let mode_str = match env.get_string(&relay_mode) {
+        Ok(s) => match s.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                jni_log!("Failed to convert relay_mode string to UTF-8");
+                return -1;
+            }
+        },
+        Err(_) => {
+            jni_log!("Failed to get relay_mode string from JNI");
+            return -1;
+        }
+    };
+
+    let url_str = match env.get_string(&relay_url) {
+        Ok(s) => match s.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => String::new(),
+        },
+        Err(_) => String::new(),
+    };
+
+    jni_log!(
+        "[DEBUG:jni] nativeSetRelayConfig: mode='{}', url='{}'",
+        mode_str,
+        url_str
+    );
+
+    if let Ok(mut mode) = RELAY_MODE.lock() {
+        *mode = mode_str;
+    }
+    if let Ok(mut url) = CUSTOM_RELAY_URL.lock() {
+        *url = url_str;
+    }
+    0
+}
+
+/// 读取 Kotlin 注入的 2FA 凭证并构造 TwoFactorAuth；未配置或 secret 为空时返回 None。
+fn current_two_factor_auth() -> Option<TwoFactorAuth> {
+    let cfg = TWO_FACTOR.lock().map(|g| g.clone()).unwrap_or_default()?;
+    let (client_id, secret, algorithm) = cfg;
+    if secret.trim().is_empty() {
+        return None;
+    }
+    match TwoFactorAuth::new(&client_id, &secret, TotpAlgorithm::from_name(&algorithm)) {
+        Ok(auth) => Some(auth),
+        Err(e) => {
+            jni_log!("2FA auth config invalid: {}", e);
+            None
+        }
+    }
+}
+
+/// 配置客户端 2FA 凭证。必须在 nativeStartProxy / nativeStartProxyLegacy 之前调用。
+/// algorithm: "sha1" / "sha256" / "sha512"。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetTwoFactor(
+    mut env: JNIEnv,
+    _class: JClass,
+    client_id: JString,
+    secret: JString,
+    algorithm: JString,
+) -> jint {
+    if env.exception_check().unwrap_or(false) {
+        jni_log!("JNI exception pending before nativeSetTwoFactor");
+        env.exception_clear().unwrap();
+        return -1;
+    }
+
+    let read_str = |env: &mut JNIEnv, s: &JString| -> Option<String> {
+        env.get_string(s).ok().and_then(|j| match j.to_str() {
+            Ok(s) => Some(s.to_string()),
+            Err(_) => None,
+        })
+    };
+
+    let client_id = match read_str(&mut env, &client_id) {
+        Some(v) => v,
+        None => {
+            jni_log!("Failed to read client_id in nativeSetTwoFactor");
+            return -1;
+        }
+    };
+    let secret = read_str(&mut env, &secret).unwrap_or_default();
+    let algorithm = read_str(&mut env, &algorithm).unwrap_or_else(|| "sha1".to_string());
+
+    jni_log!(
+        "[DEBUG:jni] nativeSetTwoFactor: client_id='{}', algorithm='{}', secret={} chars",
+        client_id,
+        algorithm,
+        secret.len()
+    );
+
+    if let Ok(mut tf) = TWO_FACTOR.lock() {
+        *tf = Some((client_id, secret, algorithm));
+    }
+    0
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartIroh(
     env: JNIEnv,
@@ -507,13 +630,34 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartIroh(
         DNS_OVERRIDES.lock().map(|g| g.clone()).unwrap_or_default();
 
     let bind_result: Result<Endpoint, ()> = runtime.block_on(async move {
-        // 固定 relay 到 aps1-1（亚太南），防止 iroh 在多个 relay 间切换导致 WS 断线。
-        // 见 PINNED_RELAY_URL 注释。
-        let relay_url: RelayUrl = PINNED_RELAY_URL
-            .parse()
-            .expect("PINNED_RELAY_URL must be a valid relay URL");
-        jni_log!("[iroh] pinning relay to {}", PINNED_RELAY_URL);
-        let builder = Endpoint::builder(presets::N0).relay_mode(RelayMode::custom([relay_url]));
+        // 读取 Kotlin 侧注入的 relay 配置（nativeSetRelayConfig 设置）。
+        // relay_mode: "default" = iroh 默认（所有 N0 relay），"disabled" = 无 relay，
+        // "custom" = 用户自定义 relay URL；空字符串 = 使用 PINNED_RELAY_URL 默认值。
+        let cfg_mode = RELAY_MODE.lock().map(|g| g.clone()).unwrap_or_default();
+        let cfg_url = CUSTOM_RELAY_URL
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let builder = if cfg_mode == "disabled" {
+            jni_log!("[iroh] relay mode: disabled (direct connections only)");
+            Endpoint::builder(presets::N0).relay_mode(RelayMode::Disabled)
+        } else if cfg_mode == "custom" && !cfg_url.is_empty() {
+            jni_log!("[iroh] relay mode: custom, url={}", cfg_url);
+            let custom_url: RelayUrl = cfg_url.parse().expect("custom relay URL must be valid");
+            Endpoint::builder(presets::N0)
+                .relay_mode(RelayMode::Custom(RelayMap::from_iter(vec![custom_url])))
+        } else if cfg_mode == "default" {
+            jni_log!("[iroh] relay mode: default (all N0 relays)");
+            Endpoint::builder(presets::N0)
+        } else {
+            // 默认行为：固定 relay 到 aps1-1（亚太南），防止 iroh 在多个 relay 间切换导致 WS 断线。
+            let relay_url: RelayUrl = PINNED_RELAY_URL
+                .parse()
+                .expect("PINNED_RELAY_URL must be a valid relay URL");
+            jni_log!("[iroh] pinning relay to {}", PINNED_RELAY_URL);
+            Endpoint::builder(presets::N0)
+                .relay_mode(RelayMode::Custom(RelayMap::from_iter(vec![relay_url])))
+        };
         // 始终用 OverrideResolver 包装 hickory：
         // - 对 DNS_OVERRIDES 中的 iroh 基础设施域名（dns.iroh.link, *.relay.n0.iroh.link）
         //   直接返回 Kotlin 预解析的 IP，绕过 GFW 对 iroh.link UDP DNS 响应的阻断。
@@ -715,6 +859,11 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
             } else {
                 jni_log!("No nodes or domain mappings configured");
                 return Err("No nodes or domain mappings configured".to_string());
+            }
+
+            // 2FA：把 Kotlin 注入的凭证下发给连接组，新建连接会先执行认证握手。
+            if let Some(auth) = current_two_factor_auth() {
+                endpoint_group.set_two_factor(Some(auth)).await;
             }
 
             jni_log!("[DEBUG:jni] Creating LocalProxy on {}", listen_addr);
@@ -951,6 +1100,11 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxyLegacy(
                             return Err(format!("Failed to create connection pool: {}", e));
                         }
                     }
+                }
+
+                // 2FA：把 Kotlin 注入的凭证下发到连接池，新建连接会先执行认证握手。
+                if let Some(auth) = current_two_factor_auth() {
+                    pool.set_two_factor(Some(auth)).await;
                 }
 
                 match LocalProxy::new_with_single_pool(&listen_addr, domains, pool.clone()).await {
@@ -1406,7 +1560,6 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDestroy(
 /// 参数：
 /// - `tun_fd`: TUN 文件描述符（detachFd 返回值）
 /// - `proxy_domains`: 逗号分隔的代理域名列表
-/// - `captive_portal_domains`: 逗号分隔的 captive portal 校验域名列表
 ///
 /// 返回 0 成功，-1 失败。
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
@@ -1416,7 +1569,6 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartTunProxy(
     _class: JClass,
     tun_fd: jint,
     proxy_domains: JString,
-    captive_portal_domains: JString,
 ) -> jint {
     if env.exception_check().unwrap_or(false) {
         jni_log!("JNI exception pending before nativeStartTunProxy");
@@ -1444,31 +1596,10 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartTunProxy(
         .filter(|s| !s.is_empty())
         .collect();
 
-    // 解析 captive portal 域名（逗号分隔）
-    let portal_domains_str = match env.get_string(&captive_portal_domains) {
-        Ok(s) => match s.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                jni_log!("Failed to convert captive_portal_domains to UTF-8");
-                return -1;
-            }
-        },
-        Err(_) => {
-            jni_log!("Failed to get captive_portal_domains string from JNI");
-            return -1;
-        }
-    };
-    let portal_domains_list: Vec<String> = portal_domains_str
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
     jni_log!(
-        "[DEBUG:jni] nativeStartTunProxy: fd={}, proxy_domains={} items, portal_domains={} items",
+        "[DEBUG:jni] nativeStartTunProxy: fd={}, proxy_domains={} items",
         tun_fd,
-        proxy_domains_list.len(),
-        portal_domains_list.len()
+        proxy_domains_list.len()
     );
 
     let runtime = match get_runtime() {
@@ -1537,7 +1668,6 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartTunProxy(
         tun_fd as std::os::fd::RawFd,
         endpoint_group,
         proxy_domains_list,
-        portal_domains_list,
         custom_dns_servers,
     ) {
         Ok(tp) => tp,

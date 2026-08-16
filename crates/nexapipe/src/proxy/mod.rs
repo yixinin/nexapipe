@@ -1,5 +1,6 @@
-pub mod local_proxy;
+﻿pub mod local_proxy;
 
+use crate::auth::AuthConfig;
 use crate::config::{IrohConfig, LocalProxyConfig, ServerConfig};
 use crate::conn;
 use crate::health::HealthChecker;
@@ -35,9 +36,13 @@ pub async fn run_proxy(
     server_config: Option<ServerConfig>,
     iroh_config: Option<IrohConfig>,
     shutdown_signal: Arc<ShutdownSignal>,
+    auth_config: Option<AuthConfig>,
 ) -> anyhow::Result<()> {
     let config = Arc::new(RouteConfig::new(routes, default_backend.clone()));
     let http_client = Arc::new(http::create_http_client());
+
+    // Wrap auth config in Arc<RwLock> for shared access
+    let auth_config = auth_config.map(|cfg| Arc::new(tokio::sync::RwLock::new(cfg)));
 
     let mut builder = Endpoint::builder(presets::N0).alpns(vec![ALPN_NEXAPIPE.to_vec()]);
 
@@ -236,8 +241,9 @@ pub async fn run_proxy(
                     Some(incoming) => {
                         let config_clone = config.clone();
                         let http_client_clone = http_client.clone();
+                        let auth_config_clone = auth_config.clone();
                         tokio::spawn(async move {
-                            conn::handle_incoming(incoming, config_clone, http_client_clone).await;
+                            conn::handle_incoming(incoming, config_clone, http_client_clone, auth_config_clone).await;
                         });
                     }
                     None => {

@@ -1,26 +1,32 @@
-use std::fmt;
+﻿use std::fmt;
 
 #[derive(Debug)]
 pub enum ClientError {
     ConnectionError(String),
+    ConnectionFailed(String),
+    AuthenticationFailed(String),
     ParseError(String),
     SendError(String),
     ReceiveError(String),
     TimeoutError,
     InvalidConfig(String),
     IoError(std::io::Error),
+    Other(String),
 }
 
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ClientError::ConnectionError(msg) => write!(f, "Connection error: {}", msg),
+            ClientError::ConnectionFailed(msg) => write!(f, "Connection failed: {}", msg),
+            ClientError::AuthenticationFailed(msg) => write!(f, "Authentication failed: {}", msg),
             ClientError::ParseError(msg) => write!(f, "Parse error: {}", msg),
             ClientError::SendError(msg) => write!(f, "Send error: {}", msg),
             ClientError::ReceiveError(msg) => write!(f, "Receive error: {}", msg),
             ClientError::TimeoutError => write!(f, "Operation timed out"),
             ClientError::InvalidConfig(msg) => write!(f, "Invalid config: {}", msg),
             ClientError::IoError(e) => write!(f, "IO error: {}", e),
+            ClientError::Other(msg) => write!(f, "Error: {}", msg),
         }
     }
 }

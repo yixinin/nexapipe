@@ -1,4 +1,5 @@
-﻿use crate::http;
+﻿use crate::auth::{AuthConfig, AuthMessage, TotpValidator};
+use crate::http;
 use crate::routes::{BackendInfo, RouteConfig};
 use ::http::Request;
 use hyper_util::client::legacy;
@@ -55,9 +56,6 @@ pub async fn handle_bidi_stream(
     }
 
     tracing::debug!("Iroh stream data received - bytes_read: {}", buf.len());
-
-    let request_str = String::from_utf8_lossy(&buf);
-    tracing::debug!("Raw Iroh request:\n{}", request_str);
 
     let request = http::parse_http_request_legacy(&buf)?;
 
@@ -206,20 +204,13 @@ async fn handle_websocket_stream(
             let mut buf = [0u8; 8192];
             loop {
                 match recv.read(&mut buf).await {
-                    Ok(None) => {
-                        tracing::debug!("WebSocket iroh stream finished");
-                        return "iroh_finished";
-                    }
+                    Ok(None) => return "iroh_finished",
                     Ok(Some(n)) => {
                         if let Err(e) = backend_write.write_all(&buf[..n]).await {
-                            tracing::debug!("WebSocket iroh_to_backend error: {}", e);
                             return "backend_write_error";
                         }
                     }
-                    Err(e) => {
-                        tracing::debug!("WebSocket iroh_to_backend read error: {}", e);
-                        return "iroh_read_error";
-                    }
+                    Err(_) => return "iroh_read_error",
                 }
             }
         };
@@ -229,20 +220,13 @@ async fn handle_websocket_stream(
             let mut backend_read = backend_read;
             loop {
                 match backend_read.read(&mut buf).await {
-                    Ok(0) => {
-                        tracing::debug!("WebSocket backend stream closed");
-                        return "backend_finished";
-                    }
+                    Ok(0) => return "backend_finished",
                     Ok(n) => {
                         if let Err(e) = send.write_all(&buf[..n]).await {
-                            tracing::debug!("WebSocket backend_to_iroh error: {}", e);
                             return "iroh_write_error";
                         }
                     }
-                    Err(e) => {
-                        tracing::debug!("WebSocket backend_to_iroh read error: {}", e);
-                        return "backend_read_error";
-                    }
+                    Err(_) => return "backend_read_error",
                 }
             }
         };
@@ -270,11 +254,104 @@ async fn handle_websocket_stream(
 
 fn get_connection_type(path: &iroh::endpoint::Path<'_>) -> &'static str {
     if path.is_ip() {
-        "Direct (直连)"
+        "Direct"
     } else if path.is_relay() {
-        "Relay (中转)"
+        "Relay"
     } else {
         "Unknown"
+    }
+}
+
+/// Perform 2FA authentication handshake with a client.
+///
+/// Protocol:
+/// 1. Receive AUTH_START from client
+/// 2. Send AUTH_CHALLENGE with nonce
+/// 3. Receive AUTH_RESPONSE with TOTP code
+/// 4. Validate and send AUTH_OK or AUTH_FAILED
+async fn perform_authentication(
+    conn: &Connection,
+    config: &AuthConfig,
+) -> Result<String, anyhow::Error> {
+    let (mut send, mut recv) = conn.accept_bi().await
+        .map_err(|e| anyhow::anyhow!("Failed to open auth stream: {}", e))?;
+
+    // Step 1: Receive AUTH_START
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf).await
+        .map_err(|e| anyhow::anyhow!("Failed to read AUTH_START length: {}", e))?;
+    let msg_len = u32::from_le_bytes(len_buf) as usize;
+
+    let mut msg_buf = vec![0u8; msg_len];
+    recv.read_exact(&mut msg_buf).await
+        .map_err(|e| anyhow::anyhow!("Failed to read AUTH_START message: {}", e))?;
+
+    let start_msg = AuthMessage::from_bytes(&msg_buf)
+        .map_err(|e| anyhow::anyhow!("Failed to parse AUTH_START: {}", e))?;
+
+    let client_id = match start_msg {
+        AuthMessage::Start { client_id, .. } => client_id,
+        _ => return Err(anyhow::anyhow!("Expected AUTH_START message")),
+    };
+
+    // Step 2: Send AUTH_CHALLENGE
+    let nonce: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+    let challenge_msg = AuthMessage::Challenge { nonce };
+
+    let challenge_bytes = challenge_msg.to_bytes()
+        .map_err(|e| anyhow::anyhow!("Failed to serialize challenge: {}", e))?;
+    let len = challenge_bytes.len() as u32;
+    send.write_all(&len.to_le_bytes()).await?;
+    send.write_all(&challenge_bytes).await?;
+
+    // Step 3: Receive AUTH_RESPONSE
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf).await
+        .map_err(|e| anyhow::anyhow!("Failed to read AUTH_RESPONSE length: {}", e))?;
+    let msg_len = u32::from_le_bytes(len_buf) as usize;
+
+    let mut msg_buf = vec![0u8; msg_len];
+    recv.read_exact(&mut msg_buf).await
+        .map_err(|e| anyhow::anyhow!("Failed to read AUTH_RESPONSE message: {}", e))?;
+
+    let response_msg = AuthMessage::from_bytes(&msg_buf)
+        .map_err(|e| anyhow::anyhow!("Failed to parse AUTH_RESPONSE: {}", e))?;
+
+    let (resp_client_id, _timestamp, totp_code) = match response_msg {
+        AuthMessage::Response { client_id, timestamp, totp_code } => {
+            (client_id, timestamp, totp_code)
+        }
+        _ => return Err(anyhow::anyhow!("Expected AUTH_RESPONSE message")),
+    };
+
+    if resp_client_id != client_id {
+        return Err(anyhow::anyhow!("Client ID mismatch in AUTH_RESPONSE"));
+    }
+
+    // Step 4: Validate TOTP code
+    let validator = TotpValidator::new(config.clone());
+    let is_valid = validator.validate(&client_id, &totp_code).unwrap_or(false);
+
+    let result_msg = if is_valid {
+        AuthMessage::Ok
+    } else {
+        AuthMessage::Failed {
+            reason: "Invalid TOTP code".to_string(),
+        }
+    };
+
+    let result_bytes = result_msg.to_bytes()
+        .map_err(|e| anyhow::anyhow!("Failed to serialize auth result: {}", e))?;
+    let len = result_bytes.len() as u32;
+    send.write_all(&len.to_le_bytes()).await?;
+    send.write_all(&result_bytes).await?;
+    send.finish()
+        .map_err(|e| anyhow::anyhow!("Failed to finish auth stream: {}", e))?;
+
+    if is_valid {
+        Ok(client_id)
+    } else {
+        Err(anyhow::anyhow!("Invalid TOTP code for client '{}'", client_id))
     }
 }
 
@@ -282,10 +359,10 @@ pub async fn handle_connection(
     conn: Connection,
     config: Arc<RouteConfig>,
     client: Arc<HttpClient>,
+    auth_config: Option<Arc<tokio::sync::RwLock<AuthConfig>>>,
 ) {
     let peer_id = conn.remote_id();
     tracing::info!("New connection from peer: {}", peer_id);
-    tracing::debug!("Iroh connection info - peer_id: {}", peer_id);
 
     let paths = conn.paths();
     if let Some(selected_path) = paths.iter().find(|p| p.is_selected()) {
@@ -301,22 +378,33 @@ pub async fn handle_connection(
             match event {
                 iroh::endpoint::PathEvent::Selected { remote_addr, .. } => {
                     if remote_addr.is_ip() {
-                        tracing::info!("Connection upgraded: Relay → Direct (直连)");
+                        tracing::info!("Connection upgraded: Relay -> Direct");
                     } else if remote_addr.is_relay() {
-                        tracing::info!("Connection downgraded: Direct → Relay (中转)");
-                    }
-                }
-                iroh::endpoint::PathEvent::Opened { remote_addr, .. } => {
-                    if remote_addr.is_ip() {
-                        tracing::info!("Direct path opened (waiting for selection)");
-                    } else if remote_addr.is_relay() {
-                        tracing::info!("Relay path opened");
+                        tracing::info!("Connection downgraded: Direct -> Relay");
                     }
                 }
                 _ => {}
             }
         }
     });
+
+    // ===== 2FA Authentication Handshake =====
+    if let Some(auth_cfg) = &auth_config {
+        let cfg = auth_cfg.read().await;
+        if cfg.enabled {
+            match perform_authentication(&conn, &cfg).await {
+                Ok(client_id) => {
+                    tracing::info!("Client '{}' authenticated successfully from {}", client_id, peer_id);
+                }
+                Err(e) => {
+                    tracing::warn!("Authentication failed for {}: {}", peer_id, e);
+                    conn.close(0u32.into(), b"Authentication failed");
+                    return;
+                }
+            }
+        }
+    }
+    // ===== Authentication Complete =====
 
     loop {
         match conn.accept_bi().await {
@@ -349,12 +437,13 @@ pub async fn handle_incoming(
     incoming: Incoming,
     config: Arc<RouteConfig>,
     client: Arc<HttpClient>,
+    auth_config: Option<Arc<tokio::sync::RwLock<AuthConfig>>>,
 ) {
     match incoming.accept() {
         Ok(accepting) => match accepting.await {
             Ok(conn) => {
                 tokio::spawn(async move {
-                    handle_connection(conn, config, client).await;
+                    handle_connection(conn, config, client, auth_config).await;
                 });
             }
             Err(e) => {

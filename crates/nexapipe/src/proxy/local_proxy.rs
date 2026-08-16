@@ -2,6 +2,7 @@ use crate::config::LocalProxyConfig;
 use crate::shutdown::ShutdownSignal;
 use iroh::Endpoint;
 use iroh::endpoint::presets;
+use nexapipe_client::auth::{TotpAlgorithm, TwoFactorAuth};
 use nexapipe_client::{EndpointGroup, LoadBalancingStrategy, LocalProxy, NodeConfig};
 use std::sync::Arc;
 
@@ -10,6 +11,7 @@ pub async fn run_local_proxy(
     shutdown_signal: Arc<ShutdownSignal>,
 ) -> anyhow::Result<()> {
     let listen_addr = config.listen_addr.clone();
+    let two_factor_config = config.two_factor.clone();
 
     let mut proxy_domains = config.proxy_domains;
 
@@ -80,6 +82,22 @@ pub async fn run_local_proxy(
 
         EndpointGroup::new_with_single_pool(conn_pool).await
     };
+
+    // 2FA：若配置了 [local_proxy.two_factor] 且启用，则每个新建连接都会先执行认证握手。
+    if let Some(tf) = two_factor_config {
+        if tf.enabled.unwrap_or(false) {
+            let auth = TwoFactorAuth::new(
+                &tf.client_id,
+                &tf.secret,
+                TotpAlgorithm::from_name(tf.algorithm.as_deref().unwrap_or("sha1")),
+            )?;
+            endpoint_group.set_two_factor(Some(auth)).await;
+            tracing::info!(
+                "2FA enabled for local proxy, client_id: {}",
+                tf.client_id
+            );
+        }
+    }
 
     let node_ids = endpoint_group.node_ids();
     tracing::info!(

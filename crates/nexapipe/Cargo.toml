@@ -1,46 +1,50 @@
 [package]
-name = "nexapipe"
-version = "0.1.0"
-edition = "2024"
+name = 'nexapipe'
+version = '0.1.0'
+edition = '2024'
 
 [dependencies]
-clap = { version = "4.6.1", features = ["derive"] }
+clap = { version = '4.6.1', features = ['derive'] }
 iroh.workspace = true
 iroh-tickets.workspace = true
 quinn.workspace = true
-rand = "0.10.1"
+rand = '0.10.1'
 tokio.workspace = true
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing = '0.1.44'
+tracing-subscriber = { version = '0.3.23', features = ['env-filter'] }
 anyhow.workspace = true
 http.workspace = true
 url.workspace = true
-toml = "1.1.2"
-serde = { version = "1.0.228", features = ["derive"] }
+toml = '1.1.2'
+serde = { version = '1.0.228', features = ['derive'] }
+serde_json = '1.0'
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-native-certs.workspace = true
 webpki-roots.workspace = true
-rustls-pemfile = "2.0"
-rustls-pki-types = "1.15.0"
-instant-acme = { version = "0.8.5", default-features = false, features = ["hyper-rustls", "ring"] }
-cloudflare = { version = "0.14.0", default-features = false, features = ["rustls-tls"] }
-x509-parser = "0.18.1"
-chrono = { version = "0.4.45", features = ["serde"] }
+rustls-pemfile = '2.0'
+rustls-pki-types = '1.15.0'
+instant-acme = { version = '0.8.5', default-features = false, features = ['hyper-rustls', 'ring'] }
+cloudflare = { version = '0.14.0', default-features = false, features = ['rustls-tls'] }
+x509-parser = '0.18.1'
+chrono = { version = '0.4.45', features = ['serde'] }
 futures-util.workspace = true
-base64 = "0.22.1"
+base64 = '0.22.1'
 hyper.workspace = true
 hyper-util.workspace = true
 hyper-rustls.workspace = true
 http-body-util.workspace = true
 tokio-stream.workspace = true
-flate2 = "1.0"
+flate2 = '1.0'
 bytes.workspace = true
-lazy_static = "1.4"
-hex = "0.4"
-nexapipe-client = { path = "../nexapipe-client", features = ["local-proxy"] }
+lazy_static = '1.4'
+hex = '0.4'
+nexapipe-client = { path = '../nexapipe-client', features = ['local-proxy'] }
+# 2FA support
+totp-rs = { version = '5.6', features = ['gen_secret'] }
+base32 = '0.4'
 
 [dev-dependencies]
-duct = "1.1.1"
-nix = { version = "0.31.3", features = ["signal", "process"] }
-tempfile = "3.8"
+duct = '1.1.1'
+nix = { version = '0.31.3', features = ['signal', 'process'] }
+tempfile = '3.8'

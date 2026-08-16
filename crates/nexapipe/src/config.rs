@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -53,6 +54,15 @@ pub struct LocalProxyNode {
     pub domains: Vec<String>,
 }
 
+/// Client-side 2FA credentials used by local-proxy mode.
+#[derive(Debug, Deserialize, Clone)]
+pub struct LocalProxyTwoFactorConfig {
+    pub enabled: Option<bool>,
+    pub client_id: String,
+    pub secret: String,
+    pub algorithm: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct LocalProxyConfig {
     pub enabled: bool,
@@ -69,6 +79,14 @@ pub struct LocalProxyConfig {
     /// Preferred for long-term configurations
     /// Deprecated: use `nodes` for multi-endpoint support
     pub server_node_id: Option<String>,
+    /// 2FA credentials used to authenticate with the server.
+    /// Example:
+    ///   [local_proxy.two_factor]
+    ///   enabled = true
+    ///   client_id = "client-001"
+    ///   secret = "JBSWY3DPEHPK3PXP"
+    ///   algorithm = "sha1"
+    pub two_factor: Option<LocalProxyTwoFactorConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -109,5 +127,89 @@ pub fn get_strategy(strategy: &Option<String>) -> crate::lb::LoadBalancingStrate
         Some("random") | Some("Random") => crate::lb::LoadBalancingStrategy::Random,
         Some("round_robin") | Some("RoundRobin") | Some("roundrobin") => crate::lb::LoadBalancingStrategy::RoundRobin,
         None | Some(_) => crate::lb::LoadBalancingStrategy::RoundRobin,
+    }
+}
+
+// ===== 2FA 认证配置 =====
+
+/// TOML 格式的认证配置
+#[derive(Debug, Deserialize, Clone)]
+pub struct AuthTomlConfig {
+    pub enabled: Option<bool>,
+    pub algorithm: Option<String>,
+    pub time_step: Option<u32>,
+    pub digits: Option<u32>,
+    pub window: Option<u32>,
+    pub max_attempts: Option<u32>,
+    pub lockout_duration: Option<u64>,
+    pub clients: Option<HashMap<String, ClientAuthToml>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ClientAuthToml {
+    pub secret: String,
+    pub created_at: Option<String>,
+}
+
+impl ProxyConfig {
+    /// Load config and extract auth settings from TOML
+    pub fn load_with_auth(path: &str) -> anyhow::Result<(Self, Option<crate::auth::AuthConfig>)> {
+        let content = std::fs::read_to_string(path)?;
+        
+        // Parse the base config
+        let base: Self = toml::from_str(&content)?;
+        
+        // Try to parse auth section separately
+        let auth_config = match content.parse::<toml::Value>() {
+            Ok(toml_value) => {
+                if let Some(auth_section) = toml_value.get("auth") {
+                    let auth_toml: AuthTomlConfig = auth_section.clone().try_into()
+                        .map_err(|e| anyhow::anyhow!("Failed to parse auth config: {}", e))?;
+                    
+                    let mut clients = HashMap::new();
+                    if let Some(clients_toml) = auth_toml.clients {
+                        for (id, client_toml) in clients_toml {
+                            clients.insert(
+                                id,
+                                crate::auth::ClientAuth {
+                                    secret: client_toml.secret,
+                                    created_at: client_toml.created_at.unwrap_or_else(|| {
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_secs().to_string())
+                                            .unwrap_or_else(|_| "0".to_string())
+                                    }),
+                                    last_used: None,
+                                    failed_attempts: 0,
+                                    locked_until: None,
+                                },
+                            );
+                        }
+                    }
+                    
+                    let algorithm = match auth_toml.algorithm.as_deref() {
+                        Some("sha256") | Some("SHA256") => crate::auth::TotpAlgorithm::SHA256,
+                        Some("sha512") | Some("SHA512") => crate::auth::TotpAlgorithm::SHA512,
+                        _ => crate::auth::TotpAlgorithm::SHA1,
+                    };
+                    
+                    Some(crate::auth::AuthConfig {
+                        enabled: auth_toml.enabled.unwrap_or(false),
+                        algorithm,
+                        time_step: auth_toml.time_step.unwrap_or(30),
+                        digits: auth_toml.digits.unwrap_or(6),
+                        window: auth_toml.window.unwrap_or(1),
+                        clients,
+                        max_attempts: auth_toml.max_attempts.unwrap_or(5),
+                        lockout_duration: auth_toml.lockout_duration.unwrap_or(300),
+                    })
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        };
+        
+        Ok((base, auth_config))
     }
 }

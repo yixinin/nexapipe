@@ -8,14 +8,13 @@
 //!                      TcpListener    UdpSocket
 //!                      (TCP 连接)      (DNS 查询)
 //!                           │              │
-//!                ┌──────────┤              ├──────────────┐
-//!                ↓          ↓              ↓              ↓
-//!           10.0.1.3:80,443  10.0.1.4:80   解析域名       非代理域名
-//!           (代理流量)       (captive portal)  │              │
-//!                │          │              ↓              ↓
-//!       handle_local_     返回 204       代理→10.0.1.3   转发真实 DNS
-//!       connection        (硬编码响应)    portal→10.0.1.4  (tokio UdpSocket)
-//!       (→iroh→后端)
+//!                           ↓              ↓
+//!                    10.0.1.3:80,443    解析域名
+//!                    (代理流量)           │
+//!                           │            ↓
+//!               handle_local_     代理→10.0.1.3
+//!               connection       其他→转发真实 DNS
+//!               (→iroh→后端)      (tokio UdpSocket)
 //!                           │
 //!                Stack(Stream: IP 包出) → AsyncFd → 写回 TUN fd
 //! ```
@@ -34,26 +33,23 @@ macro_rules! jni_log {
 
 use futures_util::{SinkExt, StreamExt};
 use netstack_smoltcp::{StackBuilder, TcpListener as SmolTcpListener};
-use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{FromRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncWriteExt, unix::AsyncFd};
+use tokio::io::unix::AsyncFd;
 use tokio::task::JoinHandle;
 
 // 虚拟 IP 常量 — 必须与 Kotlin 侧 NexaVpnService 的 TUN 配置一致。
 // 10.0.1.2 = DNS 服务器（smoltcp UdpSocket 接收 DNS 查询）
 // 10.0.1.3 = 代理 IP（TCP 连接走 handle_local_connection → iroh）
-// 10.0.1.4 = captive portal IP（TCP 连接返回硬编码 204 响应）
 /// DNS 服务器虚拟 IP — 仅用于文档化，与 Kotlin 侧 NexaVpnService.virtualDNSIP 一致。
 /// DNS 查询的 dst_addr 即为此 IP，响应时原样用作 src_addr。
 #[allow(dead_code)]
 const VIRTUAL_DNS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 2);
 const VIRTUAL_PROXY_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 3);
-const VIRTUAL_CAPTIVE_PORTAL_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 4);
 
 const TUN_MTU: usize = 1500;
 const DNS_FORWARD_TIMEOUT: Duration = Duration::from_secs(3);
@@ -75,7 +71,6 @@ impl TunProxy {
     ///   本函数会 `dup` 两份（读/写），并关闭原始 fd。
     /// - `endpoint_group`: 从 `ProxyState` 克隆的 `Arc<EndpointGroup>`，用于 iroh 连接。
     /// - `proxy_domains`: 需要代理的域名列表（逗号分隔已解析）。
-    /// - `captive_portal_domains`: captive portal 校验域名列表。
     /// - `custom_dns_servers`: 系统 DNS 服务器列表（从 `CUSTOM_DNS_SERVERS` 读取）。
     ///
     /// 内部用 `runtime.spawn()` 启动所有任务，**不 block_on**。
@@ -83,7 +78,6 @@ impl TunProxy {
         tun_fd: RawFd,
         endpoint_group: Arc<EndpointGroup>,
         proxy_domains: Vec<String>,
-        captive_portal_domains: Vec<String>,
         custom_dns_servers: Vec<SocketAddr>,
     ) -> Result<Self, ClientError> {
         // 1. dup fd 两份（读/写），关闭原始 fd
@@ -257,14 +251,14 @@ impl TunProxy {
                         break;
                     }
                     match listener.next().await {
-                        Some((stream, _client_addr, server_addr)) => {
+                        Some((stream, client_addr, server_addr)) => {
                             let dest_ip = server_addr.ip();
                             let dest_port = server_addr.port();
                             jni_log!(
                                 "[tun-proxy] TCP accept: dest={}:{}, client={}",
                                 dest_ip,
                                 dest_port,
-                                _client_addr
+                                client_addr
                             );
                             if dest_ip == IpAddr::V4(VIRTUAL_PROXY_IP) {
                                 // 代理流量 → handle_local_connection → iroh
@@ -277,27 +271,6 @@ impl TunProxy {
                                             e
                                         );
                                     }
-                                });
-                            } else if dest_ip == IpAddr::V4(VIRTUAL_CAPTIVE_PORTAL_IP) {
-                                // captive portal 校验：
-                                // - port 80 (HTTP): 返回 204 No Content，让系统判定网络已验证
-                                // - port 443 (HTTPS): 直接关闭连接。不能发 plain HTTP 204——
-                                //   客户端期望 TLS 握手，收到明文 HTTP 会导致 TLS 协议错误，
-                                //   Android 可能把 HTTPS 失败解读为 captive portal 拦截 → 感叹号。
-                                //   关闭连接让系统回退到 HTTP 校验（port 80 已返回 204）。
-                                tokio::spawn(async move {
-                                    let mut s = stream;
-                                    if dest_port == 80 {
-                                        let _ = s
-                                            .write_all(
-                                                b"HTTP/1.1 204 No Content\r\n\
-                                                 Content-Length: 0\r\n\
-                                                 Connection: close\r\n\
-                                                 \r\n",
-                                            )
-                                            .await;
-                                    }
-                                    // port 443 or other: 直接 drop，stream 关闭时发 FIN
                                 });
                             } else {
                                 jni_log!(
@@ -316,19 +289,13 @@ impl TunProxy {
             }));
         }
 
-        // 8. DNS handler（UDP 53）— 处理 DNS 查询，劫持代理/portal 域名到虚拟 IP
+        // 8. DNS handler（UDP 53）— 处理 DNS 查询，劫持代理域名到虚拟 IP
         //
         // 并发处理：每个 DNS 查询 spawn 一个独立 task，避免串行阻塞。
         // 原串行实现在 DNS 转发超时（~1.6s）时会阻塞所有后续查询，导致 APP DNS 超时。
         if let Some(udp_socket) = udp_socket {
             let (udp_rx, udp_tx) = udp_socket.split();
             let proxy_vec = Arc::new(proxy_domains.clone());
-            let portal_set: Arc<HashSet<String>> = Arc::new(
-                captive_portal_domains
-                    .into_iter()
-                    .map(|d| d.to_lowercase())
-                    .collect(),
-            );
             let dns_servers = Arc::new(custom_dns_servers);
             let stopped_clone = stopped.clone();
             // udp_tx 需要 Arc<Mutex> 共享给并发 task
@@ -344,12 +311,10 @@ impl TunProxy {
                             // 并发处理每个 DNS 查询，不阻塞后续查询
                             let tx = tx.clone();
                             let proxy_vec = proxy_vec.clone();
-                            let portal_set = portal_set.clone();
                             let dns_servers = dns_servers.clone();
                             tokio::spawn(async move {
                                 let response =
-                                    handle_dns_query(&data, &proxy_vec, &portal_set, &dns_servers)
-                                        .await;
+                                    handle_dns_query(&data, &proxy_vec, &dns_servers).await;
                                 if let Some(resp) = response {
                                     // 回送：src=10.0.1.2:53(查询的 dst), dst=客户端(查询的 src)
                                     let mut tx = tx.lock().await;
@@ -429,13 +394,16 @@ fn set_nonblocking(fd: RawFd) -> Result<(), ClientError> {
 /// 处理 DNS 查询，返回 DNS 响应 payload。
 ///
 /// - 代理域名 → 返回 10.0.1.3（A 记录）
-/// - captive portal 域名 → 返回 10.0.1.4（A 记录）
 /// - iroh 基础设施域名 → 转发到真实 DNS（不在 TUN 内代理）
 /// - 其他域名 → 转发到真实 DNS，原样返回响应
+///
+/// 注意：不要劫持系统 captive portal 校验域名（connectivitycheck.gstatic.com 等）到
+/// 私有虚拟 IP。Android 的 NetworkMonitor 会把"校验域名解析到私有 IP"直接判定为
+/// "无互联网"（DNS returned private IP = no internet），导致状态栏 WiFi 感叹号。
+/// 让它们走真实 DNS、连物理网络即可，与不开启 VPN 时的行为一致。
 async fn handle_dns_query(
     query: &[u8],
     proxy_domains: &Arc<Vec<String>>,
-    portal_domains: &Arc<HashSet<String>>,
     dns_servers: &Arc<Vec<SocketAddr>>,
 ) -> Option<Vec<u8>> {
     let (domain, qtype) = match parse_dns_query(query) {
@@ -451,17 +419,9 @@ async fn handle_dns_query(
     // iroh 基础设施域名不通过 TUN 代理 — iroh 自身的流量走 addDisallowedApplication
     let is_iroh = domain_lower.ends_with(".iroh.link") || domain_lower.ends_with(".n0.iroh.link");
 
-    let is_portal = portal_domains.contains(&domain_lower);
-    let is_proxy = !is_portal && !is_iroh && should_proxy_domain(&domain, proxy_domains);
+    let is_proxy = !is_iroh && should_proxy_domain(&domain, proxy_domains);
 
-    if is_portal {
-        jni_log!(
-            "[tun-proxy] DNS: '{}' -> captive portal IP {}",
-            domain,
-            VIRTUAL_CAPTIVE_PORTAL_IP
-        );
-        Some(build_dns_response(query, VIRTUAL_CAPTIVE_PORTAL_IP, qtype))
-    } else if is_proxy {
+    if is_proxy {
         jni_log!(
             "[tun-proxy] DNS: '{}' -> proxy IP {}",
             domain,

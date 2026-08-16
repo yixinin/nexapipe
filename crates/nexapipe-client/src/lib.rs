@@ -31,3 +31,4 @@ pub use local_proxy::LocalProxy;
 
 #[cfg(feature = "uniffi")]
 uniffi::include_scaffolding!("nexapipe_client");
+pub mod auth;

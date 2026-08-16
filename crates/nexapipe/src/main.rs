@@ -1,4 +1,4 @@
-use clap::Parser;
+﻿use clap::Parser;
 use iroh::SecretKey;
 use nexapipe::acme::{AcmeConfig, AcmeManager};
 use nexapipe::config::{self, IrohConfig, LocalProxyConfig, ProxyConfig, ServerConfig};
@@ -22,6 +22,9 @@ struct Cli {
 
     #[arg(long, help = "Generate a new secret key for stable endpoint identity")]
     generate_secret: bool,
+
+    #[arg(long, help = "Generate a new 2FA secret for a client")]
+    generate_2fa: Option<String>,
 }
 
 #[tokio::main]
@@ -43,6 +46,18 @@ async fn main() {
         println!();
         println!("Add this to your config.toml under [iroh] section:");
         println!("secret_key = \"{}\"", secret_key_hex);
+        return;
+    }
+
+    // Handle --generate-2fa flag
+    if let Some(client_id) = &cli.generate_2fa {
+        let secret = nexapipe::auth::TotpValidator::generate_secret();
+        println!("Generated 2FA secret for client '{}':", client_id);
+        println!("Secret: {}", secret);
+        println!();
+        println!("Add to your config.toml:");
+        println!("[auth.clients.\"{}\"]", client_id);
+        println!("secret = \"{}\"", secret);
         return;
     }
 
@@ -229,12 +244,27 @@ async fn run_server_mode(
     tracing::info!("Starting proxy with domain-based and path-based routing");
     tracing::info!("Default backend: {}", proxy_config.default_backend);
 
+
+    // Load 2FA auth config
+    let auth_config = match ProxyConfig::load_with_auth(config_path) {
+        Ok((_, auth_cfg)) => {
+            if let Some(ref cfg) = auth_cfg {
+                tracing::info!("2FA authentication enabled with {} clients", cfg.clients.len());
+            }
+            auth_cfg
+        }
+        Err(e) => {
+            tracing::warn!("Failed to load auth config: {}", e);
+            None
+        }
+    };
     if let Err(e) = run_proxy(
         routes,
         proxy_config.default_backend.clone(),
         server_config,
         iroh_config,
         shutdown_signal.clone(),
+        auth_config,
     )
     .await
     {

@@ -1,4 +1,5 @@
 use crate::connection_pool::{IrohConnectionPool, PRECONNECT_TIMEOUT};
+use crate::auth::TwoFactorAuth;
 use crate::lb::{LoadBalancingStrategy, RoundRobinBalancer, RandomBalancer, LoadBalancer};
 use crate::ClientError;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
@@ -217,6 +218,21 @@ impl EndpointGroup {
         Self {
             domains: HashMap::new(),
             default_pools,
+        }
+    }
+
+    /// Configure client 2FA credentials on every pool in this group.
+    /// Safe to call any time before connections are established.
+    pub async fn set_two_factor(&self, auth: Option<TwoFactorAuth>) {
+        for pools in self.domains.values() {
+            for pool in &pools.pools {
+                pool.set_two_factor(auth.clone()).await;
+            }
+        }
+        if let Some(default) = &self.default_pools {
+            for pool in &default.pools {
+                pool.set_two_factor(auth.clone()).await;
+            }
         }
     }
 

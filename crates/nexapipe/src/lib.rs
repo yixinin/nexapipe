@@ -9,3 +9,4 @@ pub mod log;
 pub mod proxy;
 pub mod routes;
 pub mod shutdown;
+pub mod auth;
