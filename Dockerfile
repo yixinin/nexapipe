@@ -9,7 +9,7 @@ COPY src ./src
 
 RUN cargo build --release
 
-FROM registry.it.iakl.top/alpine:3.22
+FROM alpine:3.22
 
 RUN apk add --no-cache ca-certificates tzdata
 
