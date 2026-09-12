@@ -45,10 +45,23 @@ backends = ["http://host.docker.internal:15666"]
 cert_path = ""
 key_path = ""
 
+[[routes]]
+host_pattern = "comfyui.iroh.iakl.top"
+path_pattern = "/"
+path_is_prefix = true
+strategy = "round_robin"
+backends = ["http://10.0.0.222:8188"]
+cert_path = ""
+key_path = ""
+
 [local_proxy]
 enabled = true
 listen_addr = "127.0.0.1:8081"
-proxy_domains = ["fn.iroh.iakl.top"]
+proxy_domains = [
+    "fn.iroh.iakl.top",
+    "comfyui.iroh.iakl.top",
+    "mt.iroh.iakl.top",
+]
 # 全局负载均衡策略（可选），默认 round_robin
 strategy = "round_robin"
 # strategy = "random"

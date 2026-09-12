@@ -1,5 +1,5 @@
 sandbox_mode = "workspace-write"
 
-web_search = "live"
+web_search = "disabled"
 [sandbox_workspace_write]
 network_access = true
