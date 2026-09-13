@@ -1,0 +1,60 @@
+# Nexapipe 2FA Configuration Example
+#
+# This file shows how to enable 2FA authentication for Nexapipe.
+# Copy the relevant sections into your config.toml.
+
+# ===== Server Configuration =====
+default_backend = "http://localhost:3000"
+debug = true
+
+[server]
+listen_addr = "0.0.0.0:8080"
+tls_enabled = false
+
+[iroh]
+# secret_key = "your-hex-encoded-secret-key"
+bind_port = 0
+
+# ===== 2FA Authentication Configuration (server side) =====
+# When enabled, every client connection must complete a TOTP handshake
+# before proxying is allowed.
+[auth]
+enabled = true
+algorithm = "sha1"      # sha1, sha256, sha512
+time_step = 30          # TOTP time step in seconds
+digits = 6              # Number of digits in TOTP code
+window = 1              # Time window tolerance (accept +/- N steps)
+max_attempts = 5        # Max failed attempts before lockout
+lockout_duration = 300  # Lockout duration in seconds (5 minutes)
+
+# Client configurations.
+# Generate secrets using: nexapipe --generate-2fa <client-id>
+[auth.clients.client-001]
+secret = "JBSWY3DPEHPK3PXP" # Base32-encoded secret
+created_at = "1723756800"
+
+[auth.clients.client-002]
+secret = "KBSWY3DPEHPK3PXQ"
+created_at = "1723756800"
+
+# ===== Routes =====
+[[routes]]
+host_pattern = "*"
+path_pattern = "/"
+backends = ["http://localhost:3000"]
+strategy = "round_robin"
+
+# ===== Client Local Proxy Configuration (client side) =====
+[local_proxy]
+enabled = true
+listen_addr = "127.0.0.1:8080"
+server_node_id = "your-server-node-id"
+proxy_domains = ["example.com", "api.example.com"]
+
+# Client 2FA credentials: must match a client configured in [auth.clients]
+# on the server, otherwise every connection will be rejected.
+[local_proxy.two_factor]
+enabled = true
+client_id = "client-001"
+secret = "JBSWY3DPEHPK3PXP"
+algorithm = "sha1"

@@ -1,0 +1,62 @@
+name: CI
+
+# 日常提交/PR 的快速校验（仅 Linux）：格式、lint、测试。
+# 多平台编译由 release.yml 在打 tag 时验证。
+# 注意：dev-dependencies 里的 nix/duct 仅支持 unix，因此不要在 Windows 上跑 cargo test。
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  fmt:
+    name: rustfmt (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure rustfmt
+        run: rustup component add rustfmt
+      # 当前仓库尚未完全按 rustfmt 格式化，这里只提示不阻塞。
+      # 全量格式化后（cargo fmt --all）可删除 continue-on-error。
+      - name: cargo fmt --check
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure clippy
+        run: rustup component add clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+      - name: cargo test
+        run: cargo test --workspace --locked

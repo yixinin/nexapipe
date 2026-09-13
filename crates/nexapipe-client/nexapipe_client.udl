@@ -1,0 +1,39 @@
+namespace nexapipe_client;
+
+enum ClientError {
+    ConnectionError(string msg),
+    ParseError(string msg),
+    SendError(string msg),
+    ReceiveError(string msg),
+    TimeoutError,
+    InvalidConfig(string msg),
+    IoError(string msg),
+    IrohError(string msg),
+}
+
+struct HttpRequest {
+    string method;
+    string path;
+    string host;
+    dict<string, string> headers;
+    bytes body;
+}
+
+struct HttpResponse {
+    u16 status_code;
+    string status_text;
+    dict<string, string> headers;
+    bytes body;
+}
+
+interface IrohProxyClient {
+    constructor(string? server_node_id, string? server_ticket) throws ClientError;
+    
+    string node_id();
+    
+    HttpResponse send_request(HttpRequest request) throws ClientError;
+    
+    bytes send_raw(bytes data) throws ClientError;
+    
+    void close();
+}
