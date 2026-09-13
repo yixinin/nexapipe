@@ -1,0 +1,55 @@
+[workspace]
+members = ["crates/nexapipe", "crates/nexapipe-client"]
+exclude = ["ui-desktop/src-tauri"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+# Vendor smoltcp 0.12.0 with a minimal patch guarding the unguarded
+# `remote_last_seq - local_seq_no` subtraction in the TCP transmit path.
+# Without it, real-world traffic (e.g. retransmissions) can trigger
+# `panic: attempt to subtract sequence numbers with underflow` in
+# smoltcp-0.12.0/src/wire/tcp.rs, which kills the TUN proxy stack and
+# disconnects the tunnel a few seconds after connecting.
+[patch.crates-io]
+smoltcp = { path = "third_party/smoltcp" }
+
+[profile.release]
+panic = "unwind"
+opt-level = "s"
+codegen-units = 1
+lto = true
+debug = "none"
+strip = true
+
+[workspace.dependencies]
+iroh = { version = "1.0.1", default-features = false, features = ["tls-ring"] }
+iroh-tickets = { version = "1.0.0" }
+quinn = { version = "0.16", package = "iroh-quinn" }
+tokio = { version = "1.52.3", features = ["full"] }
+anyhow = "1.0.103"
+http = "1.4.2"
+url = "2.5.8"
+rustls = { version = "0.23.40", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = [
+    "ring",
+] }
+rustls-native-certs = "0.8.4"
+webpki-roots = "1.0.8"
+hyper = { version = "1.10.1", features = ["full", "http2"] }
+hyper-util = { version = "0.1", features = ["full"] }
+hyper-rustls = { version = "0.27.9", default-features = false, features = [
+    "ring",
+    "http1",
+    "http2",
+] }
+http-body-util = "0.1"
+tokio-stream = "0.1"
+bytes = "1.12.0"
+futures-util = "0.3.32"

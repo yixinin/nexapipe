@@ -1,0 +1,97 @@
+default_backend = "http://10.0.0.72:15666"
+debug = true
+
+[iroh]
+# Relay server URL (optional)
+# 使用自定义的 relay 服务器进行连接和打洞
+# relay_url = "https://relay.iroh.network"
+
+# Relay mode: "disabled", "default", "custom"
+# disabled: 不使用 relay（纯点对点连接）
+# default: 使用默认的 iroh relay
+# custom: 使用自定义 relay（需要设置 relay_url）
+# relay_mode = "custom"
+
+# Bind port for iroh endpoint (optional)
+# bind_port = 4433
+
+# Secret key for stable endpoint identity (optional)
+# 如果设置了此选项，服务端每次启动时将使用相同的 Node ID
+# 从而生成固定的连接 Ticket，客户端不需要每次更新 Ticket
+# 使用 `nexapipe --generate-secret` 命令生成一个新的 secret key
+# secret_key = "your-generated-secret-key-here"
+
+[server]
+listen_addr = "0.0.0.0:8080"
+tls_enabled = false
+cert_path = ""
+key_path = ""
+
+[[routes]]
+host_pattern = "mt.iroh.iakl.top"
+path_pattern = "/"
+path_is_prefix = true
+strategy = "round_robin"
+backends = ["http://host.docker.internal:8063"]
+cert_path = ""
+key_path = ""
+
+[[routes]]
+host_pattern = "fn.iroh.iakl.top"
+path_pattern = "/"
+path_is_prefix = true
+strategy = "round_robin"
+backends = ["http://host.docker.internal:15666"]
+cert_path = ""
+key_path = ""
+
+[[routes]]
+host_pattern = "comfyui.iroh.iakl.top"
+path_pattern = "/"
+path_is_prefix = true
+strategy = "round_robin"
+backends = ["http://10.0.0.222:8188"]
+cert_path = ""
+key_path = ""
+
+[local_proxy]
+enabled = true
+listen_addr = "127.0.0.1:8081"
+proxy_domains = [
+    "fn.iroh.iakl.top",
+    "comfyui.iroh.iakl.top",
+    "mt.iroh.iakl.top",
+]
+# 全局负载均衡策略（可选），默认 round_robin
+strategy = "round_robin"
+# strategy = "random"
+
+# 多节点配置（推荐）
+# 每个节点配置自己的 server_node_id/server_ticket 和服务的域名
+# 同一个域名可以配置在多个节点上，实现负载均衡
+[[local_proxy.nodes]]
+server_node_id = ""
+domains = ["fn.iroh.iakl.top", "mt.iroh.iakl.top"]
+
+[acme]
+# Enable automatic certificate management
+enabled = false
+
+# Email address for Let's Encrypt account
+email = "your-email@example.com"
+
+# ACME directory URL (Let's Encrypt production)
+directory_url = "https://acme-v02.api.letsencrypt.org/directory"
+
+# Cloudflare API token (required for DNS challenge)
+# Create token with Zone.DNS:Edit permissions at https://dash.cloudflare.com/profile/api-tokens
+cloudflare_api_token = "your-cloudflare-api-token"
+
+# Directory to store certificates
+certs_dir = "./certs"
+
+# Renew certificate before expiry (days)
+renew_before_days = 30
+
+# Domains to obtain certificates for
+domains = ["fn.iroh.iakl.top"]

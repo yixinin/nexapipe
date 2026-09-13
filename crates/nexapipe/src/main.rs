@@ -1,0 +1,298 @@
+﻿use clap::Parser;
+use iroh::SecretKey;
+use nexapipe::acme::{AcmeConfig, AcmeManager};
+use nexapipe::config::{self, IrohConfig, LocalProxyConfig, ProxyConfig, ServerConfig};
+use nexapipe::config_watcher::ConfigWatcher;
+use nexapipe::proxy::{run_local_proxy, run_proxy};
+use nexapipe::routes::Route;
+use nexapipe::shutdown::{ShutdownSignal, wait_for_shutdown_signal};
+use std::sync::Arc;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    #[arg(short, long, default_value = "config.toml")]
+    config: String,
+
+    #[arg(long, help = "Run in client local proxy mode")]
+    local_proxy: bool,
+
+    #[arg(long, help = "Obtain certificates without starting proxy")]
+    obtain_certs: bool,
+
+    #[arg(long, help = "Generate a new secret key for stable endpoint identity")]
+    generate_secret: bool,
+
+    #[arg(long, help = "Generate a new 2FA secret for a client")]
+    generate_2fa: Option<String>,
+}
+
+#[tokio::main]
+async fn main() {
+    // Install ring as the default CryptoProvider for rustls
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install ring as default CryptoProvider");
+
+    let cli = Cli::parse();
+
+    // Handle --generate-secret flag
+    if cli.generate_secret {
+        let secret_key = SecretKey::generate();
+        // Convert to hex string for storage
+        let secret_key_hex = hex::encode(secret_key.to_bytes());
+        println!("Generated secret key for stable endpoint identity:");
+        println!("{}", secret_key_hex);
+        println!();
+        println!("Add this to your config.toml under [iroh] section:");
+        println!("secret_key = \"{}\"", secret_key_hex);
+        return;
+    }
+
+    // Handle --generate-2fa flag
+    if let Some(client_id) = &cli.generate_2fa {
+        let secret = nexapipe::auth::TotpValidator::generate_secret();
+        println!("Generated 2FA secret for client '{}':", client_id);
+        println!("Secret: {}", secret);
+        println!();
+        println!("Add to your config.toml:");
+        println!("[auth.clients.\"{}\"]", client_id);
+        println!("secret = \"{}\"", secret);
+        return;
+    }
+
+    let proxy_config = match ProxyConfig::from_file(&cli.config) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("Failed to load config: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let debug_enabled = proxy_config.debug.unwrap_or(false);
+    let log_filter = if debug_enabled {
+        "nexapipe=debug"
+    } else {
+        "nexapipe=info"
+    };
+
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_filter))
+        .with_target(false)
+        .with_level(true)
+        .init();
+
+    if debug_enabled {
+        tracing::info!("Debug mode enabled");
+    }
+
+    let shutdown_signal = Arc::new(ShutdownSignal::new());
+    let shutdown_signal_clone = shutdown_signal.clone();
+
+    tokio::spawn(async move {
+        wait_for_shutdown_signal(shutdown_signal_clone).await;
+    });
+    tracing::info!("Shutdown signal handler registered");
+
+    if let Some(acme_config) = &proxy_config.acme {
+        if let Ok(acme_manager) = setup_acme(acme_config).await {
+            if cli.obtain_certs {
+                obtain_certs_once(&acme_manager, acme_config).await;
+                return;
+            }
+
+            tokio::spawn(async move {
+                if let Err(e) = acme_manager.start_renewal_loop().await {
+                    tracing::error!("ACME renewal loop failed: {}", e);
+                }
+            });
+        }
+    }
+
+    if cli.local_proxy {
+        run_local_proxy_mode(&proxy_config, &shutdown_signal).await;
+    } else {
+        run_server_mode(&proxy_config, &cli.config, &shutdown_signal).await;
+    }
+
+    tracing::info!("Waiting for graceful shutdown...");
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    tracing::info!("Proxy shutdown complete");
+}
+
+async fn setup_acme(config: &config::AcmeConfig) -> Result<AcmeManager, anyhow::Error> {
+    if !config.enabled.unwrap_or(false) {
+        return Err(anyhow::anyhow!("ACME is not enabled"));
+    }
+
+    let email = config
+        .email
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("ACME email is required"))?;
+    let directory_url = config
+        .directory_url
+        .clone()
+        .unwrap_or_else(|| "https://acme-v02.api.letsencrypt.org/directory".to_string());
+    let cloudflare_api_token = config
+        .cloudflare_api_token
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Cloudflare API token is required"))?;
+    let certs_dir = config
+        .certs_dir
+        .clone()
+        .unwrap_or_else(|| "./certs".to_string());
+    let renew_before_days = config.renew_before_days.unwrap_or(30);
+    let domains = config.domains.clone().unwrap_or_default();
+
+    if domains.is_empty() {
+        return Err(anyhow::anyhow!("ACME domains list is empty"));
+    }
+
+    std::fs::create_dir_all(&certs_dir)?;
+
+    let acme_config = AcmeConfig {
+        enabled: true,
+        email,
+        directory_url,
+        cloudflare_api_token,
+        certs_dir,
+        renew_before_days,
+        domains,
+    };
+
+    let manager = AcmeManager::new(acme_config).await?;
+    tracing::info!("ACME manager initialized");
+
+    Ok(manager)
+}
+
+async fn obtain_certs_once(manager: &AcmeManager, config: &config::AcmeConfig) {
+    let domains = config.domains.clone().unwrap_or_default();
+
+    for domain in domains {
+        match manager.obtain_or_renew_certificate(&domain).await {
+            Ok(info) => {
+                tracing::info!(
+                    "Successfully obtained certificate for {} (expires in {} days)",
+                    domain,
+                    info.days_remaining
+                );
+            }
+            Err(e) => {
+                tracing::error!("Failed to obtain certificate for {}: {}", domain, e);
+            }
+        }
+    }
+}
+
+async fn run_server_mode(
+    proxy_config: &ProxyConfig,
+    config_path: &str,
+    shutdown_signal: &Arc<ShutdownSignal>,
+) {
+    let config_watcher = Arc::new(ConfigWatcher::new(
+        config_path.to_string(),
+        proxy_config.clone(),
+    ));
+
+    tokio::spawn({
+        let config_watcher_clone = config_watcher.clone();
+        async move {
+            if let Err(e) = config_watcher_clone.start_watch().await {
+                tracing::error!("Config watcher failed: {}", e);
+            }
+        }
+    });
+    tracing::info!("Config watcher started, monitoring: {}", config_path);
+
+    let server_config: Option<ServerConfig> = proxy_config.server.clone();
+    let iroh_config: Option<IrohConfig> = proxy_config.iroh.clone();
+
+    let mut routes = Vec::new();
+
+    if let Some(route_configs) = proxy_config.routes.clone() {
+        for route_config in route_configs {
+            let strategy = config::get_strategy(&route_config.strategy);
+            let path_is_prefix = route_config.path_is_prefix.unwrap_or(true);
+            let backends_count = route_config.backends.len();
+            let host_pattern = route_config.host_pattern.clone();
+            let path_pattern = route_config.path_pattern.clone();
+
+            routes.push(Route::new(
+                &host_pattern,
+                &path_pattern,
+                path_is_prefix,
+                route_config.backends,
+                strategy,
+                route_config.cert_path,
+                route_config.key_path,
+                route_config.path_rewrite,
+                route_config.redirect_to_https.unwrap_or(false),
+            ));
+
+            tracing::info!(
+                "Loaded route: host={}, path={} (prefix={}), backends={}, strategy={:?}",
+                host_pattern,
+                path_pattern,
+                path_is_prefix,
+                backends_count,
+                strategy
+            );
+        }
+    }
+
+    tracing::info!("Starting proxy with domain-based and path-based routing");
+    tracing::info!("Default backend: {}", proxy_config.default_backend);
+
+
+    // Load 2FA auth config
+    let auth_config = match ProxyConfig::load_with_auth(config_path) {
+        Ok((_, auth_cfg)) => {
+            if let Some(ref cfg) = auth_cfg {
+                tracing::info!("2FA authentication enabled with {} clients", cfg.clients.len());
+            }
+            auth_cfg
+        }
+        Err(e) => {
+            tracing::warn!("Failed to load auth config: {}", e);
+            None
+        }
+    };
+    if let Err(e) = run_proxy(
+        routes,
+        proxy_config.default_backend.clone(),
+        server_config,
+        iroh_config,
+        shutdown_signal.clone(),
+        auth_config,
+    )
+    .await
+    {
+        tracing::error!("Proxy failed: {}", e);
+        std::process::exit(1);
+    }
+}
+
+async fn run_local_proxy_mode(proxy_config: &ProxyConfig, shutdown_signal: &Arc<ShutdownSignal>) {
+    let local_proxy_config: Option<LocalProxyConfig> = proxy_config.local_proxy.clone();
+
+    let config = match local_proxy_config {
+        Some(cfg) => cfg,
+        None => {
+            tracing::error!("Local proxy config not found");
+            std::process::exit(1);
+        }
+    };
+
+    if !config.enabled {
+        tracing::error!("Local proxy is not enabled in config");
+        std::process::exit(1);
+    }
+
+    tracing::info!("Starting local proxy mode");
+
+    if let Err(e) = run_local_proxy(config, shutdown_signal.clone()).await {
+        tracing::error!("Local proxy failed: {}", e);
+        std::process::exit(1);
+    }
+}
