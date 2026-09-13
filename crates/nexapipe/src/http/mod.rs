@@ -111,7 +111,7 @@ pub async fn proxy_request(
     let mut builder = Request::builder().method(method).uri(new_uri);
 
     for (name, value) in headers_clone.iter() {
-        // 保留客户端原始 Host 头，确保后端虚拟主机路由正确
+        // Preserve the client's original Host header so backend virtual-host routing works
         builder = builder.header(name, value);
     }
 
@@ -371,7 +371,7 @@ pub async fn proxy_to_backend_streaming(
     let mut builder = Request::builder().method(req.method()).uri(new_uri);
 
     for (name, value) in req.headers() {
-        // 保留客户端原始 Host 头，确保后端虚拟主机路由正确
+        // Preserve the client's original Host header so backend virtual-host routing works
         builder = builder.header(name, value);
     }
 
@@ -512,7 +512,7 @@ async fn proxy_websocket_direct_http(
 
     let request_line = format!("{} {} HTTP/1.1\r\n", req.method(), path);
 
-    // 保留客户端原始 Host 头，确保后端虚拟主机路由正确
+    // Preserve the client's original Host header so backend virtual-host routing works
     let original_host = req
         .headers()
         .get("host")
@@ -650,7 +650,7 @@ async fn proxy_websocket_direct_https(
 
     let request_line = format!("{} {} HTTP/1.1\r\n", req.method(), path);
 
-    // 保留客户端原始 Host 头，确保后端虚拟主机路由正确
+    // Preserve the client's original Host header so backend virtual-host routing works
     let original_host = req
         .headers()
         .get("host")

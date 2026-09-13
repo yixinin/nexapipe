@@ -83,7 +83,8 @@ pub async fn run_local_proxy(
         EndpointGroup::new_with_single_pool(conn_pool).await
     };
 
-    // 2FA：若配置了 [local_proxy.two_factor] 且启用，则每个新建连接都会先执行认证握手。
+    // 2FA: if `[local_proxy.two_factor]` is configured and enabled, every new connection
+    // performs an authentication handshake first.
     if let Some(tf) = two_factor_config {
         if tf.enabled.unwrap_or(false) {
             let auth = TwoFactorAuth::new(

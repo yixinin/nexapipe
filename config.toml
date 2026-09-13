@@ -3,22 +3,22 @@ debug = true
 
 [iroh]
 # Relay server URL (optional)
-# 使用自定义的 relay 服务器进行连接和打洞
+# Use a custom relay server for connection establishment and hole punching
 # relay_url = "https://relay.iroh.network"
 
 # Relay mode: "disabled", "default", "custom"
-# disabled: 不使用 relay（纯点对点连接）
-# default: 使用默认的 iroh relay
-# custom: 使用自定义 relay（需要设置 relay_url）
+# disabled: do not use a relay (pure peer-to-peer connections)
+# default: use the default iroh relay
+# custom: use a custom relay (requires relay_url to be set)
 # relay_mode = "custom"
 
 # Bind port for iroh endpoint (optional)
 # bind_port = 4433
 
 # Secret key for stable endpoint identity (optional)
-# 如果设置了此选项，服务端每次启动时将使用相同的 Node ID
-# 从而生成固定的连接 Ticket，客户端不需要每次更新 Ticket
-# 使用 `nexapipe --generate-secret` 命令生成一个新的 secret key
+# If set, the server reuses the same Node ID on every startup,
+# which produces a stable connection Ticket so clients do not need to update it each time.
+# Run `nexapipe --generate-secret` to generate a new secret key
 # secret_key = "your-generated-secret-key-here"
 
 [server]
@@ -62,13 +62,13 @@ proxy_domains = [
     "comfyui.iroh.iakl.top",
     "mt.iroh.iakl.top",
 ]
-# 全局负载均衡策略（可选），默认 round_robin
+# Global load balancing strategy (optional), defaults to round_robin
 strategy = "round_robin"
 # strategy = "random"
 
-# 多节点配置（推荐）
-# 每个节点配置自己的 server_node_id/server_ticket 和服务的域名
-# 同一个域名可以配置在多个节点上，实现负载均衡
+# Multi-node configuration (recommended)
+# Each node configures its own server_node_id/server_ticket and the domains it serves.
+# The same domain can be configured on multiple nodes to enable load balancing.
 [[local_proxy.nodes]]
 server_node_id = ""
 domains = ["fn.iroh.iakl.top", "mt.iroh.iakl.top"]

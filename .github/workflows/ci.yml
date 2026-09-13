@@ -1,8 +1,8 @@
 name: CI
 
-# 日常提交/PR 的快速校验（仅 Linux）：格式、lint、测试。
-# 多平台编译由 release.yml 在打 tag 时验证。
-# 注意：dev-dependencies 里的 nix/duct 仅支持 unix，因此不要在 Windows 上跑 cargo test。
+# Fast checks for regular commits/PRs (Linux only): formatting, lint, tests.
+# Multi-platform builds are verified by release.yml when a tag is pushed.
+# Note: the nix/duct dev-dependencies are Unix-only, so do not run cargo test on Windows.
 on:
   push:
     branches: [main, master]
@@ -29,8 +29,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Configure rustfmt
         run: rustup component add rustfmt
-      # 当前仓库尚未完全按 rustfmt 格式化，这里只提示不阻塞。
-      # 全量格式化后（cargo fmt --all）可删除 continue-on-error。
       - name: cargo fmt --check
         continue-on-error: true
         run: cargo fmt --all -- --check

@@ -1,7 +1,7 @@
 name: Release
 
-# 推送 v* tag 时构建多平台产物并创建 GitHub Release。
-# 也可手动触发（workflow_dispatch），需填入一个已存在的 tag。
+# Build multi-platform artifacts and create a GitHub Release when a v* tag is pushed.
+# Can also be triggered manually (workflow_dispatch); an existing tag must be provided.
 on:
   push:
     tags:
@@ -9,11 +9,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "已存在的 tag，例如 v0.1.0"
+        description: "Existing tag, e.g. v0.1.0"
         required: true
         type: string
 
-# 构建阶段只需要读权限；发布阶段单独提权（见 release job）
+# The build stage only needs read access; the release stage elevates separately (see the release job)
 permissions:
   contents: read
 
@@ -25,6 +25,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   BIN_NAME: nexapipe
+  # Client crate; its cdylib is built as well (crate-type includes cdylib)
+  LIB_NAME: nexapipe-client
 
 jobs:
   build:
@@ -32,12 +34,12 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
-      # 单个平台失败时继续构建其余平台，便于定位问题
+      # Keep building the remaining platforms if one fails, to make issues easier to locate
       fail-fast: false
       matrix:
         include:
           # ---------- Linux (glibc) ----------
-          # x86_64 直接在 runner 上原生构建；aarch64 通过 cross(Docker) 交叉编译
+          # x86_64 is built natively on the runner; aarch64 is cross-compiled via cross (Docker)
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             cross: false
@@ -45,7 +47,7 @@ jobs:
             runner: ubuntu-latest
             cross: true
 
-          # ---------- Linux (musl, 静态链接) ----------
+          # ---------- Linux (musl, statically linked) ----------
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             cross: true
@@ -53,7 +55,7 @@ jobs:
             runner: ubuntu-latest
             cross: true
 
-          # ---------- macOS (在 arm64 runner 上交叉编译出 Intel 版本) ----------
+          # ---------- macOS (cross-compile the Intel build on an arm64 runner) ----------
           - target: aarch64-apple-darwin
             runner: macos-latest
             cross: false
@@ -61,7 +63,7 @@ jobs:
             runner: macos-latest
             cross: false
 
-          # ---------- Windows (在 x64 runner 上交叉编译出 arm64 版本) ----------
+          # ---------- Windows (cross-compile the arm64 build on an x64 runner) ----------
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             cross: false
@@ -83,16 +85,16 @@ jobs:
           VERSION="${TAG#v}"
           echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "构建 tag: $TAG (version=$VERSION)"
+          echo "Building tag: $TAG (version=$VERSION)"
 
-      # 仅提醒，不阻塞发布：tag 与 Cargo.toml 里的版本号不一致
+      # Warning only, does not block the release: the tag does not match the version in Cargo.toml
       - name: Warn on version mismatch
         shell: bash
         run: |
           set -euo pipefail
           CARGO_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
           if [ -n "$CARGO_VERSION" ] && [ "$CARGO_VERSION" != "$VERSION" ]; then
-            echo "::warning::tag ${TAG_NAME} 与 Cargo.toml workspace 版本 ${CARGO_VERSION} 不一致"
+            echo "::warning::tag ${TAG_NAME} does not match workspace version ${CARGO_VERSION} in Cargo.toml"
           fi
 
       - name: Install Rust target
@@ -111,7 +113,7 @@ jobs:
         with:
           tool: cross
 
-      # cross 在容器内自带对应目标的 gcc/musl-gcc 与 ring 所需的 C 工具链
+      # cross ships the target's gcc/musl-gcc and the C toolchain required by ring inside the container
       - name: Build (cross)
         if: ${{ matrix.cross }}
         shell: bash
@@ -121,6 +123,39 @@ jobs:
         if: ${{ !matrix.cross }}
         shell: bash
         run: cargo build --release --locked --target ${{ matrix.target }} -p ${{ env.BIN_NAME }}
+
+      # Client cdylib. Note: every #[no_mangle] export lives in jni.rs (only compiled with the
+      # jni feature), and jni.rs depends on LocalProxy, so local-proxy must be enabled too;
+      # otherwise the build produces no exported symbols at all.
+      - name: Build client cdylib (cross)
+        if: ${{ matrix.cross }}
+        shell: bash
+        run: cross build --release --locked --target ${{ matrix.target }} -p ${{ env.LIB_NAME }} --features jni,local-proxy
+
+      - name: Build client cdylib (native)
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }} -p ${{ env.LIB_NAME }} --features jni,local-proxy
+
+      - name: Resolve client library file name
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}" in
+            Windows)
+              echo "LIB_FILE=nexapipe_client.dll" >> "$GITHUB_ENV"
+              # MSVC also emits an import library, which is convenient for linking from C/C++
+              echo "LIB_FILE_EXTRA=nexapipe_client.dll.lib" >> "$GITHUB_ENV"
+              ;;
+            macOS)
+              echo "LIB_FILE=libnexapipe_client.dylib" >> "$GITHUB_ENV"
+              echo "LIB_FILE_EXTRA=" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "LIB_FILE=libnexapipe_client.so" >> "$GITHUB_ENV"
+              echo "LIB_FILE_EXTRA=" >> "$GITHUB_ENV"
+              ;;
+          esac
 
       - name: Smoke test
         if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
@@ -135,6 +170,7 @@ jobs:
           PKG="${BIN_NAME}-${VERSION}-${{ matrix.target }}"
           mkdir -p "dist/$PKG"
           cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/$PKG/"
+          cp "target/${{ matrix.target }}/release/${LIB_FILE}" "dist/$PKG/"
           cp config.toml config.toml.2fa.example LICENSE "dist/$PKG/"
           tar -czf "dist/$PKG.tar.gz" -C dist "$PKG"
           rm -rf "dist/$PKG"
@@ -148,6 +184,10 @@ jobs:
           $stage = "dist/$pkg"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/$env:BIN_NAME.exe" $stage
+          Copy-Item "target/${{ matrix.target }}/release/$env:LIB_FILE" $stage
+          if ($env:LIB_FILE_EXTRA -and (Test-Path "target/${{ matrix.target }}/release/$env:LIB_FILE_EXTRA")) {
+            Copy-Item "target/${{ matrix.target }}/release/$env:LIB_FILE_EXTRA" $stage
+          }
           Copy-Item config.toml, config.toml.2fa.example, LICENSE $stage
           Compress-Archive -Path $stage -DestinationPath "dist/$pkg.zip" -Force
           Remove-Item -Recurse -Force $stage
@@ -166,11 +206,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # gh release 需要写权限
+    # gh release needs write permission
     permissions:
       contents: write
     steps:
-      # gh 需要工作目录是一个 git 仓库；fetch-depth: 0 让 --generate-notes 能对比上一个 tag
+      # gh requires the working directory to be a git repo; fetch-depth: 0 lets
+      # --generate-notes diff against the previous tag
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -206,7 +247,7 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
-            echo "Release $TAG_NAME 已存在，覆盖上传产物"
+            echo "Release $TAG_NAME already exists, overwriting the uploaded artifacts"
             gh release upload "$TAG_NAME" dist/* --clobber
           else
             gh release create "$TAG_NAME" dist/* \

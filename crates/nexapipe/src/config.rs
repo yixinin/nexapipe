@@ -130,9 +130,9 @@ pub fn get_strategy(strategy: &Option<String>) -> crate::lb::LoadBalancingStrate
     }
 }
 
-// ===== 2FA 认证配置 =====
+// ===== 2FA authentication config =====
 
-/// TOML 格式的认证配置
+/// Authentication config in TOML format
 #[derive(Debug, Deserialize, Clone)]
 pub struct AuthTomlConfig {
     pub enabled: Option<bool>,

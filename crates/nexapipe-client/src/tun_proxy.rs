@@ -1,22 +1,22 @@
-//! TUN 代理：用 netstack-smoltcp 在 Rust 侧实现用户态 TCP/IP 栈，替代 Kotlin 手写 TCP 栈。
+//! TUN proxy: a user-space TCP/IP stack implemented in Rust with netstack-smoltcp, replacing the Kotlin hand-written TCP stack.
 //!
-//! 数据流：
+//! Data flow:
 //! ```text
-//! APP → TUN fd → Rust(AsyncFd) → Stack(Sink: IP 包入)
-//!                                  ↓ smoltcp 处理
+//! APP → TUN fd → Rust(AsyncFd) → Stack(Sink: IP packets in)
+//!                                  ↓ smoltcp processing
 //!                           ┌──────┴──────┐
 //!                      TcpListener    UdpSocket
-//!                      (TCP 连接)      (DNS 查询)
+//!                      (TCP connections) (DNS queries)
 //!                           │              │
 //!                           ↓              ↓
-//!                    10.0.1.3:80,443    解析域名
-//!                    (代理流量)           │
+//!                    10.0.1.3:80,443    resolve domain
+//!                    (proxied traffic)      │
 //!                           │            ↓
-//!               handle_local_     代理→10.0.1.3
-//!               connection       其他→转发真实 DNS
-//!               (→iroh→后端)      (tokio UdpSocket)
+//!               handle_local_     proxy→10.0.1.3
+//!               connection       other→forward to real DNS
+//!               (→iroh→backend)   (tokio UdpSocket)
 //!                           │
-//!                Stack(Stream: IP 包出) → AsyncFd → 写回 TUN fd
+//!                Stack(Stream: IP packets out) → AsyncFd → write back to TUN fd
 //! ```
 
 use crate::ClientError;
@@ -42,11 +42,11 @@ use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::task::JoinHandle;
 
-// 虚拟 IP 常量 — 必须与 Kotlin 侧 NexaVpnService 的 TUN 配置一致。
-// 10.0.1.2 = DNS 服务器（smoltcp UdpSocket 接收 DNS 查询）
-// 10.0.1.3 = 代理 IP（TCP 连接走 handle_local_connection → iroh）
-/// DNS 服务器虚拟 IP — 仅用于文档化，与 Kotlin 侧 NexaVpnService.virtualDNSIP 一致。
-/// DNS 查询的 dst_addr 即为此 IP，响应时原样用作 src_addr。
+// Virtual IP constants — must match the TUN config in the Kotlin-side NexaVpnService.
+// 10.0.1.2 = DNS server (smoltcp UdpSocket receives DNS queries)
+// 10.0.1.3 = proxy IP (TCP connections go through handle_local_connection → iroh)
+/// Virtual DNS server IP — documented only; matches Kotlin-side NexaVpnService.virtualDNSIP.
+/// The DNS query's dst_addr is this IP, and it is used as-is as the src_addr in the response.
 #[allow(dead_code)]
 const VIRTUAL_DNS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 2);
 const VIRTUAL_PROXY_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 3);
@@ -54,33 +54,33 @@ const VIRTUAL_PROXY_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 3);
 const TUN_MTU: usize = 1500;
 const DNS_FORWARD_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// TUN 代理：管理 smoltcp 栈和所有后台 pump/acceptor 任务。
+/// TUN proxy: manages the smoltcp stack and all background pump/acceptor tasks.
 ///
-/// 生命周期：由 `nativeStartTunProxy` 创建，存入 `ProxyState.tun_proxy`。
-/// `nativeStopTunProxy` / `nativeDestroy` 调用 `stop()` 终止所有任务。
-/// `Drop` 也会调用 `stop()` 作为安全网。
+/// Lifecycle: created by `nativeStartTunProxy` and stored in `ProxyState.tun_proxy`.
+/// `nativeStopTunProxy` / `nativeDestroy` call `stop()` to terminate all tasks.
+/// `Drop` also calls `stop()` as a safety net.
 pub struct TunProxy {
     stopped: Arc<AtomicBool>,
     tasks: Vec<JoinHandle<()>>,
 }
 
 impl TunProxy {
-    /// 创建并启动 TUN 代理。
+    /// Create and start the TUN proxy.
     ///
-    /// - `tun_fd`: Kotlin 侧 `ParcelFileDescriptor.detachFd()` 返回的原始 fd。
-    ///   本函数会 `dup` 两份（读/写），并关闭原始 fd。
-    /// - `endpoint_group`: 从 `ProxyState` 克隆的 `Arc<EndpointGroup>`，用于 iroh 连接。
-    /// - `proxy_domains`: 需要代理的域名列表（逗号分隔已解析）。
-    /// - `custom_dns_servers`: 系统 DNS 服务器列表（从 `CUSTOM_DNS_SERVERS` 读取）。
+    /// - `tun_fd`: the raw fd returned by Kotlin's `ParcelFileDescriptor.detachFd()`.
+    ///   This function `dup`s it twice (read/write) and closes the original fd.
+    /// - `endpoint_group`: the `Arc<EndpointGroup>` cloned from `ProxyState`, used for iroh connections.
+    /// - `proxy_domains`: the list of domains to proxy (already split from comma-separated input).
+    /// - `custom_dns_servers`: the system DNS server list (read from `CUSTOM_DNS_SERVERS`).
     ///
-    /// 内部用 `runtime.spawn()` 启动所有任务，**不 block_on**。
+    /// All tasks are started via `runtime.spawn()` internally — **no block_on**.
     pub fn new(
         tun_fd: RawFd,
         endpoint_group: Arc<EndpointGroup>,
         proxy_domains: Vec<String>,
         custom_dns_servers: Vec<SocketAddr>,
     ) -> Result<Self, ClientError> {
-        // 1. dup fd 两份（读/写），关闭原始 fd
+        // 1. dup the fd twice (read/write) and close the original fd.
         let fd_read = unsafe { libc::dup(tun_fd) };
         if fd_read < 0 {
             let e = std::io::Error::last_os_error();
@@ -94,7 +94,7 @@ impl TunProxy {
             unsafe { libc::close(fd_read) };
             return Err(e.into());
         }
-        // 关闭原始 fd — 我们现在持有两个 dup
+        // Close the original fd — we now hold two dups.
         unsafe { libc::close(tun_fd) };
 
         set_nonblocking(fd_read)?;
@@ -106,7 +106,7 @@ impl TunProxy {
             fd_write
         );
 
-        // 2. 构建 smoltcp 栈
+        // 2. Build the smoltcp stack.
         let (stack, runner, udp_socket, tcp_listener) = StackBuilder::default()
             .enable_tcp(true)
             .enable_udp(true)
@@ -116,7 +116,7 @@ impl TunProxy {
         let stopped = Arc::new(AtomicBool::new(false));
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
-        // 3. spawn Runner（驱动 smoltcp 内部处理：重传、超时等）
+        // 3. spawn the Runner (drives smoltcp's internal processing: retransmits, timeouts, etc.).
         if let Some(runner) = runner {
             let stopped_clone = stopped.clone();
             tasks.push(tokio::spawn(async move {
@@ -128,10 +128,10 @@ impl TunProxy {
             }));
         }
 
-        // 4. split Stack → (Sink for IP 包入, Stream for IP 包出)
+        // 4. split Stack → (Sink for IP packets in, Stream for IP packets out).
         let (stack_sink, stack_stream) = stack.split();
 
-        // 5. TUN → Stack pump（读 fd → Stack Sink）
+        // 5. TUN → Stack pump (read fd → Stack Sink).
         {
             let file = unsafe { std::fs::File::from_raw_fd(fd_read) };
             let async_fd = AsyncFd::new(file)?;
@@ -151,16 +151,16 @@ impl TunProxy {
                             break;
                         }
                     };
-                    // 用 try_io：&File 实现了 Read，可用 get_ref()（不可变守卫只有 get_ref）。
-                    // try_io 在 WouldBlock 时自动清除 readiness，无需手动 clear_ready。
+                    // Use try_io: &File implements Read, so we can use get_ref() (the immutable guard
+                    // only has get_ref()). try_io auto-clears readiness on WouldBlock, no manual clear_ready needed.
                     match guard.try_io(|inner| inner.get_ref().read(&mut buf)) {
                         Ok(Ok(0)) => {
-                            // EOF — TUN fd 被关闭
+                            // EOF — the TUN fd was closed.
                             jni_log!("[tun-proxy] TUN read EOF, stopping pump-in");
                             break;
                         }
                         Ok(Ok(n)) => {
-                            // n > 0 — 读到 IP 包，送入 smoltcp 栈
+                            // n > 0 — read an IP packet; feed it into the smoltcp stack.
                             if let Err(e) = sink.send(buf[..n].to_vec()).await {
                                 jni_log!("[tun-proxy] stack send error: {}", e);
                                 break;
@@ -171,7 +171,7 @@ impl TunProxy {
                             break;
                         }
                         Err(_would_block) => {
-                            // try_io 已清除 readiness，重等
+                            // try_io already cleared readiness; wait again.
                             continue;
                         }
                     }
@@ -180,7 +180,7 @@ impl TunProxy {
             }));
         }
 
-        // 6. Stack → TUN pump（Stack Stream → 写 fd）
+        // 6. Stack → TUN pump (Stack Stream → write fd).
         {
             let file = unsafe { std::fs::File::from_raw_fd(fd_write) };
             let async_fd = AsyncFd::new(file)?;
@@ -194,7 +194,7 @@ impl TunProxy {
                     }
                     match stream.next().await {
                         Some(Ok(pkt)) => {
-                            // 写入 TUN fd，处理 WouldBlock 重试
+                            // Write to the TUN fd, retrying on WouldBlock.
                             loop {
                                 if stopped_clone.load(Ordering::Acquire) {
                                     break;
@@ -206,16 +206,16 @@ impl TunProxy {
                                         break;
                                     }
                                 };
-                                // 用 try_io：&File 实现了 Write，可用 get_ref()。
-                                // try_io 在 WouldBlock 时自动清除 readiness。
+                                // Use try_io: &File implements Write, so we can use get_ref().
+                                // try_io auto-clears readiness on WouldBlock.
                                 match guard.try_io(|inner| inner.get_ref().write_all(&pkt)) {
-                                    Ok(Ok(())) => break, // 写入成功
+                                    Ok(Ok(())) => break, // write succeeded
                                     Ok(Err(e)) => {
                                         jni_log!("[tun-proxy] TUN write error: {}", e);
                                         break;
                                     }
                                     Err(_would_block) => {
-                                        // try_io 已清除 readiness，重试
+                                        // try_io already cleared readiness; retry.
                                         continue;
                                     }
                                 }
@@ -234,12 +234,12 @@ impl TunProxy {
             }));
         }
 
-        // 7. TCP acceptor — 接受 smoltcp 产出的 TCP 连接，按目标 IP 分流
+        // 7. TCP acceptor — accept the TCP connections produced by smoltcp and route them by destination IP.
         //
-        // 注意 netstack-smoltcp 的命名陷阱：TcpListener yields (stream, local_addr, remote_addr)
-        // 其中 local_addr = stream.local_addr() = src_addr = IP 包源地址 = 客户端地址
-        //      remote_addr = stream.remote_addr() = dst_addr = IP 包目标地址 = 服务器地址(10.0.1.3)
-        // 即 local/remote 的语义与标准 TCP 相反！这里用第三元素(remote_addr)判断目标 IP。
+        // Beware a netstack-smoltcp naming trap: TcpListener yields (stream, local_addr, remote_addr)
+        // where local_addr = stream.local_addr() = src_addr = the packet's source IP = the client address,
+        //      remote_addr = stream.remote_addr() = dst_addr = the packet's destination IP = the server address (10.0.1.3).
+        // So local/remote semantics are the REVERSE of standard TCP! We use the third element (remote_addr) to decide the destination IP.
         if let Some(tcp_listener) = tcp_listener {
             let eg = endpoint_group.clone();
             let pd = Arc::new(proxy_domains.clone());
@@ -261,7 +261,7 @@ impl TunProxy {
                                 client_addr
                             );
                             if dest_ip == IpAddr::V4(VIRTUAL_PROXY_IP) {
-                                // 代理流量 → handle_local_connection → iroh
+                                // Proxied traffic → handle_local_connection → iroh.
                                 let eg = eg.clone();
                                 let pd = pd.clone();
                                 tokio::spawn(async move {
@@ -289,16 +289,16 @@ impl TunProxy {
             }));
         }
 
-        // 8. DNS handler（UDP 53）— 处理 DNS 查询，劫持代理域名到虚拟 IP
+        // 8. DNS handler (UDP 53) — handle DNS queries, hijacking proxied domains to the virtual IP.
         //
-        // 并发处理：每个 DNS 查询 spawn 一个独立 task，避免串行阻塞。
-        // 原串行实现在 DNS 转发超时（~1.6s）时会阻塞所有后续查询，导致 APP DNS 超时。
+        // Process concurrently: spawn one independent task per DNS query to avoid serial blocking.
+        // The original serial implementation blocked all subsequent queries on a DNS forward timeout (~1.6s), causing APP DNS timeouts.
         if let Some(udp_socket) = udp_socket {
             let (udp_rx, udp_tx) = udp_socket.split();
             let proxy_vec = Arc::new(proxy_domains.clone());
             let dns_servers = Arc::new(custom_dns_servers);
             let stopped_clone = stopped.clone();
-            // udp_tx 需要 Arc<Mutex> 共享给并发 task
+            // udp_tx needs Arc<Mutex> to be shared across concurrent tasks.
             let tx = Arc::new(tokio::sync::Mutex::new(udp_tx));
             tasks.push(tokio::spawn(async move {
                 let mut rx = udp_rx;
@@ -308,7 +308,7 @@ impl TunProxy {
                     }
                     match rx.next().await {
                         Some((data, src_addr, dst_addr)) => {
-                            // 并发处理每个 DNS 查询，不阻塞后续查询
+                            // Process each DNS query concurrently without blocking later queries.
                             let tx = tx.clone();
                             let proxy_vec = proxy_vec.clone();
                             let dns_servers = dns_servers.clone();
@@ -316,7 +316,7 @@ impl TunProxy {
                                 let response =
                                     handle_dns_query(&data, &proxy_vec, &dns_servers).await;
                                 if let Some(resp) = response {
-                                    // 回送：src=10.0.1.2:53(查询的 dst), dst=客户端(查询的 src)
+                                    // Echo back: src=10.0.1.2:53 (the query's dst), dst=client (the query's src).
                                     let mut tx = tx.lock().await;
                                     let _ = tx.send((resp, dst_addr, src_addr)).await;
                                 }
@@ -336,8 +336,8 @@ impl TunProxy {
         Ok(Self { stopped, tasks })
     }
 
-    /// 停止所有后台任务。非阻塞 — abort() 标记任务取消，不等待完成。
-    /// 用于 `Drop` 或不需要等待 fd 关闭的场景。
+    /// Stop all background tasks. Non-blocking — abort() marks the tasks for cancellation without waiting.
+    /// Used by `Drop` or when we don't need to wait for the fd to close.
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
         for task in &self.tasks {
@@ -346,22 +346,22 @@ impl TunProxy {
         jni_log!("[tun-proxy] Stopped (aborted {} tasks)", self.tasks.len());
     }
 
-    /// Abort 所有任务并等待它们完成（带超时），确保 fd 被关闭后再返回。
-    /// 消费 self。在 `nativeStopTunProxy` / `nativeStopProxy` 中使用，
-    /// 确保在 endpoint_group.close_all() 之前 TUN 代理的 fd 已释放。
+    /// Abort all tasks and wait for them to finish (with a timeout), ensuring the fd is closed before returning.
+    /// Consumes self. Used in `nativeStopTunProxy` / `nativeStopProxy` to ensure the TUN proxy's fd
+    /// is released before endpoint_group.close_all().
     pub fn shutdown(mut self, runtime: &tokio::runtime::Runtime) {
         self.stopped.store(true, Ordering::Release);
-        // 用 mem::take 取出 tasks，避免 E0509（不能从 Drop 类型 move 出字段）
+        // Use mem::take to pull tasks out, avoiding E0509 (can't move a field out of a Drop type).
         let tasks = std::mem::take(&mut self.tasks);
         for task in tasks {
             task.abort();
-            // 等待任务结束（drop future → drop AsyncFd → close fd）
+            // Wait for the task to end (drop future → drop AsyncFd → close fd).
             let _ = runtime.block_on(async {
                 let _ = tokio::time::timeout(std::time::Duration::from_millis(500), task).await;
             });
         }
         jni_log!("[tun-proxy] Shutdown complete (all tasks joined)");
-        // self dropped here → Drop::drop 调 stop()（幂等，tasks 已空）
+        // self dropped here → Drop::drop calls stop() (idempotent; tasks are already empty).
     }
 }
 
@@ -372,10 +372,10 @@ impl Drop for TunProxy {
 }
 
 // ============================================================
-// 辅助函数
+// Helper functions
 // ============================================================
 
-/// 设置 fd 为非阻塞模式。
+/// Put the fd into non-blocking mode.
 fn set_nonblocking(fd: RawFd) -> Result<(), ClientError> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
@@ -388,19 +388,20 @@ fn set_nonblocking(fd: RawFd) -> Result<(), ClientError> {
 }
 
 // ============================================================
-// DNS 处理 — 移植自 Kotlin NexaVpnService
+// DNS handling — ported from the Kotlin NexaVpnService.
 // ============================================================
 
-/// 处理 DNS 查询，返回 DNS 响应 payload。
+/// Handle a DNS query and return the DNS response payload.
 ///
-/// - 代理域名 → 返回 10.0.1.3（A 记录）
-/// - iroh 基础设施域名 → 转发到真实 DNS（不在 TUN 内代理）
-/// - 其他域名 → 转发到真实 DNS，原样返回响应
+/// - Proxied domain → return 10.0.1.3 (an A record).
+/// - iroh infrastructure domain → forward to the real DNS (not proxied inside the TUN).
+/// - Other domain → forward to the real DNS and return the response as-is.
 ///
-/// 注意：不要劫持系统 captive portal 校验域名（connectivitycheck.gstatic.com 等）到
-/// 私有虚拟 IP。Android 的 NetworkMonitor 会把"校验域名解析到私有 IP"直接判定为
-/// "无互联网"（DNS returned private IP = no internet），导致状态栏 WiFi 感叹号。
-/// 让它们走真实 DNS、连物理网络即可，与不开启 VPN 时的行为一致。
+/// Note: do NOT hijack the system's captive-portal validation domains (connectivitycheck.gstatic.com,
+/// etc.) to a private virtual IP. Android's NetworkMonitor treats "validation domain resolves to a
+/// private IP" as "no internet" (DNS returned private IP = no internet), which shows a WiFi
+/// exclamation mark in the status bar. Let them use the real DNS and reach the physical network,
+/// matching the behavior when the VPN is off.
 async fn handle_dns_query(
     query: &[u8],
     proxy_domains: &Arc<Vec<String>>,
@@ -416,7 +417,7 @@ async fn handle_dns_query(
 
     let domain_lower = domain.to_lowercase();
 
-    // iroh 基础设施域名不通过 TUN 代理 — iroh 自身的流量走 addDisallowedApplication
+    // iroh infrastructure domains are not proxied through the TUN — iroh's own traffic goes via addDisallowedApplication.
     let is_iroh = domain_lower.ends_with(".iroh.link") || domain_lower.ends_with(".n0.iroh.link");
 
     let is_proxy = !is_iroh && should_proxy_domain(&domain, proxy_domains);
@@ -429,7 +430,7 @@ async fn handle_dns_query(
         );
         Some(build_dns_response(query, VIRTUAL_PROXY_IP, qtype))
     } else {
-        // 转发到真实 DNS
+        // Forward to the real DNS.
         jni_log!(
             "[tun-proxy] DNS: '{}' -> forwarding to real DNS (qtype={})",
             domain,
@@ -439,8 +440,8 @@ async fn handle_dns_query(
     }
 }
 
-/// 解析 DNS 查询，返回 (域名, QTYPE)。
-/// QTYPE: 1=A, 28=AAAA。解析失败返回 None。
+/// Parse a DNS query, returning (domain, QTYPE).
+/// QTYPE: 1=A, 28=AAAA. Returns None on parse failure.
 fn parse_dns_query(payload: &[u8]) -> Option<(String, u16)> {
     if payload.len() < 12 {
         return None;
@@ -452,17 +453,17 @@ fn parse_dns_query(payload: &[u8]) -> Option<(String, u16)> {
         return None;
     }
 
-    // 解析 Question section 的域名（length-prefixed labels）
+    // Parse the Question section's domain name (length-prefixed labels).
     let mut pos = 12;
     let mut labels: Vec<&str> = Vec::new();
 
     while pos < payload.len() {
         let len = payload[pos] as usize;
         if len == 0 {
-            pos += 1; // 跳过 null 终止符
+            pos += 1; // Skip the null terminator.
             break;
         }
-        // 防止越界
+        // Prevent out-of-bounds access.
         if pos + 1 + len > payload.len() {
             return None;
         }
@@ -471,7 +472,7 @@ fn parse_dns_query(payload: &[u8]) -> Option<(String, u16)> {
         pos += 1 + len;
     }
 
-    // pos 指向 null 字节之后。QTYPE 是紧随其后的 2 字节。
+    // pos points right after the null byte. QTYPE is the 2 bytes immediately following it.
     let qtype = if pos + 2 <= payload.len() {
         u16::from_be_bytes([payload[pos], payload[pos + 1]])
     } else {
@@ -481,12 +482,12 @@ fn parse_dns_query(payload: &[u8]) -> Option<(String, u16)> {
     Some((labels.join("."), qtype))
 }
 
-/// 构建 DNS 响应：将域名解析为指定的 IPv4 地址。
+/// Build a DNS response resolving the domain to the given IPv4 address.
 ///
-/// - qtype=1 (A): 返回 A 记录 with 4 bytes RDATA
-/// - qtype=28 (AAAA) 或其他: 返回空应答（ANCOUNT=0），让客户端回退到 A 查询
+/// - qtype=1 (A): return an A record with 4 bytes of RDATA.
+/// - qtype=28 (AAAA) or other: return an empty answer (ANCOUNT=0) so the client falls back to an A query.
 fn build_dns_response(query: &[u8], ip: Ipv4Addr, qtype: u16) -> Vec<u8> {
-    // 非 A 查询：返回空应答（虚拟 IP 是 IPv4，无法回答 AAAA/MX 等）
+    // Non-A query: return an empty answer (the virtual IP is IPv4, so it can't answer AAAA/MX, etc.).
     if qtype != 1 {
         return build_empty_dns_response(query);
     }
@@ -494,7 +495,7 @@ fn build_dns_response(query: &[u8], ip: Ipv4Addr, qtype: u16) -> Vec<u8> {
     let mut response = Vec::with_capacity(query.len() + 16);
     response.extend_from_slice(query);
 
-    // 设置 flags: QR=1, Opcode=0, AA=0, TC=0, RD=1(copied), RA=1
+    // Set flags: QR=1, Opcode=0, AA=0, TC=0, RD=1(copied), RA=1
     response[2] = 0x81;
     response[3] = 0x80;
     // ANCOUNT = 1
@@ -502,7 +503,7 @@ fn build_dns_response(query: &[u8], ip: Ipv4Addr, qtype: u16) -> Vec<u8> {
     response[7] = 0x01;
 
     // Answer section:
-    // Name: 压缩指针 0xC00C → 指向 offset 12（Question section 的域名）
+    // Name: compression pointer 0xC00C → points to offset 12 (the Question section's domain name)
     response.push(0xC0);
     response.push(0x0C);
     // TYPE: A = 1
@@ -519,14 +520,14 @@ fn build_dns_response(query: &[u8], ip: Ipv4Addr, qtype: u16) -> Vec<u8> {
     // RDLENGTH: 4 (IPv4)
     response.push(0x00);
     response.push(0x04);
-    // RDATA: IP 地址的 4 字节
+    // RDATA: the 4 bytes of the IP address.
     response.extend_from_slice(&ip.octets());
 
     response
 }
 
-/// 构建空 DNS 应答：QR=1, RA=1, RCODE=0(NoError), ANCOUNT=0。
-/// 用于"查询类型不支持"或"没有匹配类型的地址"。
+/// Build an empty DNS answer: QR=1, RA=1, RCODE=0 (NoError), ANCOUNT=0.
+/// Used for "query type not supported" or "no address of the matching type".
 fn build_empty_dns_response(query: &[u8]) -> Vec<u8> {
     let mut response = query.to_vec();
     response[2] = 0x81;
@@ -537,35 +538,35 @@ fn build_empty_dns_response(query: &[u8]) -> Vec<u8> {
     response
 }
 
-/// 将 DNS 查询转发到真实 DNS 服务器，原样返回响应。
+/// Forward a DNS query to the real DNS server and return the response as-is.
 ///
-/// 遍历所有配置的 DNS 服务器，**IPv4 优先**，按地址族绑定 socket
-/// （IPv4→0.0.0.0:0，IPv6→[::]:0）。每个服务器单独 800ms 超时，整体 3s 限制。
+/// Iterates over all configured DNS servers, **preferring IPv4**, binding the socket by address family
+/// (IPv4→0.0.0.0:0, IPv6→[::]:0). Each server has its own 800ms timeout, with an overall 3s cap.
 ///
-/// 解决：系统 DNS 列表前几个是 IPv6（如 2408:8888::8）导致
-/// 绑定 0.0.0.0:0 后 connect() 失败，且原代码只尝试 dns_servers[0] 不会 fallback。
+/// Fix: the system DNS list often starts with IPv6 servers (e.g. 2408:8888::8), which made binding
+/// 0.0.0.0:0 then connect() fail, and the old code only tried dns_servers[0] with no fallback.
 async fn forward_dns_query(query: &[u8], dns_servers: &Arc<Vec<SocketAddr>>) -> Option<Vec<u8>> {
     if dns_servers.is_empty() {
         jni_log!("[tun-proxy] No DNS servers configured, dropping query");
         return None;
     }
 
-    // IPv4 优先：先尝试 IPv4 DNS（更快更可靠），再尝试 IPv6
+    // Prefer IPv4: try IPv4 DNS first (faster and more reliable), then IPv6.
     let mut ordered: Vec<&SocketAddr> = dns_servers.iter().collect();
-    ordered.sort_by_key(|s| !s.is_ipv4() as u8); // false(=IPv4) 排前
+    ordered.sort_by_key(|s| !s.is_ipv4() as u8); // false(=IPv4) goes first
 
     let per_server_timeout = Duration::from_millis(800);
 
     let result = tokio::time::timeout(DNS_FORWARD_TIMEOUT, async {
         for dns_server in ordered.iter() {
-            // 按地址族绑定：IPv4 DNS → 0.0.0.0:0，IPv6 DNS → [::]:0
+            // Bind by address family: IPv4 DNS → 0.0.0.0:0, IPv6 DNS → [::]:0.
             let bind_addr = if dns_server.is_ipv4() {
                 "0.0.0.0:0"
             } else {
                 "[::]:0"
             };
 
-            // 每个服务器单独超时，避免卡在不可达的 IPv6 DNS 上
+            // Per-server timeout so we don't get stuck on an unreachable IPv6 DNS server.
             let server_result = tokio::time::timeout(per_server_timeout, async {
                 let sock = tokio::net::UdpSocket::bind(bind_addr).await.ok()?;
                 sock.connect(**dns_server).await.ok()?;

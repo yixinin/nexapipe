@@ -1,35 +1,35 @@
-//! 客户端示例：连接到 iroh 代理
+//! Client example: connect to the iroh proxy
 //!
-//! 使用方法：
-//! 1. 运行代理服务，获取 Ticket
-//! 2. 将 Ticket 传递给此客户端
+//! Usage:
+//! 1. Start the proxy server and get its Ticket
+//! 2. Pass that Ticket to this client
 
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr};
 use iroh_tickets::endpoint::EndpointTicket;
 
 const ALPN_HTTP3: &[u8] = b"\x05http/3";
-const MAX_RESPONSE_SIZE: usize = 1024 * 1024; // 1MB
+const MAX_RESPONSE_SIZE: usize = 1024 * 1024; // 1 MB
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 从命令行参数或环境变量获取 Ticket
+    // Get the Ticket from the command-line argument or the environment
     let ticket_str = std::env::args().nth(1).expect("Usage: client <ticket>");
 
     println!("Connecting to proxy with ticket: {}...", ticket_str);
 
-    // 解析 Ticket
+    // Parse the Ticket
     let ticket: EndpointTicket = ticket_str
         .parse()
         .map_err(|e| anyhow::anyhow!("Failed to parse ticket: {}", e))?;
 
-    // 获取端点地址
+    // Get the endpoint address
     let endpoint_addr: EndpointAddr = ticket.into();
 
-    // 创建客户端 Endpoint
+    // Create the client Endpoint
     let ep = Endpoint::builder(presets::N0).bind().await?;
 
-    // 连接到代理服务器
+    // Connect to the proxy server
     println!("Establishing connection...");
     let conn = ep
         .connect(endpoint_addr, ALPN_HTTP3)
@@ -38,23 +38,23 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Connected successfully!");
 
-    // 打开双向流
+    // Open a bidirectional stream
     let (mut send, mut recv) = conn
         .open_bi()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to open bidirectional stream: {}", e))?;
 
-    // 构造 HTTP 请求
+    // Build the HTTP request
     let request = construct_http_request("GET", "/", "example.com");
 
     println!("Sending request:\n{}", request);
 
-    // 发送请求
+    // Send the request
     send.write_all(request.as_bytes()).await?;
     send.finish()
         .map_err(|e| anyhow::anyhow!("Failed to finish stream: {}", e))?;
 
-    // 接收响应
+    // Receive the response
     let response = recv.read_to_end(MAX_RESPONSE_SIZE).await?;
 
     println!(

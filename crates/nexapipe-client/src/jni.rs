@@ -27,37 +27,41 @@ use tokio::task::JoinHandle;
 static RUNTIME: OnceCell<Runtime> = OnceCell::new();
 static ENDPOINT: Mutex<Option<Endpoint>> = Mutex::new(None);
 static STATE: OnceCell<Arc<Mutex<ProxyState>>> = OnceCell::new();
-// 2FA 配置：Kotlin 侧通过 nativeSetTwoFactor 在启动前注入 (client_id, secret, algorithm)。
+// 2FA config: Kotlin injects (client_id, secret, algorithm) via nativeSetTwoFactor before startup.
 static TWO_FACTOR: Mutex<Option<(String, String, String)>> = Mutex::new(None);
 
-// 代际计数器：每次 nativeStopProxy 释放 endpoint 时自增。nativeStartIroh 在 bind()
-// 前后比对该值，若期间发生过 stop 则丢弃迟到的新 endpoint，避免孤立 bind 复活已释放的隧道。
+// Generation counter: incremented each time nativeStopProxy releases the endpoint.
+// nativeStartIroh compares this before/after bind(); if a stop happened in between, the late
+// new endpoint is discarded to avoid a stray bind reviving an already-released tunnel.
 static ENDPOINT_GEN: AtomicU64 = AtomicU64::new(0);
 
-// Kotlin 侧传下来的系统 DNS 服务器列表。iroh 内部通过 JNI 读系统 DNS 会失败
-// (Null pointer in call_method obj argument)，回落 Google DNS 在国内不稳定。
-// 这里由 Kotlin 从 ConnectivityManager.getLinkProperties().dnsServers 拿到后注入，
-// nativeStartIroh 用它构造 DnsResolver，绕开 iroh 的 JNI 失败路径。
+// System DNS servers passed down from Kotlin. iroh's internal JNI path for reading system DNS
+// fails (Null pointer in call_method obj argument), and falling back to Google DNS is unstable
+// domestically. Kotlin obtains these from ConnectivityManager.getLinkProperties().dnsServers
+// and injects them; nativeStartIroh uses them to build the DnsResolver, bypassing iroh's
+// broken JNI path.
 static CUSTOM_DNS_SERVERS: Mutex<Vec<SocketAddr>> = Mutex::new(Vec::new());
 
-// iroh 基础设施域名（dns.iroh.link, *.relay.n0.iroh.link）的预解析 IP 覆盖。
-// GFW 会丢弃 iroh.link 域名的 UDP DNS 响应，导致 hickory 解析超时。
-// Kotlin 侧用系统 DNS（可能走 DoT/Private DNS，绕过 GFW）预解析这些域名，
-// 传给 Rust 存入此 map。OverrideResolver 对这些域名直接返回预解析 IP，
-// 其他域名仍走 hickory + 系统 DNS 服务器。
+// Pre-resolved IP overrides for iroh infrastructure domains (dns.iroh.link, *.relay.n0.iroh.link).
+// The GFW drops UDP DNS responses for iroh.link domains, causing hickory resolution to time out.
+// Kotlin pre-resolves these via the system DNS (which may use DoT/Private DNS to bypass the GFW)
+// and passes them to Rust to store in this map. OverrideResolver returns the pre-resolved IPs for
+// these domains directly; all other domains still go through hickory + the system DNS servers.
 static DNS_OVERRIDES: Lazy<Mutex<HashMap<String, Vec<IpAddr>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-// OverrideResolver 内部委托 DnsResolver 时的单次查询超时。
+// Per-query timeout used when OverrideResolver delegates to DnsResolver.
 const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
-// BoxFuture 兼容类型，与 iroh::dns::Resolver trait 的返回类型（n0_future::boxed::BoxFuture，
-// 即 futures_lite::future::Boxed = Pin<Box<dyn Future<Output = T> + Send + 'static>>）一致。
-// 必须 'static：impl Resolver 的方法返回的 Future 不能借用 self，方法体内需 clone 所需数据。
+// BoxFuture compatibility type, matching the return type of the iroh::dns::Resolver trait
+// (n0_future::boxed::BoxFuture, i.e. futures_lite::future::Boxed =
+// Pin<Box<dyn Future<Output = T> + Send + 'static>>).
+// Must be 'static: the Future returned by Resolver methods cannot borrow self, so clone any
+// needed data inside the method body.
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 type BoxIter<T> = Box<dyn Iterator<Item = T> + Send + 'static>;
 
-// 各阶段超时。弱网下 STUN/relay/DNS 发现可能很慢，这些超时保证卡死时能返回失败而非永久阻塞。
+// Per-stage timeouts. Discovery of STUN/relay/DNS can be slow on weak networks; these timeouts ensure we return failure instead of blocking forever when stuck.
 const IROH_BIND_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 const START_PROXY_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(15);
 const CLOSE_ALL_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(8);
@@ -65,15 +69,17 @@ const PROXY_RUN_JOIN_TIMEOUT: tokio::time::Duration = tokio::time::Duration::fro
 /// Pre-connect / warm-up timeout for establishing iroh connections to all backends.
 const PRECONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(15);
 
-/// 固定使用的 relay 服务器（亚太南 aps1-1，新加坡）——国内最近的 N0 relay。
+/// The relay server we always use (aps1-1, Singapore — the closest N0 relay in this region).
 ///
-/// iroh 默认从 4 个 N0 relay 中按延迟选 home relay，国内环境下 aps1-1(亚太) 和
-/// euc1-1(欧洲) 延迟接近，iroh 会在两者间反复切换。每次切换 home relay 会导致
-/// 正在通过 relay 路由的连接（WebSocket 等）断线重连。
+/// By default iroh picks a home relay from the 4 N0 relays by latency; in this region aps1-1
+/// (Asia-Pacific) and euc1-1 (Europe) have similar latency, so iroh keeps flip-flopping between
+/// them. Each home-relay switch forces connections routed through relay (WebSocket, etc.) to
+/// drop and reconnect.
 ///
-/// 固定到 aps1-1 后 iroh 不会再切换，WS 连接稳定。
-/// 副作用：若 aps1-1 宕机则 relay 路径不可用（直连不受影响）。
-/// DNS 仍由 Kotlin 侧 resolveIrohDnsOverrides 预解析 aps1-1 的 IP 注入 OverrideResolver。
+/// Pinning to aps1-1 stops iroh from switching, keeping WS connections stable.
+/// Side effect: if aps1-1 goes down, the relay path is unavailable (direct connections are fine).
+/// DNS still pre-resolves aps1-1's IP on the Kotlin side via resolveIrohDnsOverrides and injects
+/// it into OverrideResolver.
 const PINNED_RELAY_URL: &str = "https://aps1-1.relay.n0.iroh.link.";
 
 // Relay configuration: mode and custom URL from Kotlin settings.
@@ -85,12 +91,12 @@ struct ProxyState {
     conn_pool: Option<IrohConnectionPool>,
     endpoint_group: Option<Arc<EndpointGroup>>,
     local_proxy: Option<LocalProxy>,
-    // 后台 proxy.run() 任务句柄，停止时 abort + await 以确定式释放监听端口。
+    // Background proxy.run() task handle; aborted + awaited on stop for a deterministic port release.
     proxy_task: Option<JoinHandle<()>>,
     nodes: Vec<NodeConfig>,
     domain_mappings: Vec<DomainMapping>,
     domains: Vec<String>,
-    // TUN 代理（smoltcp 用户态 TCP/IP 栈）。仅 Android tun-proxy feature 启用时存在。
+    // TUN proxy (smoltcp user-space TCP/IP stack). Present only when the Android tun-proxy feature is enabled.
     #[cfg(all(feature = "tun-proxy", target_os = "android"))]
     tun_proxy: Option<TunProxy>,
 }
@@ -143,11 +149,12 @@ macro_rules! jni_log {
     };
 }
 
-/// 自定义 DNS Resolver，包装 hickory 解析器并对指定域名返回预解析的 IP。
+/// Custom DNS Resolver that wraps the hickory resolver and returns pre-resolved IPs for specific domains.
 ///
-/// GFW 会丢弃 `iroh.link` 域名的 UDP DNS 响应，导致 hickory 解析超时。
-/// 此 resolver 对 `DNS_OVERRIDES` 中的域名直接返回 Kotlin 预解析的 IP
-/// （Kotlin 用系统 DNS，可能走 DoT/Private DNS 绕过 GFW），其他域名仍走 hickory。
+/// The GFW drops UDP DNS responses for `iroh.link` domains, causing hickory resolution to time out.
+/// This resolver returns Kotlin's pre-resolved IPs directly for domains in `DNS_OVERRIDES`
+/// (Kotlin uses the system DNS, which may go through DoT/Private DNS to bypass the GFW); all other
+/// domains still go through hickory.
 struct OverrideResolver {
     inner: DnsResolver,
     overrides: HashMap<String, Vec<IpAddr>>,
@@ -325,10 +332,10 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeInit(
     0
 }
 
-/// Kotlin 侧通过 ConnectivityManager.getLinkProperties().dnsServers 拿到系统 DNS 后，
-/// 以逗号分隔的 IP 字符串传入（如 "192.168.1.1,8.8.8.8"）。本函数解析为 SocketAddr
-/// （端口固定 53，UDP），存入 CUSTOM_DNS_SERVERS。nativeStartIroh 会在 bind 前读取。
-/// 必须在 nativeStartIroh 之前调用。
+/// Kotlin obtains the system DNS from ConnectivityManager.getLinkProperties().dnsServers and
+/// passes it as a comma-separated IP string (e.g. "192.168.1.1,8.8.8.8"). This function parses it
+/// into SocketAddr (port fixed to 53, UDP) and stores it in CUSTOM_DNS_SERVERS. nativeStartIroh
+/// reads it before bind. Must be called before nativeStartIroh.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDnsServers(
     mut env: JNIEnv,
@@ -355,7 +362,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDnsServers(
         }
     };
 
-    // 解析逗号分隔的 IP 地址列表。Kotlin 传的是纯 IP（无端口），统一加 53 端口。
+    // Parse the comma-separated IP list. Kotlin passes bare IPs (no port), so we always append port 53.
     let servers: Vec<SocketAddr> = dns_str
         .split(',')
         .map(|s| s.trim())
@@ -381,13 +388,14 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDnsServers(
     0
 }
 
-/// Kotlin 侧用系统 DNS（可能走 DoT/Private DNS，绕过 GFW）预解析 iroh 基础设施域名
-/// （dns.iroh.link, *.relay.n0.iroh.link），以 "domain=ip1,ip2;domain2=ip3,ip4" 格式传入。
-/// 本函数解析后存入 DNS_OVERRIDES。OverrideResolver 对这些域名直接返回预解析 IP，
-/// 绕过 hickory 的 UDP DNS 查询（GFW 会丢弃 iroh.link 域名的 UDP DNS 响应）。
-/// 这样 pkarr resolve（HTTPS to dns.iroh.link/pkarr/<z32>）能连上 iroh 的 pkarr 服务器，
-/// 拿到目标节点的 EndpointInfo（relay URL + direct addr），即使 DNS TXT 被 GFW 阻断也无妨。
-/// 必须在 nativeStartIroh 之前调用。
+/// Kotlin pre-resolves iroh infrastructure domains (dns.iroh.link, *.relay.n0.iroh.link) via the
+/// system DNS (which may use DoT/Private DNS to bypass the GFW) and passes them in the format
+/// "domain=ip1,ip2;domain2=ip3,ip4". This function parses and stores them in DNS_OVERRIDES.
+/// OverrideResolver returns the pre-resolved IPs directly for these domains, bypassing hickory's
+/// UDP DNS queries (the GFW drops UDP DNS responses for iroh.link domains).
+/// This lets pkarr resolve (HTTPS to dns.iroh.link/pkarr/<z32>) reach iroh's pkarr server and fetch
+/// the target node's EndpointInfo (relay URL + direct addr), even if DNS TXT is blocked by the GFW.
+/// Must be called before nativeStartIroh.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDnsOverride(
     mut env: JNIEnv,
@@ -414,7 +422,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDnsOverride(
         }
     };
 
-    // 解析 "domain=ip1,ip2;domain2=ip3,ip4" 格式。
+    // Parse the "domain=ip1,ip2;domain2=ip3,ip4" format.
     let mut map: HashMap<String, Vec<IpAddr>> = HashMap::new();
     for entry in overrides_str.split(';') {
         let entry = entry.trim();
@@ -473,9 +481,9 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDnsOverride(
     0
 }
 
-/// 配置 relay 模式和自定义 URL。relay_mode: "default"/"disabled"/"custom"。
-/// relay_url 仅在 relay_mode="custom" 时使用。
-/// 必须在 nativeStartIroh 之前调用。
+/// Configure the relay mode and custom URL. relay_mode: "default"/"disabled"/"custom".
+/// relay_url is only used when relay_mode="custom".
+/// Must be called before nativeStartIroh.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetRelayConfig(
     mut env: JNIEnv,
@@ -526,7 +534,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetRelayConfig(
     0
 }
 
-/// 读取 Kotlin 注入的 2FA 凭证并构造 TwoFactorAuth；未配置或 secret 为空时返回 None。
+/// Read the 2FA credentials injected by Kotlin and build a TwoFactorAuth; returns None when unset or secret is empty.
 fn current_two_factor_auth() -> Option<TwoFactorAuth> {
     let cfg = TWO_FACTOR.lock().map(|g| g.clone()).unwrap_or_default()?;
     let (client_id, secret, algorithm) = cfg;
@@ -542,8 +550,8 @@ fn current_two_factor_auth() -> Option<TwoFactorAuth> {
     }
 }
 
-/// 配置客户端 2FA 凭证。必须在 nativeStartProxy / nativeStartProxyLegacy 之前调用。
-/// algorithm: "sha1" / "sha256" / "sha512"。
+/// Configure the client's 2FA credentials. Must be called before nativeStartProxy /
+/// nativeStartProxyLegacy. algorithm: "sha1" / "sha256" / "sha512".
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetTwoFactor(
     mut env: JNIEnv,
@@ -604,7 +612,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartIroh(
         None => return std::ptr::null_mut(),
     };
 
-    // 快速路径：已有 endpoint 则立即返回。仅短暂持锁，不跨任何 await。
+    // Fast path: if an endpoint already exists, return immediately. Holds the lock briefly without crossing any await.
     {
         if let Ok(guard) = ENDPOINT.lock() {
             if let Some(ep) = guard.as_ref() {
@@ -617,11 +625,11 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartIroh(
         }
     }
 
-    // bind() 期间不持 ENDPOINT 锁，避免 nativeStopProxy 死锁。
+    // Don't hold the ENDPOINT lock during bind() to avoid deadlocking with nativeStopProxy.
     let gen_before = ENDPOINT_GEN.load(Ordering::Acquire);
 
-    // 读取 Kotlin 注入的系统 DNS 服务器 + iroh 基础设施域名预解析 IP。
-    // 短暂持锁 clone 后立即释放，不跨 await。
+    // Read the system DNS servers injected by Kotlin plus the pre-resolved iroh infrastructure IPs.
+    // Hold the lock briefly to clone, then release immediately, without crossing await.
     let custom_dns: Vec<SocketAddr> = CUSTOM_DNS_SERVERS
         .lock()
         .map(|g| g.clone())
@@ -630,9 +638,9 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartIroh(
         DNS_OVERRIDES.lock().map(|g| g.clone()).unwrap_or_default();
 
     let bind_result: Result<Endpoint, ()> = runtime.block_on(async move {
-        // 读取 Kotlin 侧注入的 relay 配置（nativeSetRelayConfig 设置）。
-        // relay_mode: "default" = iroh 默认（所有 N0 relay），"disabled" = 无 relay，
-        // "custom" = 用户自定义 relay URL；空字符串 = 使用 PINNED_RELAY_URL 默认值。
+        // Read the relay config injected by Kotlin (set by nativeSetRelayConfig).
+        // relay_mode: "default" = iroh default (all N0 relays), "disabled" = no relay,
+        // "custom" = user-provided relay URL; empty string = fall back to PINNED_RELAY_URL.
         let cfg_mode = RELAY_MODE.lock().map(|g| g.clone()).unwrap_or_default();
         let cfg_url = CUSTOM_RELAY_URL
             .lock()
@@ -650,7 +658,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartIroh(
             jni_log!("[iroh] relay mode: default (all N0 relays)");
             Endpoint::builder(presets::N0)
         } else {
-            // 默认行为：固定 relay 到 aps1-1（亚太南），防止 iroh 在多个 relay 间切换导致 WS 断线。
+            // Default behavior: pin the relay to aps1-1 (Asia-Pacific South) to stop iroh from switching between relays and dropping WS connections.
             let relay_url: RelayUrl = PINNED_RELAY_URL
                 .parse()
                 .expect("PINNED_RELAY_URL must be a valid relay URL");
@@ -658,13 +666,14 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartIroh(
             Endpoint::builder(presets::N0)
                 .relay_mode(RelayMode::Custom(RelayMap::from_iter(vec![relay_url])))
         };
-        // 始终用 OverrideResolver 包装 hickory：
-        // - 对 DNS_OVERRIDES 中的 iroh 基础设施域名（dns.iroh.link, *.relay.n0.iroh.link）
-        //   直接返回 Kotlin 预解析的 IP，绕过 GFW 对 iroh.link UDP DNS 响应的阻断。
-        //   这样 pkarr resolve（HTTPS to dns.iroh.link/pkarr/<z32>）能连上 pkarr 服务器，
-        //   拿到目标节点 EndpointInfo；relay 域名也能连上 relay 服务器。
-        // - 其他域名走 hickory + 系统 DNS 服务器（custom_dns）。
-        //   即使 custom_dns 为空，OverrideResolver 内部回落 DnsResolver::new()。
+        // Always wrap hickory with OverrideResolver:
+        // - For iroh infrastructure domains in DNS_OVERRIDES (dns.iroh.link, *.relay.n0.iroh.link),
+        //   return Kotlin's pre-resolved IPs directly, bypassing the GFW's blocking of iroh.link
+        //   UDP DNS responses. This lets pkarr resolve (HTTPS to dns.iroh.link/pkarr/<z32>) reach the
+        //   pkarr server and fetch the target node's EndpointInfo; relay domains can also reach the
+        //   relay server.
+        // - All other domains go through hickory + the system DNS servers (custom_dns).
+        //   Even if custom_dns is empty, OverrideResolver internally falls back to DnsResolver::new().
         jni_log!(
             "[DEBUG:jni] Building OverrideResolver: {} DNS servers, {} override domains {:?}",
             custom_dns.len(),
@@ -695,14 +704,14 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartIroh(
         Err(()) => return std::ptr::null_mut(),
     };
 
-    // 重新加锁提交：若期间发生过 stop（代际变化）则丢弃迟到的 endpoint；
-    // 若已有并发 startIroh 写入则返回其 id；否则写入自己的。
+    // Re-lock to commit: if a stop happened in between (generation changed), discard the late endpoint;
+    // if a concurrent startIroh already wrote one, return its id; otherwise write our own.
     let node_id = match ENDPOINT.lock() {
         Ok(mut guard) => {
             let gen_now = ENDPOINT_GEN.load(Ordering::Acquire);
             if gen_now != gen_before {
                 jni_log!("endpoint generation changed during bind, discarding late endpoint");
-                drop(ep); // 孤立 bind 的迟到结果：丢弃，不复活已释放的隧道
+                drop(ep); // Stray late result of an isolated bind: discard it; don't revive a released tunnel.
                 return std::ptr::null_mut();
             }
             if let Some(existing) = guard.as_ref() {
@@ -774,8 +783,9 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
         listen_port
     );
 
-    // 失败快速返回：无 endpoint 时拒绝继续。否则会落入「每节点独立 bind()」分支
-    // （connection_pool.rs，无超时、按后端数翻倍），重新引入卡死。
+    // Fail fast: refuse to continue when there is no endpoint. Otherwise we'd fall into the
+    // "one bind() per node" branch (connection_pool.rs, no timeout, scales with backend count) and
+    // reintroduce the hang.
     let ep = match get_endpoint() {
         Some(ep) => ep,
         None => {
@@ -861,7 +871,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
                 return Err("No nodes or domain mappings configured".to_string());
             }
 
-            // 2FA：把 Kotlin 注入的凭证下发给连接组，新建连接会先执行认证握手。
+            // 2FA: push the Kotlin-injected credentials to the connection group; new connections run the auth handshake first.
             if let Some(auth) = current_two_factor_auth() {
                 endpoint_group.set_two_factor(Some(auth)).await;
             }
@@ -891,7 +901,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
                 }
             };
 
-            // clone 一份给后台任务，原始 proxy 留给 state。
+            // Clone one copy for the background task; keep the original proxy in state.
             let proxy_for_run = proxy.clone();
             let join_handle = runtime.spawn(async move {
                 let proxy_run = match panic::catch_unwind(panic::AssertUnwindSafe(|| async move {
@@ -909,7 +919,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
                 }
             });
 
-            // 写回 state：重新加锁并校验未被并发 stop 清空，存入 JoinHandle 供确定式回收。
+            // Write back to state: re-lock and verify it wasn't cleared by a concurrent stop, then store the JoinHandle for deterministic cleanup.
             {
                 let mut guard = match state.lock() {
                     Ok(g) => g,
@@ -922,7 +932,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
                     jni_log!(
                         "[DEBUG:jni] State already has a proxy (concurrent start/stop), aborting"
                     );
-                    // 中止刚启动的任务，避免泄漏
+                    // Abort the just-started task to avoid leaking it.
                     join_handle.abort();
                     return Err("Proxy already running".to_string());
                 }
@@ -1102,7 +1112,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxyLegacy(
                     }
                 }
 
-                // 2FA：把 Kotlin 注入的凭证下发到连接池，新建连接会先执行认证握手。
+                // 2FA: push the Kotlin-injected credentials to the connection pool; new connections run the auth handshake first.
                 if let Some(auth) = current_two_factor_auth() {
                     pool.set_two_factor(Some(auth)).await;
                 }
@@ -1165,9 +1175,10 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStopProxy(
 ) -> jint {
     jni_log!("[DEBUG:jni] nativeStopProxy called (proxy-only, keeping iroh endpoint)");
 
-    // 注意：本函数只停止 local_proxy / endpoint_group / conn_pool / proxy_task，
-    // 不触碰全局 ENDPOINT。这样 startProxyWithRetries 在重绑端口前调用它时，
-    // 不会破坏 ensureIrohStarted 已建立的 endpoint。全量释放（含 endpoint）请用 nativeDestroy。
+    // Note: this function only stops local_proxy / endpoint_group / conn_pool / proxy_task,
+    // and does not touch the global ENDPOINT. This way startProxyWithRetries can call it before
+    // rebinding the port without tearing down the endpoint that ensureIrohStarted already built.
+    // For a full teardown (including the endpoint), use nativeDestroy.
     let state = match get_state() {
         Some(s) => s,
         None => {
@@ -1176,9 +1187,10 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStopProxy(
         }
     };
 
-    // Phase 1.5：先停 TUN 代理（必须在 endpoint_group.close_all() 之前）。
-    // TUN 代理的 TCP 连接任务持有 Arc<EndpointGroup> 的克隆，若先 close_all 会导致
-    // 任务访问已关闭的连接池。shutdown() abort + 等待任务结束，确保 fd 被关闭。
+    // Phase 1.5: stop the TUN proxy first (must happen before endpoint_group.close_all()).
+    // The TUN proxy's TCP connection tasks hold an Arc<EndpointGroup> clone; closing first would
+    // make them access an already-closed connection pool. shutdown() aborts and waits for the
+    // tasks to finish, ensuring the fd is closed.
     #[cfg(all(feature = "tun-proxy", target_os = "android"))]
     {
         let tun_proxy = {
@@ -1196,14 +1208,14 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStopProxy(
                 tp.shutdown(r);
                 jni_log!("[DEBUG:jni] TUN proxy shutdown complete");
             } else {
-                // 无 runtime — 仅 abort，Drop 会调 stop()
-                jni_log!("[DEBUG:jni] No runtime, aborting TUN proxy without join");
+            // No runtime — just abort; Drop will call stop().
+            jni_log!("[DEBUG:jni] No runtime, aborting TUN proxy without join");
             }
             // tp dropped here (if not consumed by shutdown)
         }
     }
 
-    // Phase 2：锁 state，把资源 take 出来（字段置 None），立即 drop guard，再进入任何 block_on。
+    // Phase 2: lock state, take the resources out (fields set to None), drop the guard immediately, then enter any block_on.
     let (local_proxy, endpoint_group, conn_pool, proxy_task) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
@@ -1225,17 +1237,17 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStopProxy(
             guard.conn_pool.take(),
             guard.proxy_task.take(),
         )
-    }; // guard dropped here —— 不再持有 state 锁
+    }; // guard dropped here -- no longer holding the state lock.
 
     let runtime = get_runtime();
 
-    // Phase 3a：通知 proxy.run() 退出（AtomicBool）。
+    // Phase 3a: signal proxy.run() to exit (AtomicBool).
     if let Some(proxy) = local_proxy.as_ref() {
         proxy.stop();
         jni_log!("[DEBUG:jni] LocalProxy stopped");
     }
 
-    // Phase 3b：abort + await 后台任务，确定式释放监听端口（不再依赖 100ms 轮询）。
+    // Phase 3b: abort + await the background task for a deterministic port release (no longer relying on 100ms polling).
     if let Some(handle) = proxy_task {
         handle.abort();
         if let Some(r) = runtime {
@@ -1246,7 +1258,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStopProxy(
         jni_log!("[DEBUG:jni] Proxy task joined/aborted");
     }
 
-    // Phase 3c：关闭 endpoint group / pool，各自带超时，且不持 state 锁。
+    // Phase 3c: close the endpoint group / pool, each with its own timeout, without holding the state lock.
     if let Some(r) = runtime {
         if let Some(group) = endpoint_group.as_ref() {
             let _ = r.block_on(async {
@@ -1516,8 +1528,9 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDestroy(
     _class: JClass,
 ) -> jint {
     jni_log!("[DEBUG:jni] nativeDestroy called (full teardown: endpoint + proxy)");
-    // Phase 1：短暂锁 ENDPOINT，代际自增并取出 endpoint，使下次 nativeStartIroh 重建。
-    // nativeStartIroh 的 bind() 不持 ENDPOINT 锁，故此处不会因 startIroh 卡死而死锁。
+    // Phase 1: briefly lock ENDPOINT, bump the generation and take the endpoint out so the next
+    // nativeStartIroh rebuilds it. nativeStartIroh's bind() doesn't hold the ENDPOINT lock, so this
+    // won't deadlock against startIroh.
     let endpoint = {
         if let Ok(mut guard) = ENDPOINT.lock() {
             ENDPOINT_GEN.fetch_add(1, Ordering::AcqRel);
@@ -1532,11 +1545,11 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDestroy(
             None
         }
     };
-    // Phase 2+3：停止本地代理 / endpoint_group / conn_pool / proxy_task（不触碰 ENDPOINT）。
+    // Phase 2+3: stop the local proxy / endpoint_group / conn_pool / proxy_task (without touching ENDPOINT).
     let result = Java_com_nexa_pipe_IrohProxy_nativeStopProxy(_env, _class);
 
-    // Phase 4：显式关闭 endpoint。conn_pool.close_all() 现在只关闭池自建的
-    // endpoint（new()），共享的全局 endpoint 由这里负责关闭。
+    // Phase 4: explicitly close the endpoint. conn_pool.close_all() now only closes the pool's own
+    // endpoint (new()); the shared global endpoint is closed here.
     if let Some(ep) = endpoint {
         if let Some(r) = get_runtime() {
             let _ = r.block_on(async {
@@ -1549,19 +1562,19 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDestroy(
 }
 
 // ============================================================
-// TUN 代理（smoltcp 用户态 TCP/IP 栈）— 仅 Android tun-proxy feature
+// TUN proxy (smoltcp user-space TCP/IP stack) — Android tun-proxy feature only
 // ============================================================
 
-/// 启动 TUN 代理：用 smoltcp 在 Rust 侧处理 TUN fd 的 TCP/UDP 流量。
+/// Start the TUN proxy: process the TUN fd's TCP/UDP traffic on the Rust side with smoltcp.
 ///
-/// 必须在 `nativeStartProxy` 之后（endpoint_group 已创建）、VPN 建立之后调用。
-/// Kotlin 侧通过 `ParcelFileDescriptor.detachFd()` 将 fd 所有权转移给 Rust。
+/// Must be called after `nativeStartProxy` (endpoint_group already created) and after the VPN is
+/// established. Kotlin transfers fd ownership to Rust via `ParcelFileDescriptor.detachFd()`.
 ///
-/// 参数：
-/// - `tun_fd`: TUN 文件描述符（detachFd 返回值）
-/// - `proxy_domains`: 逗号分隔的代理域名列表
+/// Arguments:
+/// - `tun_fd`: the TUN file descriptor (return value of detachFd)
+/// - `proxy_domains`: comma-separated list of proxied domains
 ///
-/// 返回 0 成功，-1 失败。
+/// Returns 0 on success, -1 on failure.
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartTunProxy(
@@ -1576,7 +1589,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartTunProxy(
         return -1;
     }
 
-    // 解析代理域名（逗号分隔）
+    // Parse the proxied domains (comma-separated).
     let proxy_domains_str = match env.get_string(&proxy_domains) {
         Ok(s) => match s.to_str() {
             Ok(s) => s.to_string(),
@@ -1618,7 +1631,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartTunProxy(
         }
     };
 
-    // 从 ProxyState 克隆 endpoint_group（nativeStartProxy 已创建）
+    // Clone the endpoint_group from ProxyState (created by nativeStartProxy).
     let endpoint_group = {
         let guard = match state.lock() {
             Ok(g) => g,
@@ -1636,7 +1649,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartTunProxy(
         }
     };
 
-    // 读取系统 DNS 服务器列表（nativeSetDnsServers 已设置）
+    // Read the system DNS server list (set by nativeSetDnsServers).
     let custom_dns_servers = match CUSTOM_DNS_SERVERS.lock() {
         Ok(guard) => guard.clone(),
         Err(_) => {
@@ -1645,7 +1658,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartTunProxy(
         }
     };
 
-    // 检查是否已有 tun_proxy 在运行
+    // Check whether a tun_proxy is already running.
     {
         let guard = match state.lock() {
             Ok(g) => g,
@@ -1661,7 +1674,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartTunProxy(
         }
     }
 
-    // 进入 runtime 上下文（TunProxy::new 内部用 tokio::spawn 启动任务）
+    // Enter the runtime context (TunProxy::new spawns tasks via tokio::spawn internally).
     let _enter_guard = runtime.enter();
 
     let tun_proxy = match TunProxy::new(
@@ -1677,7 +1690,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartTunProxy(
         }
     };
 
-    // 存入 ProxyState
+    // Store it in ProxyState.
     {
         let mut guard = match state.lock() {
             Ok(g) => g,
@@ -1694,10 +1707,10 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartTunProxy(
     0
 }
 
-/// 停止 TUN 代理：abort 所有后台任务，关闭 dup 的 fd。
+/// Stop the TUN proxy: abort all background tasks and close the dup'd fd.
 ///
-/// 由 `NexaVpnService.stopVPN()` 在关闭 TUN fd 之前调用。
-/// `nativeDestroy` 也会通过 `nativeStopProxy` 间接调用（Phase 1.5）。
+/// Called by `NexaVpnService.stopVPN()` before closing the TUN fd.
+/// `nativeDestroy` also reaches it indirectly via `nativeStopProxy` (Phase 1.5).
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStopTunProxy(

@@ -8,8 +8,9 @@ pub mod lb;
 #[cfg(feature = "local-proxy")]
 pub mod local_proxy;
 
-// TUN 代理：用 smoltcp 在 Rust 侧实现用户态 TCP/IP 栈，替代 Kotlin 手写 TCP 栈。
-// 仅 Android 使用（依赖 tokio::io::unix::AsyncFd，Unix-only）。
+// TUN proxy: implements a userspace TCP/IP stack in Rust with smoltcp, replacing the
+// hand-written Kotlin TCP stack.
+// Android only (relies on tokio::io::unix::AsyncFd, which is Unix-only).
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
 pub mod tun_proxy;
 
