@@ -36,7 +36,15 @@ pub async fn run_local_proxy(
             nodes.len()
         );
 
-        let ep = Endpoint::builder(presets::N0).bind().await?;
+        // Same transport tuning as the server side: leaving the default 1.25 MB per-stream
+        // window would cap every proxied connection at ~50 Mbps on a 200 ms path.
+        let transport_tuning = nexapipe_client::transport::TransportTuning::from_env();
+        tracing::info!("QUIC transport tuning: {}", transport_tuning.describe());
+
+        let ep = Endpoint::builder(presets::N0)
+            .transport_config(transport_tuning.transport_config())
+            .bind()
+            .await?;
         tracing::info!("Shared iroh endpoint created, client node ID: {}", ep.id());
 
         let node_configs: Vec<NodeConfig> = nodes

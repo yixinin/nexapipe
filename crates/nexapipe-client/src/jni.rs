@@ -142,10 +142,29 @@ pub(crate) fn android_log(_level: log::Level, msg: &str) {
 }
 
 #[cfg(feature = "jni")]
+#[inline]
+pub fn debug_log_enabled() -> bool {
+    log::log_enabled!(log::Level::Debug)
+}
+
+#[cfg(feature = "jni")]
+#[inline]
+pub fn debug_log(msg: &str) {
+    android_log(log::Level::Debug, msg);
+}
+
+/// Debug log that is a no-op when the `log` level filter is below `Debug`.
+///
+/// The guard matters: without it every call site formatted its arguments into a `String`
+/// before the level was ever consulted, so the proxy paid a heap allocation per packet even
+/// with logging disabled.
+#[cfg(feature = "jni")]
 #[macro_export]
 macro_rules! jni_log {
     ($($arg:tt)*) => {
-        $crate::jni::android_log(log::Level::Debug, &format!($($arg)*))
+        if $crate::jni::debug_log_enabled() {
+            $crate::jni::debug_log(&format!($($arg)*))
+        }
     };
 }
 
@@ -313,11 +332,23 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeInit(
         jni_log!("RUST PANIC: {}{}", msg, location);
     }));
 
+    // Four workers left two cores idle on every modern phone and made the TUN pump,
+    // the QUIC driver and the smoltcp runner compete for the same threads. Scale with the
+    // device instead, but keep a floor (4) and a ceiling (8) so a 16-core phone does not
+    // spread the data path across enough threads to hurt cache locality.
+    let worker_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(4, 8);
     let rt = Builder::new_multi_thread()
         .thread_name("nexapipe-worker")
-        .worker_threads(4)
+        .worker_threads(worker_threads)
         .enable_all()
         .build();
+    jni_log!(
+        "[DEBUG:jni] tokio runtime worker_threads={}",
+        worker_threads
+    );
 
     match rt {
         Ok(rt) => {
@@ -682,7 +713,14 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartIroh(
         );
         let override_resolver = OverrideResolver::new(custom_dns.clone(), dns_overrides);
         let dns_resolver = DnsResolver::custom(override_resolver);
-        let builder = builder.dns_resolver(dns_resolver);
+        // One inner TCP connection == one QUIC bi-stream, so the per-stream receive window is
+        // the throughput ceiling of every proxied connection. iroh's 1.25 MB default caps a
+        // 200 ms path at roughly 50 Mbps; see crate::transport for the full rationale.
+        let (transport, tuning) = crate::transport::transport_config_with_tuning();
+        jni_log!("[DEBUG:jni] QUIC transport tuning: {}", tuning.describe());
+        let builder = builder
+            .dns_resolver(dns_resolver)
+            .transport_config(transport);
 
         match tokio::time::timeout(IROH_BIND_TIMEOUT, builder.bind()).await {
             Ok(Ok(ep)) => Ok(ep),

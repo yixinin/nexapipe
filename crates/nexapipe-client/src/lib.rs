@@ -4,6 +4,7 @@ pub mod endpoint_group;
 pub mod error;
 pub mod http;
 pub mod lb;
+pub mod transport;
 
 #[cfg(feature = "local-proxy")]
 pub mod local_proxy;
@@ -26,6 +27,7 @@ pub use endpoint_group::{EndpointGroup, NodeConfig, DomainMapping, PooledConnect
 pub use error::ClientError;
 pub use http::{HttpRequest, HttpResponse};
 pub use lb::LoadBalancingStrategy;
+pub use transport::{TransportTuning, transport_config, transport_config_with_tuning};
 
 #[cfg(feature = "local-proxy")]
 pub use local_proxy::LocalProxy;

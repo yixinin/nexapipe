@@ -92,6 +92,13 @@ pub async fn run_proxy(
         }
     }
 
+    // QUIC transport tuning: one inner TCP connection maps to one QUIC bi-stream, so the
+    // per-stream receive window sets the throughput ceiling of every proxied connection.
+    // See nexapipe_client::transport for the numbers and the override variables.
+    let transport_tuning = nexapipe_client::transport::TransportTuning::from_env();
+    tracing::info!("QUIC transport tuning: {}", transport_tuning.describe());
+    let builder = builder.transport_config(transport_tuning.transport_config());
+
     let ep = builder.bind().await?;
 
     let node_id = ep.id();

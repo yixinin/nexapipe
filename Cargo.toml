@@ -18,7 +18,9 @@ smoltcp = { path = "third_party/smoltcp" }
 
 [profile.release]
 panic = "unwind"
-opt-level = "s"
+# "s" put smoltcp's packet path, the QUIC AEAD and rustls under size optimisation.
+# 3 is the single cheapest throughput win available here.
+opt-level = 3
 codegen-units = 1
 lto = true
 debug = "none"

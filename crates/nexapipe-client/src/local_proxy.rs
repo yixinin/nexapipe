@@ -19,6 +19,24 @@ macro_rules! jni_log {
     ($($arg:tt)*) => {};
 }
 
+/// Gate for the debug-only WebSocket frame dumps.
+///
+/// `jni_log!` already skips formatting when `Debug` logging is off, but that only helps if the
+/// arguments are cheap. Building a frame preview is not: it hex-escapes up to 256 bytes with
+/// one `format!` allocation per non-printable byte, and it used to run on **every** WebSocket
+/// chunk in both directions regardless of the log level.
+#[cfg(feature = "jni")]
+#[inline]
+fn debug_log_enabled() -> bool {
+    crate::jni::debug_log_enabled()
+}
+
+#[cfg(not(feature = "jni"))]
+#[inline]
+fn debug_log_enabled() -> bool {
+    false
+}
+
 const STREAM_BUF_SIZE: usize = 128 * 1024;
 const STREAM_OPERATION_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 /// Number of attempts for opening a fresh iroh bi-stream for a new request.
@@ -149,6 +167,9 @@ impl LocalProxy {
     }
 }
 
+// Only referenced from the `debug_log_enabled()`-gated WebSocket dumps; in non-JNI builds
+// that guard is a constant `false`, so the lint sees no live caller.
+#[allow(dead_code)]
 fn websocket_frame_preview(data: &[u8]) -> String {
     let mut preview = String::new();
     for &b in data.iter().take(256) {
@@ -620,10 +641,12 @@ where
                                             String::from_utf8_lossy(p)
                                         );
                                     }
-                                    jni_log!(
-                                        "[DEBUG:local-proxy] WS iroh->client: {}",
-                                        websocket_frame_preview(&buf[..n])
-                                    );
+                                    if debug_log_enabled() {
+                                        jni_log!(
+                                            "[DEBUG:local-proxy] WS iroh->client: {}",
+                                            websocket_frame_preview(&buf[..n])
+                                        );
+                                    }
                                     if n <= 1024 {
                                         jni_log!(
                                             "[DEBUG:local-proxy] WS iroh->client decoded: {}",

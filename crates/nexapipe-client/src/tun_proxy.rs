@@ -51,7 +51,16 @@ use tokio::task::JoinHandle;
 const VIRTUAL_DNS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 2);
 const VIRTUAL_PROXY_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 3);
 
-const TUN_MTU: usize = 1500;
+/// Inner MTU for both the TUN device (see `Builder.setMtu` in NexaVpnService.kt) and the
+/// smoltcp stack. These two must agree.
+///
+/// Not 1500: an inner IP packet of 1500 bytes does not fit in one QUIC datagram. iroh's MTU
+/// discovery tops out around a 1452-byte UDP payload, and the QUIC short header plus the
+/// AEAD tag eat ~17 more bytes, leaving ~1435 for stream data. A 1500-byte inner packet
+/// therefore had to be fragmented across two datagrams, roughly doubling the datagram count
+/// and the number of AEAD operations per megabyte. 1400 leaves ~35 bytes of headroom and
+/// keeps one inner segment == one QUIC datagram.
+const TUN_MTU: usize = 1400;
 const DNS_FORWARD_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// TUN proxy: manages the smoltcp stack and all background pump/acceptor tasks.

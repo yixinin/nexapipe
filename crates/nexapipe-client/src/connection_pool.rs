@@ -59,7 +59,11 @@ struct IrohConnectionPoolInner {
 
 impl IrohConnectionPool {
     pub async fn new(endpoint_addr: EndpointAddr) -> Result<Self, crate::error::ClientError> {
+        let (transport, tuning) = crate::transport::transport_config_with_tuning();
+        #[cfg(feature = "tracing")]
+        tracing::info!("QUIC transport tuning: {}", tuning.describe());
         let ep = Endpoint::builder(presets::N0)
+            .transport_config(transport)
             .bind()
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
