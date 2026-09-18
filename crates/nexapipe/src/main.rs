@@ -1,10 +1,9 @@
 use clap::{Parser, ValueEnum};
 use iroh::SecretKey;
 use nexapipe::auth::AuthConfig;
-use nexapipe::config::{self, IrohConfig, LocalProxyConfig, ProxyConfig, RouteMode, ServerConfig};
-use nexapipe::config_watcher::ConfigWatcher;
+use nexapipe::config::{IrohConfig, LocalProxyConfig, ProxyConfig, ServerConfig};
 use nexapipe::proxy::{run_local_proxy, run_proxy};
-use nexapipe::routes::{L4Options, Route};
+use nexapipe::routes::RouteConfig;
 use nexapipe::shutdown::{ShutdownSignal, wait_for_shutdown_signal};
 use std::sync::Arc;
 
@@ -199,98 +198,30 @@ async fn run_server_mode(
     config_path: &str,
     shutdown_signal: &Arc<ShutdownSignal>,
 ) {
-    let config_watcher = Arc::new(ConfigWatcher::new(
-        config_path.to_string(),
-        proxy_config.clone(),
-    ));
-
-    tokio::spawn({
-        let config_watcher_clone = config_watcher.clone();
-        async move {
-            if let Err(e) = config_watcher_clone.start_watch().await {
-                tracing::error!("Config watcher failed: {}", e);
-            }
-        }
-    });
-    tracing::info!("Config watcher started, monitoring: {}", config_path);
-
     let server_config: Option<ServerConfig> = proxy_config.server.clone();
     let iroh_config: Option<IrohConfig> = proxy_config.iroh.clone();
 
-    let mut routes = Vec::new();
-
-    // Optional: without it an unrouted `Host` is answered 404 instead of being
-    // forwarded somewhere arbitrary.
-    if let Some(default_backend) = &proxy_config.default_backend
-        && let Err(e) = config::validate_backend("default_backend", RouteMode::Http, default_backend)
-    {
-        tracing::error!("{}", e);
-        std::process::exit(1);
-    }
-
-    if let Some(route_configs) = proxy_config.routes.clone() {
-        for route_config in route_configs {
-            let strategy = config::get_strategy(&route_config.strategy);
-            let mode = config::get_route_mode(&route_config.mode);
-            let path_is_prefix = route_config.path_is_prefix.unwrap_or(true);
-            let backends_count = route_config.backends.len();
-            let host_pattern = route_config.host_pattern.clone();
-            let path_pattern = route_config.path_pattern.clone();
-            let label = format!("route {host_pattern}");
-
-            for backend in &route_config.backends {
-                if let Err(e) = config::validate_backend(&label, mode, backend) {
-                    tracing::error!("{}", e);
-                    std::process::exit(1);
-                }
-            }
-
-            // Only meaningful for `tcp` / `udp`, where they are harmless defaults
-            // otherwise; the other modes never read them.
-            let l4_options = L4Options {
-                client_ports: route_config.client_ports.clone(),
-                idle_timeout: route_config
-                    .idle_timeout_secs
-                    .map(std::time::Duration::from_secs),
-            };
-            let client_ports = route_config.client_ports.clone();
-            let idle_timeout_secs = route_config.idle_timeout_secs;
-
-            routes.push(
-                Route::new(
-                    &host_pattern,
-                    &path_pattern,
-                    path_is_prefix,
-                    route_config.backends,
-                    strategy,
-                    mode,
-                    route_config.path_rewrite,
-                )
-                .with_l4_options(l4_options),
-            );
-
-            tracing::info!(
-                "Loaded route: host={}, path={} (prefix={}), mode={:?}, backends={}, strategy={:?}",
-                host_pattern,
-                path_pattern,
-                path_is_prefix,
-                mode,
-                backends_count,
-                strategy
-            );
-
-            if mode.is_l4() {
-                // Worth spelling out: `client_ports` changes which flows match, and a
-                // reader who assumed "the port is what gets dialled" would be wrong.
-                tracing::info!(
-                    "  L4 route {}: client_ports={:?} (absent = every port matches; the port never \
-                     decides where the connection goes), idle_timeout_secs={:?}",
-                    host_pattern,
-                    client_ports,
-                    idle_timeout_secs
-                );
-            }
+    // Same builder the config watcher calls on a reload: a route that works
+    // after a restart must work without one too. A bad config is fatal here,
+    // where nothing is serving yet — on a reload it only keeps the old routes.
+    let routes = match proxy_config.build_routes() {
+        Ok(routes) => routes,
+        Err(e) => {
+            tracing::error!("{}", e);
+            std::process::exit(1);
         }
+    };
+
+    let route_config = Arc::new(RouteConfig::new(
+        routes,
+        proxy_config.default_backend.clone(),
+    ));
+
+    match &proxy_config.default_backend {
+        Some(url) => tracing::info!("Default backend: {}", url),
+        // Optional now: an unrouted host is answered 404 rather than forwarded
+        // somewhere arbitrary. See ProxyConfig::default_backend.
+        None => tracing::info!("No default backend: an unrouted host is answered with 404"),
     }
 
     tracing::info!("Starting proxy with domain-based and path-based routing");
@@ -312,10 +243,10 @@ async fn run_server_mode(
         }
     };
     if let Err(e) = run_proxy(
-        routes,
-        proxy_config.default_backend.clone(),
+        route_config,
         server_config,
         iroh_config,
+        config_path,
         shutdown_signal.clone(),
         auth_config,
     )

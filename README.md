@@ -155,6 +155,13 @@ running on the Docker host are reachable.
 `config.toml` is the single source of truth for both the server and the client
 mode. Every key is optional.
 
+The file is re-read every 5 seconds and **applied live**: `[[routes]]` and
+`default_backend` take effect without a restart, and a config that fails to
+parse or validate is reported and ignored so a half-saved edit cannot take the
+proxy down. The rest still needs a restart, because it is read once when the
+process starts: `[server] listen_addr`, `[iroh] secret_key` / `bind_port` /
+relay settings, `[auth]` and `[log]`.
+
 ### Top level
 
 ```toml

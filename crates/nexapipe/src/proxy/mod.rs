@@ -2,12 +2,13 @@ pub mod local_proxy;
 
 use crate::auth::AuthConfig;
 use crate::config::{IrohConfig, LocalProxyConfig, RouteMode, ServerConfig};
+use crate::config_watcher::ConfigWatcher;
 use crate::conn;
 use crate::health::HealthChecker;
 use crate::http;
 use crate::log;
 use crate::passthrough;
-use crate::routes::{Route, RouteConfig};
+use crate::routes::RouteConfig;
 use crate::shutdown::ShutdownSignal;
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::client::legacy;
@@ -22,7 +23,66 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-type HttpClient = legacy::Client<legacy::connect::HttpConnector, http_body_util::Full<bytes::Bytes>>;
+/// Shared by the startup path and the config watcher, which spawns checkers for
+/// routes that appear in a reload.
+pub type HttpClient = legacy::Client<legacy::connect::HttpConnector, http_body_util::Full<bytes::Bytes>>;
+
+/// One background `GET /health` probe per `http` route.
+///
+/// Called again after a reload, so it only starts checkers for routes it has not
+/// seen before: a probe runs until the process ends, and re-starting one per
+/// reload would pile up tasks that all poke the same backend. The trade-off is
+/// that a route deleted from the config keeps being probed — harmless, because
+/// its pool is no longer reachable from the routing table, but it does keep
+/// logging if that backend really is gone.
+pub async fn spawn_health_checks(
+    config: &Arc<RouteConfig>,
+    http_client: &Arc<HttpClient>,
+    seen: &tokio::sync::Mutex<std::collections::HashSet<String>>,
+) {
+    let mut seen = seen.lock().await;
+
+    for route in config.routes().await {
+        // Only an http:// backend answers `GET /health`. A passthrough backend is
+        // a TLS listener and an L4 backend is whatever the route points at — a
+        // database, a TURN server, an SSH daemon. Probing either would fail, mark
+        // the backend down, and the pool would then quietly fall back to its first
+        // entry. There is nothing to probe without speaking the protocol, so the
+        // pool is left alone; a dead backend shows up as a connect error when a
+        // flow arrives.
+        if route.mode() != RouteMode::Http {
+            tracing::info!(
+                "Route {}: mode={:?}, skipping the HTTP health check",
+                route.host_pattern(),
+                route.mode()
+            );
+            continue;
+        }
+
+        let key = format!(
+            "{}|{:?}",
+            route.host_pattern(),
+            route.backend_pool().backends().await
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+
+        let backend_pool = route.backend_pool().clone();
+        let http_client_clone = http_client.clone();
+        let health_checker = HealthChecker::new(
+            backend_pool,
+            http_client_clone,
+            tokio::time::Duration::from_secs(10),
+            tokio::time::Duration::from_secs(5),
+            3,
+            "/health",
+        );
+        tokio::spawn(async move {
+            health_checker.run().await;
+        });
+    }
+}
 
 /// How long the plaintext listener waits for a first byte before handing the
 /// connection to the HTTP server. Long enough for a TLS `ClientHello` to
@@ -30,19 +90,33 @@ type HttpClient = legacy::Client<legacy::connect::HttpConnector, http_body_util:
 const FIRST_BYTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub async fn run_proxy(
-    routes: Vec<Route>,
-    default_backend: Option<String>,
+    config: Arc<RouteConfig>,
     server_config: Option<ServerConfig>,
     iroh_config: Option<IrohConfig>,
+    config_path: &str,
     shutdown_signal: Arc<ShutdownSignal>,
     auth_config: Option<AuthConfig>,
 ) -> anyhow::Result<()> {
-    let config = Arc::new(RouteConfig::new(routes, default_backend.clone()));
-    match &default_backend {
-        Some(url) => tracing::info!("Default backend: {}", url),
-        None => tracing::info!("No default backend: an unrouted host is answered with 404"),
-    }
     let http_client = Arc::new(http::create_http_client());
+
+    let health_seen = Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+    spawn_health_checks(&config, &http_client, &health_seen).await;
+
+    // The watcher needs both to apply a reload: it rebuilds the routes and
+    // restarts whatever health checks the new routes need.
+    let config_watcher = Arc::new(ConfigWatcher::new(
+        config_path.to_string(),
+        config.clone(),
+        http_client.clone(),
+        health_seen,
+    ));
+    tokio::spawn({
+        let config_watcher_clone = config_watcher.clone();
+        async move {
+            config_watcher_clone.start_watch().await;
+        }
+    });
+    tracing::info!("Config watcher started, monitoring: {}", config_path);
 
     // Wrap auth config in Arc<RwLock> for shared access
     let auth_config = auth_config.map(|cfg| Arc::new(tokio::sync::RwLock::new(cfg)));
@@ -165,37 +239,6 @@ pub async fn run_proxy(
             tracing::error!("HTTP server failed: {}", e);
         }
     });
-
-    for route in config.routes().await.into_iter() {
-        // Only an http:// backend answers `GET /health`. A passthrough backend is a
-        // TLS listener and an L4 backend is whatever the route points at — a database,
-        // a TURN server, an SSH daemon. Probing either would fail, mark the backend
-        // down, and the pool would then quietly fall back to its first entry. There is
-        // nothing to probe without speaking the protocol, so the pool is left alone; a
-        // dead backend shows up as a connect error when a flow arrives.
-        if route.mode() != RouteMode::Http {
-            tracing::info!(
-                "Route {}: mode={:?}, skipping the HTTP health check",
-                route.host_pattern(),
-                route.mode()
-            );
-            continue;
-        }
-
-        let backend_pool = route.backend_pool().clone();
-        let http_client_clone = http_client.clone();
-        let health_checker = HealthChecker::new(
-            backend_pool,
-            http_client_clone,
-            tokio::time::Duration::from_secs(10),
-            tokio::time::Duration::from_secs(5),
-            3,
-            "/health",
-        );
-        tokio::spawn(async move {
-            health_checker.run().await;
-        });
-    }
 
     loop {
         tokio::select! {

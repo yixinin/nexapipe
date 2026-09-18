@@ -328,6 +328,12 @@ impl RouteConfig {
 
     pub async fn update_default_backend(&self, new_default: Option<String>) {
         let mut default_backend = self.default_backend.write().await;
+        // A reload rewrites the whole table, so most of them change nothing:
+        // only announce an actual change, or every save of the file would claim
+        // to have removed a default that was never there.
+        if *default_backend == new_default {
+            return;
+        }
         match &new_default {
             Some(url) => tracing::info!("Default backend updated to: {}", url),
             None => tracing::info!("Default backend removed: unrouted hosts now get 404"),

@@ -1,3 +1,4 @@
+use crate::routes::{L4Options, Route};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -238,6 +239,85 @@ impl ProxyConfig {
 }
 
 impl ProxyConfig {
+    /// Turns the `[[routes]]` table into the objects the proxy actually routes
+    /// with, rejecting anything that cannot work.
+    ///
+    /// Shared by the startup path and the config watcher: a reload has to build
+    /// routes exactly the way a cold start does, or an edit would behave
+    /// differently depending on when it was made. An error here is not fatal for
+    /// a reload — the caller keeps the routes it already has.
+    pub fn build_routes(&self) -> anyhow::Result<Vec<Route>> {
+        if let Some(default_backend) = &self.default_backend {
+            validate_backend("default_backend", RouteMode::Http, default_backend)?;
+        }
+
+        let mut routes = Vec::new();
+
+        for route_config in self.routes.iter().flatten() {
+            let strategy = get_strategy(&route_config.strategy);
+            let mode = get_route_mode(&route_config.mode);
+            let path_is_prefix = route_config.path_is_prefix.unwrap_or(true);
+            let backends_count = route_config.backends.len();
+            let host_pattern = route_config.host_pattern.clone();
+            let path_pattern = route_config.path_pattern.clone();
+            let label = format!("route {host_pattern}");
+
+            for backend in &route_config.backends {
+                validate_backend(&label, mode, backend)?;
+            }
+
+            // Only meaningful for `tcp` / `udp`, where they are harmless defaults
+            // otherwise; the other modes never read them.
+            let l4_options = L4Options {
+                client_ports: route_config.client_ports.clone(),
+                idle_timeout: route_config
+                    .idle_timeout_secs
+                    .map(std::time::Duration::from_secs),
+            };
+            let client_ports = route_config.client_ports.clone();
+            let idle_timeout_secs = route_config.idle_timeout_secs;
+
+            routes.push(
+                Route::new(
+                    &host_pattern,
+                    &path_pattern,
+                    path_is_prefix,
+                    route_config.backends.clone(),
+                    strategy,
+                    mode,
+                    route_config.path_rewrite.clone(),
+                )
+                .with_l4_options(l4_options),
+            );
+
+            tracing::info!(
+                "Loaded route: host={}, path={} (prefix={}), mode={:?}, backends={}, strategy={:?}",
+                host_pattern,
+                path_pattern,
+                path_is_prefix,
+                mode,
+                backends_count,
+                strategy
+            );
+
+            if mode.is_l4() {
+                // Worth spelling out: `client_ports` changes which flows match, and a
+                // reader who assumed "the port is what gets dialled" would be wrong.
+                tracing::info!(
+                    "  L4 route {}: client_ports={:?} (absent = every port matches; the port never \
+                     decides where the connection goes), idle_timeout_secs={:?}",
+                    host_pattern,
+                    client_ports,
+                    idle_timeout_secs
+                );
+            }
+        }
+
+        Ok(routes)
+    }
+}
+
+impl ProxyConfig {
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
         let path = Path::new(path);
         tracing::debug!("Loading config from: {}", path.display());
@@ -470,6 +550,64 @@ mod tests {
 
     fn parse(source: &str) -> ProxyConfig {
         toml::from_str(source).expect("config should parse")
+    }
+
+    /// `build_routes` is what both a cold start and a config reload use, so a
+    /// route that would work after a restart must also work without one — and a
+    /// broken one must be *reported*, not silently dropped.
+    #[test]
+    fn build_routes_is_what_a_restart_would_have_built() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "fn.iakl.top"
+mode = "passthrough"
+backends = ["host.docker.internal:8443"]
+
+[[routes]]
+host_pattern = "fn.iakl.top"
+mode = "tcp"
+backends = ["host.docker.internal:8443"]
+client_ports = [443]
+
+[[routes]]
+host_pattern = "mt.iroh.iakl.top"
+backends = ["http://10.0.0.5:8080"]
+"#,
+        );
+
+        let routes = config.build_routes().expect("the config is valid");
+        assert_eq!(routes.len(), 3);
+
+        // The two entries for one host do not collapse into each other: same
+        // host, different mode, and the L4 one kept its port selector.
+        assert_eq!(routes[0].mode(), RouteMode::Passthrough);
+        assert_eq!(routes[1].mode(), RouteMode::Tcp);
+        assert!(routes[1].matches_l4("fn.iakl.top", 443));
+        assert!(!routes[1].matches_l4("fn.iakl.top", 8443));
+        assert_eq!(routes[2].mode(), RouteMode::Http);
+
+        // No `default_backend` at all: the key is optional and building routes
+        // must not require one.
+        assert!(config.default_backend.is_none());
+    }
+
+    #[test]
+    fn build_routes_rejects_a_backend_that_cannot_work() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "fn.iakl.top"
+mode = "http"
+backends = ["https://caddy:443"]
+"#,
+        );
+
+        let error = config.build_routes().unwrap_err().to_string();
+        assert!(
+            error.contains("https://"),
+            "the message has to name the offending backend, got: {error}"
+        );
     }
 
     #[test]
