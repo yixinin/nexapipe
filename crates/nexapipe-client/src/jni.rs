@@ -101,6 +101,12 @@ static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 /// next port would fail identically, and [`LAST_ERROR`] holds a message meant for the user.
 const RESULT_CONFIG_ERROR: jint = -2;
 
+/// Reported when a backend accepted the connection and then refused it because
+/// this client never performed the 2FA handshake. The credentials are missing
+/// here, not on the server, so the message has to say where to add them.
+const AUTH_REQUIRED_MESSAGE: &str =
+    "the server requires 2FA, but this client has no 2FA credentials configured";
+
 fn set_last_error(message: impl Into<String>) {
     if let Ok(mut guard) = LAST_ERROR.lock() {
         *guard = Some(message.into());
@@ -1196,8 +1202,19 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativePreconnect(
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         runtime.block_on(async move {
-            match tokio::time::timeout(PRECONNECT_TIMEOUT, endpoint_group.preconnect_all()).await {
-                Ok(count) => count as jint,
+            match tokio::time::timeout(PRECONNECT_TIMEOUT, endpoint_group.preconnect_report()).await
+            {
+                Ok(report) => {
+                    // A backend that answered and then refused the connection
+                    // for missing 2FA is counted as unreachable, which on its
+                    // own reads like "server down". Say what actually happened:
+                    // the credentials are missing on this side.
+                    if report.any_auth_required() && !report.any_reachable() {
+                        jni_log!("[DEBUG:jni] nativePreconnect: backend requires 2FA");
+                        set_last_error(AUTH_REQUIRED_MESSAGE);
+                    }
+                    report.reachable.len() as jint
+                }
                 Err(_) => {
                     jni_log!("[DEBUG:jni] nativePreconnect timed out");
                     -1

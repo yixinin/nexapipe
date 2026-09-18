@@ -50,11 +50,13 @@ pub async fn spawn_health_checks(
         // entry. There is nothing to probe without speaking the protocol, so the
         // pool is left alone; a dead backend shows up as a connect error when a
         // flow arrives.
-        if route.mode() != RouteMode::Http {
+        // A route serving `http` *and* something else is still probed: the pool
+        // is shared, so its health is what the other modes dial into as well.
+        if !route.serves(RouteMode::Http) {
             tracing::info!(
-                "Route {}: mode={:?}, skipping the HTTP health check",
+                "Route {}: modes={:?}, skipping the HTTP health check",
                 route.host_pattern(),
-                route.mode()
+                route.modes()
             );
             continue;
         }

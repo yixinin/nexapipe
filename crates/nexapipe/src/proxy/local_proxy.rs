@@ -121,6 +121,17 @@ pub async fn run_local_proxy(
                  nor any [[local_proxy.nodes]] entry is set"
             );
         }
+        // A backend that answered and then closed for missing 2FA looks exactly
+        // like an unreachable one from here, so name the real cause: the fix is
+        // on this side of the connection, not on the server's.
+        if report.any_auth_required() {
+            anyhow::bail!(
+                "The server requires 2FA but this client has no credentials: {} accepted the \
+                 connection and then refused it. Set [local_proxy.two_factor] with the client id \
+                 and secret the server lists under [auth.clients].",
+                report.unreachable_ids()
+            );
+        }
         anyhow::bail!(
             "No backend is reachable: all {} configured node(s) failed to connect ({})",
             report.total(),

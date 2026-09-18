@@ -81,6 +81,13 @@ pub struct RouteConfig {
     pub backends: Vec<String>,
     /// `"http"` (default), `"passthrough"`, `"tcp"` or `"udp"`. See [`RouteMode`].
     pub mode: Option<String>,
+    /// Several modes at once, sharing this route's `backends` — the ordinary way
+    /// to write a host that answers both a request and a tunnel.
+    ///
+    /// `mode` and `modes` may be combined; the union is what the route serves.
+    /// Two entries instead of one is still the way to give the modes different
+    /// `backends`, since a route has exactly one pool.
+    pub modes: Option<Vec<String>>,
     pub path_rewrite: Option<String>,
     /// `tcp` / `udp` routes: the client ports this route accepts.
     ///
@@ -255,15 +262,22 @@ impl ProxyConfig {
 
         for route_config in self.routes.iter().flatten() {
             let strategy = get_strategy(&route_config.strategy);
-            let mode = get_route_mode(&route_config.mode);
+            let modes = get_route_modes(&route_config.mode, &route_config.modes);
             let path_is_prefix = route_config.path_is_prefix.unwrap_or(true);
             let backends_count = route_config.backends.len();
             let host_pattern = route_config.host_pattern.clone();
             let path_pattern = route_config.path_pattern.clone();
             let label = format!("route {host_pattern}");
 
+            // Every declared mode has to be able to dial these backends, so each
+            // one is checked: the `http` rules and the L4 rules disagree (a URL
+            // to fetch versus an address to dial, and only the L4 one insists on
+            // a port), and a route serving both has to satisfy both.
             for backend in &route_config.backends {
-                validate_backend(&label, mode, backend)?;
+                for mode in &modes {
+                    let label = format!("{label} (mode {mode:?})");
+                    validate_backend(&label, *mode, backend)?;
+                }
             }
 
             // Only meaningful for `tcp` / `udp`, where they are harmless defaults
@@ -284,23 +298,26 @@ impl ProxyConfig {
                     path_is_prefix,
                     route_config.backends.clone(),
                     strategy,
-                    mode,
+                    // The first mode only seeds the constructor; `with_modes`
+                    // then puts the whole set on the route.
+                    modes[0],
                     route_config.path_rewrite.clone(),
                 )
-                .with_l4_options(l4_options),
+                .with_l4_options(l4_options)
+                .with_modes(modes.clone()),
             );
 
             tracing::info!(
-                "Loaded route: host={}, path={} (prefix={}), mode={:?}, backends={}, strategy={:?}",
+                "Loaded route: host={}, path={} (prefix={}), modes={:?}, backends={}, strategy={:?}",
                 host_pattern,
                 path_pattern,
                 path_is_prefix,
-                mode,
+                modes,
                 backends_count,
                 strategy
             );
 
-            if mode.is_l4() {
+            if modes.iter().any(|mode| mode.is_l4()) {
                 // Worth spelling out: `client_ports` changes which flows match, and a
                 // reader who assumed "the port is what gets dialled" would be wrong.
                 tracing::info!(
@@ -351,14 +368,52 @@ pub fn get_strategy(strategy: &Option<String>) -> crate::lb::LoadBalancingStrate
 
 pub fn get_route_mode(mode: &Option<String>) -> RouteMode {
     match mode.as_deref() {
-        None | Some("http") | Some("Http") | Some("HTTP") => RouteMode::Http,
-        Some("passthrough") | Some("Passthrough") => RouteMode::Passthrough,
-        Some("tcp") | Some("Tcp") | Some("TCP") => RouteMode::Tcp,
-        Some("udp") | Some("Udp") | Some("UDP") => RouteMode::Udp,
-        Some(other) => {
+        None => RouteMode::Http,
+        Some(name) => parse_route_mode(name),
+    }
+}
+
+/// One mode name, as written in `mode` or in one entry of `modes`.
+pub fn parse_route_mode(mode: &str) -> RouteMode {
+    match mode {
+        "http" | "Http" | "HTTP" => RouteMode::Http,
+        "passthrough" | "Passthrough" => RouteMode::Passthrough,
+        "tcp" | "Tcp" | "TCP" => RouteMode::Tcp,
+        "udp" | "Udp" | "UDP" => RouteMode::Udp,
+        other => {
             tracing::warn!("Unknown route mode {:?}, falling back to \"http\"", other);
             RouteMode::Http
         }
+    }
+}
+
+/// Every mode a route serves: the union of `mode` and `modes`, deduplicated.
+///
+/// Two keys exist so that the common case stays one line — `modes = ["http", "tcp"]`
+/// — while `mode = "tcp"` keeps working. An empty `modes` list is not "serve
+/// nothing": it leaves `mode` (or the `http` default) in place, because a route
+/// that serves no mode is a silent hole in the table rather than a meaningful
+/// configuration.
+pub fn get_route_modes(mode: &Option<String>, modes: &Option<Vec<String>>) -> Vec<RouteMode> {
+    let mut resolved: Vec<RouteMode> = Vec::new();
+
+    if let Some(single) = mode {
+        push_mode(&mut resolved, parse_route_mode(single));
+    }
+    for name in modes.iter().flatten() {
+        push_mode(&mut resolved, parse_route_mode(name));
+    }
+
+    if resolved.is_empty() {
+        vec![RouteMode::Http]
+    } else {
+        resolved
+    }
+}
+
+fn push_mode(resolved: &mut Vec<RouteMode>, mode: RouteMode) {
+    if !resolved.contains(&mode) {
+        resolved.push(mode);
     }
 }
 
@@ -581,11 +636,11 @@ backends = ["http://10.0.0.5:8080"]
 
         // The two entries for one host do not collapse into each other: same
         // host, different mode, and the L4 one kept its port selector.
-        assert_eq!(routes[0].mode(), RouteMode::Passthrough);
-        assert_eq!(routes[1].mode(), RouteMode::Tcp);
+        assert_eq!(routes[0].modes(), &[RouteMode::Passthrough][..]);
+        assert_eq!(routes[1].modes(), &[RouteMode::Tcp][..]);
         assert!(routes[1].matches_l4("fn.iakl.top", 443));
         assert!(!routes[1].matches_l4("fn.iakl.top", 8443));
-        assert_eq!(routes[2].mode(), RouteMode::Http);
+        assert_eq!(routes[2].modes(), &[RouteMode::Http][..]);
 
         // No `default_backend` at all: the key is optional and building routes
         // must not require one.
@@ -643,6 +698,94 @@ backends = ["https://caddy:443"]
         assert_eq!(
             RouteMode::from_l4_proto(nexapipe_proto::L4Proto::Udp),
             RouteMode::Udp
+        );
+    }
+
+    /// One route, several modes: the whole reason `modes` exists is that a host
+    /// which answers a request and a tunnel with the same backend used to need
+    /// two entries, and forgetting the second one failed at runtime instead of
+    /// at startup.
+    #[test]
+    fn one_route_may_serve_several_modes() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "fn.iroh.iakl.top"
+modes = ["http", "tcp"]
+backends = ["http://host.docker.internal:15666"]
+"#,
+        );
+
+        let routes = config.build_routes().expect("the config is valid");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(
+            routes[0].modes(),
+            &[RouteMode::Http, RouteMode::Tcp][..],
+            "one entry, both modes, in the order they were written"
+        );
+        // `client_ports` and `path_pattern` are mode-specific knobs living on the
+        // same entry; only the L4 lookups read the former.
+        assert!(routes[0].matches_l4("fn.iroh.iakl.top", 80));
+        assert!(routes[0].matches("fn.iroh.iakl.top", "/anything"));
+    }
+
+    /// `mode` and `modes` together are the union, and duplicates collapse.
+    #[test]
+    fn mode_and_modes_are_merged_and_deduplicated() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "fn.iroh.iakl.top"
+mode = "http"
+modes = ["http", "tcp"]
+backends = ["http://host.docker.internal:15666"]
+"#,
+        );
+
+        let routes = config.build_routes().expect("the config is valid");
+        assert_eq!(routes[0].modes(), &[RouteMode::Http, RouteMode::Tcp][..]);
+
+        // An empty list means "no extra modes", not "no modes at all".
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "fn.iroh.iakl.top"
+modes = []
+backends = ["http://host.docker.internal:15666"]
+"#,
+        );
+        let routes = config.build_routes().expect("the config is valid");
+        assert_eq!(routes[0].modes(), &[RouteMode::Http][..]);
+    }
+
+    /// The price of sharing one `backends` list: an address has to satisfy every
+    /// mode, and the L4 rules are the stricter ones.
+    #[test]
+    fn a_route_serving_tcp_needs_a_port_on_its_backend() {
+        // `http://host` is a perfectly good HTTP backend — 80 is implied — but an
+        // L4 route dials an address and has no port to fall back on.
+        let valid = parse(
+            r#"
+[[routes]]
+host_pattern = "fn.iroh.iakl.top"
+mode = "http"
+backends = ["http://host.docker.internal"]
+"#,
+        );
+        assert!(valid.build_routes().is_ok(), "http alone may omit the port");
+
+        let merged = parse(
+            r#"
+[[routes]]
+host_pattern = "fn.iroh.iakl.top"
+modes = ["http", "tcp"]
+backends = ["http://host.docker.internal"]
+"#,
+        );
+        let error = merged.build_routes().unwrap_err().to_string();
+        assert!(
+            error.contains("does not name a port"),
+            "adding tcp has to be rejected at startup, got: {error}"
         );
     }
 

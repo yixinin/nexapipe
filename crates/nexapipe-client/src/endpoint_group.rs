@@ -106,6 +106,14 @@ pub struct PreconnectReport {
     pub reachable: Vec<EndpointId>,
     /// Backend nodes that refused, were unreachable, or timed out.
     pub unreachable: Vec<EndpointId>,
+    /// Backend nodes that answered the QUIC handshake and then refused the
+    /// connection because this client has no 2FA credentials.
+    ///
+    /// A client without credentials cannot fail the 2FA handshake — it never
+    /// starts one — so as far as QUIC is concerned these backends are up. They
+    /// are listed here as well as in `unreachable`, so the caller can say *why*
+    /// a backend that answered is not going to serve anything.
+    pub auth_required: Vec<EndpointId>,
 }
 
 impl PreconnectReport {
@@ -117,6 +125,12 @@ impl PreconnectReport {
     /// True when at least one configured backend answered.
     pub fn any_reachable(&self) -> bool {
         !self.reachable.is_empty()
+    }
+
+    /// True when at least one backend demanded 2FA credentials this client does
+    /// not have. Such a backend answers, then refuses to serve anything.
+    pub fn any_auth_required(&self) -> bool {
+        !self.auth_required.is_empty()
     }
 
     /// The unreachable backends as a comma-separated list, for error details.
@@ -405,7 +419,9 @@ impl EndpointGroup {
 
         // Run connectivity tests in parallel, each capped at PRECONNECT_TIMEOUT.
         let mut join_set = tokio::task::JoinSet::new();
-        for (backend_id, pool) in unique_pools {
+        for (backend_id, pool) in &unique_pools {
+            let backend_id = *backend_id;
+            let pool = pool.clone();
             join_set.spawn(async move {
                 let answered = match tokio::time::timeout(PRECONNECT_TIMEOUT, pool.preconnect()).await
                 {
@@ -458,6 +474,16 @@ impl EndpointGroup {
                 .copied()
                 .filter(|id| !classified.contains(id));
             report.unreachable.extend(missing);
+        }
+
+        // A backend that answered and then refused the connection leaves the
+        // reason on its pool. Collect it so the caller can report "this server
+        // wants 2FA" instead of an "unreachable" that hides the real cause.
+        for (backend_id, pool) in &unique_pools {
+            if let Some(reason) = pool.take_auth_required().await {
+                jni_log!("[preconnect] Node {} requires 2FA: {}", backend_id, reason);
+                report.auth_required.push(*backend_id);
+            }
         }
 
         jni_log!(
@@ -678,21 +704,35 @@ mod tests {
         let report = PreconnectReport {
             reachable: vec![reached],
             unreachable: vec![failed],
+            auth_required: Vec::new(),
         };
 
         assert_eq!(report.total(), 2);
         assert!(report.any_reachable());
+        assert!(!report.any_auth_required());
         assert_eq!(report.unreachable_ids(), failed.to_string());
         assert!(!report.unreachable_ids().contains(&reached.to_string()));
 
         let all_failed = PreconnectReport {
             reachable: Vec::new(),
             unreachable: vec![reached, failed],
+            auth_required: Vec::new(),
         };
         assert!(!all_failed.any_reachable());
         assert_eq!(
             all_failed.unreachable_ids(),
             format!("{}, {}", reached, failed)
         );
+
+        // A backend that answers the handshake and then refuses it for missing
+        // 2FA is unreachable *and* named as such: the caller's error message
+        // has to be able to say why.
+        let needs_2fa = PreconnectReport {
+            reachable: Vec::new(),
+            unreachable: vec![failed],
+            auth_required: vec![failed],
+        };
+        assert!(!needs_2fa.any_reachable());
+        assert!(needs_2fa.any_auth_required());
     }
 }

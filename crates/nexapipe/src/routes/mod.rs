@@ -22,7 +22,13 @@ pub struct Route {
     host_pattern: String,
     path_pattern: String,
     path_is_prefix: bool,
-    mode: RouteMode,
+    /// Every mode this route serves, in declaration order.
+    ///
+    /// More than one is the ordinary case for a host that has to answer both a
+    /// request and a tunnel: the same `backends` serve whichever of these the
+    /// connection turned out to be. Which one a *connection* gets is still
+    /// decided before matching, by its first byte.
+    modes: Vec<RouteMode>,
     backend_pool: Arc<BackendPool>,
     path_rewrite: Option<String>,
     l4: L4Options,
@@ -46,11 +52,31 @@ impl Route {
             host_pattern: host_pattern.to_string(),
             path_pattern: path_pattern.to_string(),
             path_is_prefix,
-            mode,
+            modes: vec![mode],
             backend_pool: Arc::new(BackendPool::new(backends, strategy)),
             path_rewrite,
             l4: L4Options::default(),
         }
+    }
+
+    /// Serve several modes from one route instead of one.
+    ///
+    /// Replaces rather than extends, because the caller (the config parser) has
+    /// already merged what the file said; duplicates collapse, so `mode = "http"`
+    /// together with `modes = ["http", "tcp"]` is not two entries. An empty list
+    /// is ignored: a route serving nothing would be a silent hole in the table,
+    /// and the constructor has already given it exactly one mode.
+    pub fn with_modes(mut self, modes: Vec<RouteMode>) -> Self {
+        let mut merged: Vec<RouteMode> = Vec::with_capacity(modes.len());
+        for mode in modes {
+            if !merged.contains(&mode) {
+                merged.push(mode);
+            }
+        }
+        if !merged.is_empty() {
+            self.modes = merged;
+        }
+        self
     }
 
     /// Attach the `tcp` / `udp` knobs. A no-op for the other modes, which have no
@@ -130,8 +156,18 @@ impl Route {
         self.path_is_prefix
     }
 
-    pub fn mode(&self) -> RouteMode {
-        self.mode
+    /// Every mode this route serves, in declaration order.
+    pub fn modes(&self) -> &[RouteMode] {
+        &self.modes
+    }
+
+    /// Whether this route takes part in `mode`'s lookup.
+    ///
+    /// A route may serve several modes, and which one a connection gets is
+    /// decided earlier — by its first byte — so this is a membership test, not a
+    /// choice between alternatives.
+    pub fn serves(&self, mode: RouteMode) -> bool {
+        self.modes.contains(&mode)
     }
 
     pub fn backend_pool(&self) -> &Arc<BackendPool> {
@@ -344,14 +380,16 @@ impl RouteConfig {
 
 /// Highest-priority route of `mode` that `matches` accepts.
 ///
-/// Ties keep the first declaration, and the modes never mix: which one applies is
-/// decided before matching, by the first byte of the connection — a TLS handshake goes
-/// to `Passthrough`, an L4 preface to `Tcp` or `Udp`, anything else to `Http`.
+/// Ties keep the first declaration. A route serves only the modes it declares,
+/// and which of them a connection uses is decided before matching, by the first
+/// byte of the connection — a TLS handshake goes to `Passthrough`, an L4 preface
+/// to `Tcp` or `Udp`, anything else to `Http`. One route may declare several
+/// modes; a connection still takes exactly one path.
 fn best_match(routes: &[Route], mode: RouteMode, matches: impl Fn(&Route) -> bool) -> Option<Route> {
     let mut best: Option<(Route, u32)> = None;
 
     for route in routes.iter() {
-        if route.mode() != mode || !matches(route) {
+        if !route.serves(mode) || !matches(route) {
             continue;
         }
 
@@ -433,6 +471,48 @@ mod tests {
         // the default backend is not a passthrough fallback.
         assert_eq!(config.get_passthrough_backend("mt.iroh.iakl.top").await, None);
         assert_eq!(config.get_passthrough_backend("unknown.test").await, None);
+    }
+
+    /// `modes = ["http", "tcp"]` in the form of a lookup: one route, two tables,
+    /// one shared pool.
+    ///
+    /// This is the configuration a TUN client needs — every one of its flows
+    /// arrives as an L4 preface, even on port 80 — and it used to take two
+    /// entries, where forgetting the second one cost a runtime `NoRoute`.
+    #[tokio::test]
+    async fn one_route_may_serve_both_a_request_and_a_tunnel() {
+        let config = RouteConfig::new(
+            vec![
+                http_route("fn.iroh.iakl.top", &["http://host.docker.internal:15666"])
+                    .with_modes(vec![RouteMode::Http, RouteMode::Tcp]),
+            ],
+            None,
+        );
+
+        assert_eq!(
+            config
+                .get_backend("fn.iroh.iakl.top", "/")
+                .await
+                .expect("the route serves this host as a request")
+                .url,
+            "http://host.docker.internal:15666"
+        );
+        assert_eq!(
+            config
+                .get_l4_backend("fn.iroh.iakl.top", 80, RouteMode::Tcp)
+                .await
+                .expect("the same route serves this host as a tunnel")
+                .backend,
+            "http://host.docker.internal:15666"
+        );
+        // Declaring two modes did not turn the route into a catch-all: udp was
+        // never one of them, and there is no default backend to fall back on.
+        assert!(
+            config
+                .get_l4_backend("fn.iroh.iakl.top", 80, RouteMode::Udp)
+                .await
+                .is_none()
+        );
     }
 
     /// One server, four kinds of traffic — the question "can http, https, tcp and udp

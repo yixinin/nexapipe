@@ -220,6 +220,13 @@ host_pattern = "turn.iroh.iakl.top"
 mode = "udp"                      # UDP flows, idle timeout in seconds
 backends = ["10.0.0.60:3478"]
 idle_timeout_secs = 60
+
+# One host that has to answer both a request and a tunnel — the ordinary shape
+# for an Android TUN client. `modes` takes several; `mode` takes one.
+[[routes]]
+host_pattern = "fn.iroh.iakl.top"
+modes = ["http", "tcp"]
+backends = ["http://host.docker.internal:15666"]
 ```
 
 | Mode | What it does |
@@ -228,6 +235,27 @@ idle_timeout_secs = 60
 | `passthrough` | Copies bytes. The route is selected by SNI, so `path_pattern` and `path_rewrite` do not apply and the backend may be a bare `host:port`. |
 | `tcp` | Carries a raw TCP flow to `backends`, selected by the host name in the L4 preface. No HTTP parsing, no `path_pattern`, no health check. See [TCP & UDP](#tcp--udp). |
 | `udp` | Carries UDP flows — one QUIC bi-stream per flow, one datagram per frame. Same selection as `tcp`, plus `idle_timeout_secs`. |
+
+A route serves **one** mode with `mode = "..."` and **several** with
+`modes = [...]`, sharing one `backends` list:
+
+```toml
+[[routes]]
+host_pattern = "fn.iroh.iakl.top"
+modes = ["http", "tcp"]           # also reachable as an L4 tunnel
+backends = ["http://host.docker.internal:15666"]
+```
+
+`mode` and `modes` may be written together — the route serves the union, and
+duplicates collapse. Which of them a *connection* uses is still decided by its
+first byte, so one connection only ever takes one path.
+
+The cost of sharing one `backends` list is that the address has to satisfy every
+declared mode, and the L4 rules are the stricter ones: **the port must be
+written out**, because an L4 route dials an address and has nothing to default
+to (`http://host` is fine for `http` alone, where 80 is implied, and rejected
+once `tcp` is added). Write two entries instead when the modes need different
+backends, since a route has exactly one pool.
 
 Removed route keys, still parsed but ignored: `cert_path`, `key_path` and
 `redirect_to_https` (let the backend redirect). They are reported at startup.
@@ -285,7 +313,8 @@ A TLS session that arrives through `CONNECT` or a TUN takes a different path: th
 client announces host and port with the L4 preface instead of handing over a
 `ClientHello`, so it is matched by a `mode = "tcp"` route and not by a
 `passthrough` one. A domain you want reachable both ways therefore needs **both**
-routes, both pointing at the same TLS-speaking backend — see
+modes — as two entries, or as one with `modes = ["passthrough", "tcp"]` when the
+same backend serves them — both pointing at the same TLS-speaking backend. See
 [TCP & UDP](#tcp--udp).
 
 ### Caddy
@@ -407,12 +436,23 @@ the packet is the port on the wire. Nothing is sniffed, which is what makes UDP
 possible at all.
 
 Note the route mode this implies: traffic a TUN sends to a domain arrives as L4,
-so that domain needs a `tcp` (or `udp`) route. A TUN reaching an HTTPS service
+so that domain needs a `tcp` (or `udp`) route — **even for plain HTTP on port
+80**, because a TUN hands over an IP packet, not an HTTP request, and the client
+states the host and port in the preface instead. A TUN reaching an HTTPS service
 therefore points a `tcp` route at the TLS-speaking backend —
 `backends = ["caddy:443"]`, which is the same Caddy as
 [TLS passthrough](#caddy) but with the port stated explicitly. `mode =
 "passthrough"` stays for clients that open a `ClientHello` straight at the
 proxy's own address.
+
+If the same backend answers a TUN and a plain request, say so in one entry:
+
+```toml
+[[routes]]
+host_pattern = "fn.iroh.iakl.top"
+modes = ["http", "tcp"]
+backends = ["http://host.docker.internal:15666"]
+```
 
 ### Where the L4 tunnel lives
 
