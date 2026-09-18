@@ -1,12 +1,15 @@
-pub mod acme;
+pub mod auth;
 pub mod config;
 pub mod config_watcher;
 pub mod conn;
 pub mod health;
 pub mod http;
+pub mod l4;
 pub mod lb;
 pub mod log;
+pub mod passthrough;
 pub mod proxy;
+pub mod qr;
 pub mod routes;
 pub mod shutdown;
-pub mod auth;
+pub mod stream_util;

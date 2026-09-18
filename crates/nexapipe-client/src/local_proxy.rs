@@ -14,9 +14,18 @@ use tracing;
 #[cfg(feature = "jni")]
 use crate::jni_log;
 
+/// No-op `jni_log!` for builds without the `jni` feature.
+///
+/// The format arguments are still *evaluated* (borrowed) inside a dead branch,
+/// so the optimiser removes the call but `unused_variables` does not fire on
+/// variables that only ever appear inside a log statement.
 #[cfg(not(feature = "jni"))]
 macro_rules! jni_log {
-    ($($arg:tt)*) => {};
+    ($($arg:tt)*) => {
+        if false {
+            let _ = ::std::format_args!($($arg)*);
+        }
+    };
 }
 
 /// Gate for the debug-only WebSocket frame dumps.
@@ -43,7 +52,7 @@ const STREAM_OPERATION_TIMEOUT: tokio::time::Duration = tokio::time::Duration::f
 /// If the pooled connection is stale (already closed by the peer), `open_bi` or
 /// the initial `write_all` can fail; we discard that connection and retry with a
 /// fresh one instead of failing the whole request.
-const REQUEST_OPEN_ATTEMPTS: usize = 3;
+pub(crate) const OPEN_ATTEMPTS: usize = 3;
 
 #[derive(Clone)]
 pub struct LocalProxy {
@@ -249,17 +258,20 @@ fn parse_websocket_frames(buffer: &mut Vec<u8>, frames: &mut Vec<(u8, Vec<u8>)>)
 /// Open a new iroh bi-stream for `host`, optionally writing `initial_data` as
 /// the first bytes of the request/tunnel payload.
 ///
-/// Retries `open_bi` / initial-write failures up to [`REQUEST_OPEN_ATTEMPTS`]
+/// Retries `open_bi` / initial-write failures up to [`OPEN_ATTEMPTS`]
 /// times, discarding the stale pooled connection on each failure so the retry
 /// gets a fresh connection.
-async fn open_stream_with_retry(
+///
+/// Shared with [`crate::l4`]: the L4 tunnel needs the same recovery, and the
+/// preface it passes as `initial_data` is written by exactly this code path.
+pub(crate) async fn open_stream_with_retry(
     endpoint_group: &Arc<EndpointGroup>,
     host: &str,
     initial_data: Option<&[u8]>,
 ) -> Result<(PooledConnection, SendStream, RecvStream), ClientError> {
     let mut last_err: Option<ClientError> = None;
 
-    for _attempt in 1..=REQUEST_OPEN_ATTEMPTS {
+    for _attempt in 1..=OPEN_ATTEMPTS {
         let pooled_conn = endpoint_group.get_connection(host).await?;
         let conn = pooled_conn.conn().clone();
 
@@ -271,7 +283,7 @@ async fn open_stream_with_retry(
                 jni_log!(
                     "[DEBUG:local-proxy] open_bi failed (attempt {}/{}): {}, retrying on a fresh connection",
                     _attempt,
-                    REQUEST_OPEN_ATTEMPTS,
+                    OPEN_ATTEMPTS,
                     e
                 );
                 last_err = Some(anyhow::anyhow!(e).into());
@@ -290,7 +302,7 @@ async fn open_stream_with_retry(
             jni_log!(
                 "[DEBUG:local-proxy] initial write failed (attempt {}/{}): {}, retrying on a fresh connection",
                 _attempt,
-                REQUEST_OPEN_ATTEMPTS,
+                OPEN_ATTEMPTS,
                 e
             );
             last_err = Some(e.into());
@@ -304,7 +316,7 @@ async fn open_stream_with_retry(
     Err(last_err.unwrap_or_else(|| {
         ClientError::ConnectionError(format!(
             "Failed to open stream to {} after {} attempts",
-            host, REQUEST_OPEN_ATTEMPTS
+            host, OPEN_ATTEMPTS
         ))
     }))
 }
@@ -418,21 +430,49 @@ where
     };
 
     if request.method().as_str() == "CONNECT" {
-        let uri = request.uri().to_string();
-        let host_port = uri.split(':').next().unwrap_or(&uri);
-        let host = host_port.to_string();
+        // `CONNECT host:port` is authority-form (RFC 9110 9.3.6). The port used to be
+        // dropped here (`uri.split(':').next()`), which is why this branch only ever
+        // worked for 443/TLS: everything else reached the server as a request line with
+        // no port, matched no route, and was silently forwarded to `default_backend`.
+        let target = request.uri().to_string();
+        let Some((host, port)) = crate::l4::parse_connect_target(&target) else {
+            jni_log!(
+                "[DEBUG:local-proxy] CONNECT without a usable host:port: '{}'",
+                target
+            );
+            return write_proxy_error(&mut stream, "400 Bad Request").await;
+        };
 
         if !should_proxy_domain(&host, &proxy_domains) {
-            return Ok(());
+            jni_log!(
+                "[DEBUG:local-proxy] CONNECT '{}' is not a proxied domain, refusing",
+                target
+            );
+            return write_proxy_error(&mut stream, "403 Forbidden").await;
         }
+
+        // Open the tunnel *before* answering 200. `200 Connection Established` promises
+        // that the far side is up, so the client has to still be able to receive an HTTP
+        // error when it is not — which is why the answer comes after the L4 handshake
+        // and not before it.
+        let (pooled_conn, mut send, mut recv) =
+            match crate::l4::open_tcp(&endpoint_group, &host, port).await {
+                Ok(tunnel) => tunnel,
+                Err(e) => {
+                    jni_log!(
+                        "[DEBUG:local-proxy] CONNECT {}:{} failed: {}",
+                        host,
+                        port,
+                        e
+                    );
+                    return write_proxy_error(&mut stream, "502 Bad Gateway").await;
+                }
+            };
 
         let (mut client_read, mut client_write) = tokio::io::split(stream);
         client_write
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
-
-        let (pooled_conn, mut send, mut recv) =
-            open_stream_with_retry(&endpoint_group, &host, None).await?;
 
         // Spawn bidirectional forwarding as separate tasks to keep each
         // task's async state machine small (avoids deep nesting that causes
@@ -501,7 +541,7 @@ where
         if let Ok(h) = header.to_str() {
             let h = h.split(':').next().unwrap_or(h);
             jni_log!("[DEBUG:local-proxy] Found Host header: '{}'", h);
-            if should_proxy_domain(&h, &proxy_domains) {
+            if should_proxy_domain(h, &proxy_domains) {
                 target_host = Some(h.to_string());
                 break;
             }
@@ -543,155 +583,151 @@ where
         if first_line_end > 0 {
             let request_line = &request_buf[..first_line_end];
             let line_str = String::from_utf8_lossy(request_line);
-            if let Some((method_rest, version)) = line_str.rsplit_once(" HTTP/") {
-                if let Some(method) = method_rest.split_whitespace().next() {
-                    let path = request
-                        .uri()
-                        .path_and_query()
-                        .map(|pq| pq.as_str())
-                        .unwrap_or("/");
-                    // Use http:// scheme (not ws://) — the backend handles
-                    // the WebSocket upgrade via the Upgrade header, not the URI
-                    let absolute_uri = format!("http://{}{}", host, path);
-                    let new_line = format!("{} {} HTTP/{}\r\n", method, absolute_uri, version);
+            if let Some((method_rest, version)) = line_str.rsplit_once(" HTTP/")
+                && let Some(method) = method_rest.split_whitespace().next()
+            {
+                let path = request
+                    .uri()
+                    .path_and_query()
+                    .map(|pq| pq.as_str())
+                    .unwrap_or("/");
+                // Use http:// scheme (not ws://) — the backend handles
+                // the WebSocket upgrade via the Upgrade header, not the URI
+                let absolute_uri = format!("http://{}{}", host, path);
+                let new_line = format!("{} {} HTTP/{}\r\n", method, absolute_uri, version);
 
-                    let mut request_to_send =
-                        Vec::with_capacity(new_line.len() + header_end - first_line_end);
-                    request_to_send.extend_from_slice(new_line.as_bytes());
-                    // Copy the rest of headers (skip the original request line)
-                    let rest_start = first_line_end + 2; // skip \r\n
-                    if rest_start < header_end {
-                        request_to_send.extend_from_slice(&request_buf[rest_start..header_end]);
-                    }
+                let mut request_to_send =
+                    Vec::with_capacity(new_line.len() + header_end - first_line_end);
+                request_to_send.extend_from_slice(new_line.as_bytes());
+                // Copy the rest of headers (skip the original request line)
+                let rest_start = first_line_end + 2; // skip \r\n
+                if rest_start < header_end {
+                    request_to_send.extend_from_slice(&request_buf[rest_start..header_end]);
+                }
 
-                    jni_log!(
-                        "[DEBUG:local-proxy] Rewrote WebSocket request line: {}",
-                        new_line.trim()
-                    );
+                jni_log!(
+                    "[DEBUG:local-proxy] Rewrote WebSocket request line: {}",
+                    new_line.trim()
+                );
 
-                    // Open iroh bi-stream and send the modified request
-                    let (pooled_conn, mut send, mut recv) =
-                        open_stream_with_retry(&endpoint_group, &host, Some(&request_to_send))
-                            .await?;
+                // Open iroh bi-stream and send the modified request
+                let (pooled_conn, mut send, mut recv) =
+                    open_stream_with_retry(&endpoint_group, &host, Some(&request_to_send)).await?;
 
-                    let (mut client_read, mut client_write) = tokio::io::split(stream);
-                    jni_log!(
-                        "[DEBUG:local-proxy] WebSocket request sent to iroh: {} bytes",
-                        request_to_send.len()
-                    );
+                let (mut client_read, mut client_write) = tokio::io::split(stream);
+                jni_log!(
+                    "[DEBUG:local-proxy] WebSocket request sent to iroh: {} bytes",
+                    request_to_send.len()
+                );
 
-                    // Bidirectional forwarding (no send.finish() — keep stream open)
-                    let client_to_iroh = async move {
-                        let mut buf = vec![0u8; STREAM_BUF_SIZE];
-                        let mut ws_buffer = Vec::new();
-                        loop {
-                            match client_read.read(&mut buf).await {
-                                Ok(0) => {
-                                    jni_log!("[DEBUG:local-proxy] WS client EOF");
-                                    return "client_eof";
+                // Bidirectional forwarding (no send.finish() — keep stream open)
+                let client_to_iroh = async move {
+                    let mut buf = vec![0u8; STREAM_BUF_SIZE];
+                    let mut ws_buffer = Vec::new();
+                    loop {
+                        match client_read.read(&mut buf).await {
+                            Ok(0) => {
+                                jni_log!("[DEBUG:local-proxy] WS client EOF");
+                                return "client_eof";
+                            }
+                            Ok(n) => {
+                                jni_log!(
+                                    "[DEBUG:local-proxy] WS client->iroh: {}",
+                                    websocket_frame_preview(&buf[..n])
+                                );
+                                ws_buffer.extend_from_slice(&buf[..n]);
+                                let mut frames = Vec::new();
+                                parse_websocket_frames(&mut ws_buffer, &mut frames);
+                                for (opcode, payload) in frames {
+                                    if opcode == 1 || opcode == 8 {
+                                        jni_log!(
+                                            "[DEBUG:local-proxy] WS client frame decoded (opcode {}): {}",
+                                            opcode,
+                                            String::from_utf8_lossy(&payload)
+                                        );
+                                    }
                                 }
-                                Ok(n) => {
+                                if let Err(e) = send.write_all(&buf[..n]).await {
+                                    jni_log!("[DEBUG:local-proxy] WS client->backend err: {}", e);
+                                    return "client_write_error";
+                                }
+                            }
+                            Err(e) => {
+                                jni_log!("[DEBUG:local-proxy] WS client read error: {}", e);
+                                return "client_read_error";
+                            }
+                        }
+                    }
+                };
+
+                let iroh_to_client = async move {
+                    let mut buf = vec![0u8; STREAM_BUF_SIZE];
+                    let mut first = true;
+                    loop {
+                        match recv.read(&mut buf).await {
+                            Ok(None) => {
+                                jni_log!("[DEBUG:local-proxy] WS iroh EOF");
+                                return "iroh_eof";
+                            }
+                            Ok(Some(n)) => {
+                                if first {
+                                    first = false;
+                                    let p = &buf[..std::cmp::min(n, 200)];
                                     jni_log!(
-                                        "[DEBUG:local-proxy] WS client->iroh: {}",
+                                        "[DEBUG:local-proxy] WS first response: {}",
+                                        String::from_utf8_lossy(p)
+                                    );
+                                }
+                                if debug_log_enabled() {
+                                    jni_log!(
+                                        "[DEBUG:local-proxy] WS iroh->client: {}",
                                         websocket_frame_preview(&buf[..n])
                                     );
-                                    ws_buffer.extend_from_slice(&buf[..n]);
-                                    let mut frames = Vec::new();
-                                    parse_websocket_frames(&mut ws_buffer, &mut frames);
-                                    for (opcode, payload) in frames {
-                                        if opcode == 1 || opcode == 8 {
-                                            jni_log!(
-                                                "[DEBUG:local-proxy] WS client frame decoded (opcode {}): {}",
-                                                opcode,
-                                                String::from_utf8_lossy(&payload)
-                                            );
-                                        }
-                                    }
-                                    if let Err(e) = send.write_all(&buf[..n]).await {
-                                        jni_log!(
-                                            "[DEBUG:local-proxy] WS client->backend err: {}",
-                                            e
-                                        );
-                                        return "client_write_error";
-                                    }
                                 }
-                                Err(e) => {
-                                    jni_log!("[DEBUG:local-proxy] WS client read error: {}", e);
-                                    return "client_read_error";
+                                if n <= 1024 {
+                                    jni_log!(
+                                        "[DEBUG:local-proxy] WS iroh->client decoded: {}",
+                                        String::from_utf8_lossy(&buf[..n])
+                                    );
                                 }
+                                if client_write.write_all(&buf[..n]).await.is_err() {
+                                    return "client_write_error";
+                                }
+                                let _ = client_write.flush().await;
+                            }
+                            Err(e) => {
+                                jni_log!("[DEBUG:local-proxy] WS iroh read error: {}", e);
+                                return "iroh_read_error";
                             }
                         }
-                    };
-
-                    let iroh_to_client = async move {
-                        let mut buf = vec![0u8; STREAM_BUF_SIZE];
-                        let mut first = true;
-                        loop {
-                            match recv.read(&mut buf).await {
-                                Ok(None) => {
-                                    jni_log!("[DEBUG:local-proxy] WS iroh EOF");
-                                    return "iroh_eof";
-                                }
-                                Ok(Some(n)) => {
-                                    if first {
-                                        first = false;
-                                        let p = &buf[..std::cmp::min(n, 200)];
-                                        jni_log!(
-                                            "[DEBUG:local-proxy] WS first response: {}",
-                                            String::from_utf8_lossy(p)
-                                        );
-                                    }
-                                    if debug_log_enabled() {
-                                        jni_log!(
-                                            "[DEBUG:local-proxy] WS iroh->client: {}",
-                                            websocket_frame_preview(&buf[..n])
-                                        );
-                                    }
-                                    if n <= 1024 {
-                                        jni_log!(
-                                            "[DEBUG:local-proxy] WS iroh->client decoded: {}",
-                                            String::from_utf8_lossy(&buf[..n])
-                                        );
-                                    }
-                                    if client_write.write_all(&buf[..n]).await.is_err() {
-                                        return "client_write_error";
-                                    }
-                                    let _ = client_write.flush().await;
-                                }
-                                Err(e) => {
-                                    jni_log!("[DEBUG:local-proxy] WS iroh read error: {}", e);
-                                    return "iroh_read_error";
-                                }
-                            }
-                        }
-                    };
-
-                    let mut client_task = tokio::spawn(client_to_iroh);
-                    let mut backend_task = tokio::spawn(iroh_to_client);
-
-                    let (closed_direction, close_reason) = tokio::select! {
-                        result = &mut client_task => {
-                            ("client_to_iroh", result.unwrap_or_else(|_| "client_task_panicked"))
-                        }
-                        result = &mut backend_task => {
-                            ("iroh_to_client", result.unwrap_or_else(|_| "backend_task_panicked"))
-                        }
-                    };
-
-                    if closed_direction == "client_to_iroh" {
-                        backend_task.abort();
-                    } else {
-                        client_task.abort();
                     }
-                    jni_log!(
-                        "[DEBUG:local-proxy] WebSocket tunnel closed first by {} ({})",
-                        closed_direction,
-                        close_reason
-                    );
+                };
 
-                    endpoint_group.return_connection(&host, pooled_conn).await;
-                    return Ok(());
+                let mut client_task = tokio::spawn(client_to_iroh);
+                let mut backend_task = tokio::spawn(iroh_to_client);
+
+                let (closed_direction, close_reason) = tokio::select! {
+                    result = &mut client_task => {
+                        ("client_to_iroh", result.unwrap_or("client_task_panicked"))
+                    }
+                    result = &mut backend_task => {
+                        ("iroh_to_client", result.unwrap_or("backend_task_panicked"))
+                    }
+                };
+
+                if closed_direction == "client_to_iroh" {
+                    backend_task.abort();
+                } else {
+                    client_task.abort();
                 }
+                jni_log!(
+                    "[DEBUG:local-proxy] WebSocket tunnel closed first by {} ({})",
+                    closed_direction,
+                    close_reason
+                );
+
+                endpoint_group.return_connection(&host, pooled_conn).await;
+                return Ok(());
             }
         }
 
@@ -1114,12 +1150,28 @@ fn remove_cache_validation_headers(header_bytes: &[u8]) -> Vec<u8> {
     result
 }
 
+/// Answer a `CONNECT` that cannot be served.
+///
+/// Only valid while the socket is still an HTTP one: once `200 Connection Established`
+/// has gone out the socket is a byte tunnel and an HTTP status line would be payload.
+/// That is why every refusal — an unusable target, a domain outside the proxy list, a
+/// tunnel the server refused — has to be decided before the 200 is written.
+async fn write_proxy_error<S>(stream: &mut S, status_line: &str) -> Result<(), ClientError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let response =
+        format!("HTTP/1.1 {status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 pub(crate) fn should_proxy_domain(host: &str, proxy_domains: &[String]) -> bool {
     let host_lower = host.to_lowercase();
     for domain in proxy_domains {
         let domain_lower = domain.to_lowercase();
-        if domain_lower.starts_with('*') {
-            let suffix = &domain_lower[1..];
+        if let Some(suffix) = domain_lower.strip_prefix('*') {
             if host_lower.ends_with(suffix) {
                 return true;
             }

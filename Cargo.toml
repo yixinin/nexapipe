@@ -1,5 +1,9 @@
 [workspace]
-members = ["crates/nexapipe", "crates/nexapipe-client"]
+members = [
+    "crates/nexapipe",
+    "crates/nexapipe-client",
+    "crates/nexapipe-proto",
+]
 exclude = ["ui-desktop/src-tauri"]
 resolver = "3"
 
@@ -55,3 +59,4 @@ http-body-util = "0.1"
 tokio-stream = "0.1"
 bytes = "1.12.0"
 futures-util = "0.3.32"
+nexapipe-proto = { path = "crates/nexapipe-proto" }

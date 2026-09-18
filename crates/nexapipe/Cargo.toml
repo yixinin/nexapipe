@@ -11,40 +11,33 @@ quinn.workspace = true
 rand = '0.10.1'
 tokio.workspace = true
 tracing = '0.1.44'
-tracing-subscriber = { version = '0.3.23', features = ['env-filter'] }
+tracing-subscriber = { version = '0.3.23', features = ['env-filter', 'registry', 'chrono'] }
 anyhow.workspace = true
 http.workspace = true
 url.workspace = true
 toml = '1.1.2'
 serde = { version = '1.0.228', features = ['derive'] }
 serde_json = '1.0'
+# iroh's QUIC handshake needs a process-wide rustls CryptoProvider; see main.rs.
 rustls.workspace = true
-tokio-rustls.workspace = true
-rustls-native-certs.workspace = true
-webpki-roots.workspace = true
-rustls-pemfile = '2.0'
-rustls-pki-types = '1.15.0'
-instant-acme = { version = '0.8.5', default-features = false, features = ['hyper-rustls', 'ring'] }
-cloudflare = { version = '0.14.0', default-features = false, features = ['rustls-tls'] }
-x509-parser = '0.18.1'
 chrono = { version = '0.4.45', features = ['serde'] }
 futures-util.workspace = true
-base64 = '0.22.1'
 hyper.workspace = true
 hyper-util.workspace = true
-hyper-rustls.workspace = true
 http-body-util.workspace = true
 tokio-stream.workspace = true
 flate2 = '1.0'
 bytes.workspace = true
-lazy_static = '1.4'
 hex = '0.4'
 nexapipe-client = { path = '../nexapipe-client', features = ['local-proxy'] }
+nexapipe-proto.workspace = true
 # 2FA support
 totp-rs = { version = '5.6', features = ['gen_secret'] }
 base32 = '0.4'
+qrcode = { version = "0.14.1", default-features = false }
 
 [dev-dependencies]
 duct = '1.1.1'
 nix = { version = '0.31.3', features = ['signal', 'process'] }
+rqrr = { version = "0.9", default-features = false }
 tempfile = '3.8'

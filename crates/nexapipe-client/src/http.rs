@@ -4,9 +4,18 @@ use std::collections::HashMap;
 #[cfg(feature = "jni")]
 use crate::jni_log;
 
+/// No-op `jni_log!` for builds without the `jni` feature.
+///
+/// The format arguments are still *evaluated* (borrowed) inside a dead branch,
+/// so the optimiser removes the call but `unused_variables` does not fire on
+/// variables that only ever appear inside a log statement.
 #[cfg(not(feature = "jni"))]
 macro_rules! jni_log {
-    ($($arg:tt)*) => {};
+    ($($arg:tt)*) => {
+        if false {
+            let _ = ::std::format_args!($($arg)*);
+        }
+    };
 }
 
 #[derive(Debug, Clone)]
@@ -191,25 +200,24 @@ pub fn is_websocket_request_static(req: &Request<()>) -> bool {
         connection_header.map(|h| h.to_str().ok())
     );
 
-    if let Some(upgrade) = upgrade_header {
-        if let Ok(upgrade_str) = upgrade.to_str() {
-            if upgrade_str.to_lowercase() == "websocket" {
-                jni_log!("[DEBUG:http] WebSocket detection - upgrade header is websocket");
-                if let Some(connection) = connection_header {
-                    if let Ok(connection_str) = connection.to_str() {
-                        jni_log!(
-                            "[DEBUG:http] WebSocket detection - connection header: {}",
-                            connection_str
-                        );
-                        let contains_upgrade = connection_str.to_lowercase().contains("upgrade");
-                        jni_log!(
-                            "[DEBUG:http] WebSocket detection - contains upgrade: {}",
-                            contains_upgrade
-                        );
-                        return contains_upgrade;
-                    }
-                }
-            }
+    if let Some(upgrade) = upgrade_header
+        && let Ok(upgrade_str) = upgrade.to_str()
+        && upgrade_str.to_lowercase() == "websocket"
+    {
+        jni_log!("[DEBUG:http] WebSocket detection - upgrade header is websocket");
+        if let Some(connection) = connection_header
+            && let Ok(connection_str) = connection.to_str()
+        {
+            jni_log!(
+                "[DEBUG:http] WebSocket detection - connection header: {}",
+                connection_str
+            );
+            let contains_upgrade = connection_str.to_lowercase().contains("upgrade");
+            jni_log!(
+                "[DEBUG:http] WebSocket detection - contains upgrade: {}",
+                contains_upgrade
+            );
+            return contains_upgrade;
         }
     }
     jni_log!("[DEBUG:http] WebSocket detection - returning false");

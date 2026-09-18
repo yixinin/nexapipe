@@ -62,6 +62,10 @@ impl IrohConnectionPool {
         let (transport, tuning) = crate::transport::transport_config_with_tuning();
         #[cfg(feature = "tracing")]
         tracing::info!("QUIC transport tuning: {}", tuning.describe());
+        // `tuning` is only read by the log line above; keep the binding "used"
+        // when `tracing` is off so it is not reported as unused.
+        #[cfg(not(feature = "tracing"))]
+        let _ = &tuning;
         let ep = Endpoint::builder(presets::N0)
             .transport_config(transport)
             .bind()
@@ -90,6 +94,15 @@ impl IrohConnectionPool {
         Self { inner }
     }
 
+    /// The **local** iroh endpoint's own ID — this client's identity on the
+    /// network, not the ID of the backend this pool talks to.
+    ///
+    /// Careful: pools that share a caller-owned endpoint (`new_with_endpoint`)
+    /// all report the *same* ID here, because they all use one local endpoint.
+    /// Do not use this to tell backends apart; use [`Self::backend_id`].
+    ///
+    /// Returns the all-zero ID when the endpoint lock is momentarily held or the
+    /// endpoint has already been closed.
     pub fn node_id(&self) -> EndpointId {
         match self.inner.ep.try_lock() {
             Ok(ep) => {
@@ -104,6 +117,16 @@ impl IrohConnectionPool {
                 EndpointId::from_bytes(&[0u8; 32]).expect("Failed to create default endpoint id")
             }
         }
+    }
+
+    /// The **remote** node this pool dials: the configured `server_node_id`.
+    ///
+    /// Unlike [`Self::node_id`] this is a plain copy of the address the pool was
+    /// built with, so it needs no lock, never returns a placeholder, and is
+    /// stable across every pool in a group. Pool identity / deduplication must
+    /// be based on this.
+    pub fn backend_id(&self) -> EndpointId {
+        self.inner.endpoint_addr.id
     }
 
     /// Configure client 2FA credentials. Connections established afterwards
@@ -206,10 +229,10 @@ impl IrohConnectionPool {
     pub async fn preconnect(&self) -> bool {
         {
             let connections = self.inner.connections.lock().await;
-            if let Some(pooled) = connections.last() {
-                if pooled.is_live() {
-                    return true;
-                }
+            if let Some(pooled) = connections.last()
+                && pooled.is_live()
+            {
+                return true;
             }
         }
 
@@ -223,6 +246,8 @@ impl IrohConnectionPool {
                 Ok(Err(e)) => {
                     #[cfg(feature = "tracing")]
                     tracing::warn!("preconnect failed: {}", e);
+                    #[cfg(not(feature = "tracing"))]
+                    let _ = &e;
                     return false;
                 }
                 Err(_) => {

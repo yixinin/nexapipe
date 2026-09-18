@@ -10,9 +10,18 @@ use std::sync::Arc;
 #[cfg(feature = "jni")]
 use crate::jni_log;
 
+/// No-op `jni_log!` for builds without the `jni` feature.
+///
+/// The format arguments are still *evaluated* (borrowed) inside a dead branch,
+/// so the optimiser removes the call but `unused_variables` does not fire on
+/// variables that only ever appear inside a log statement.
 #[cfg(not(feature = "jni"))]
 macro_rules! jni_log {
-    ($($arg:tt)*) => {};
+    ($($arg:tt)*) => {
+        if false {
+            let _ = ::std::format_args!($($arg)*);
+        }
+    };
 }
 
 #[derive(Debug, Clone)]
@@ -72,14 +81,54 @@ impl DomainPools {
         }
     }
 
+    /// The backend node IDs this domain load-balances across (the configured
+    /// `server_node_id`s), one per pool.
     pub fn node_ids(&self) -> Vec<EndpointId> {
-        self.pools.iter().map(|p| p.node_id()).collect()
+        self.pools.iter().map(|p| p.backend_id()).collect()
     }
 }
 
 pub struct EndpointGroup {
     domains: HashMap<String, Arc<DomainPools>>,
     default_pools: Option<Arc<DomainPools>>,
+}
+
+/// Which configured backends answered a reachability probe.
+///
+/// Building an `EndpointGroup` never dials anything: a well-formed but
+/// nonexistent `server_node_id` passes every setup call, and only an actual
+/// connection attempt reveals that nothing is there. This report is that
+/// attempt, per backend, so a caller can refuse to call a start "successful"
+/// when it reached no backend at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreconnectReport {
+    /// Backend nodes that accepted a connection.
+    pub reachable: Vec<EndpointId>,
+    /// Backend nodes that refused, were unreachable, or timed out.
+    pub unreachable: Vec<EndpointId>,
+}
+
+impl PreconnectReport {
+    /// How many distinct backends were probed. Zero means none was configured.
+    pub fn total(&self) -> usize {
+        self.reachable.len() + self.unreachable.len()
+    }
+
+    /// True when at least one configured backend answered.
+    pub fn any_reachable(&self) -> bool {
+        !self.reachable.is_empty()
+    }
+
+    /// The unreachable backends as a comma-separated list, for error details.
+    ///
+    /// Empty when everything answered.
+    pub fn unreachable_ids(&self) -> String {
+        self.unreachable
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 impl EndpointGroup {
@@ -291,19 +340,37 @@ impl EndpointGroup {
     /// Test iroh-level connectivity to each unique backend node, in parallel.
     ///
     /// Unlike the old sequential preconnect, this:
-    /// - Deduplicates pools by node ID (same node serving multiple domains is tested once)
+    /// - Deduplicates pools by *backend* node ID (same backend serving several
+    ///   domains is tested once) — deliberately not by the pool's local endpoint
+    ///   ID, which is identical for every pool when the group shares one
+    ///   caller-owned endpoint, and would collapse all backends into a single
+    ///   probe
     /// - Runs all connectivity tests in parallel via `JoinSet`
     /// - Applies a short per-pool timeout (PRECONNECT_TIMEOUT = 5s)
     /// - Caps the overall phase at 10s
     ///
     /// This ensures that a single unreachable backend node does not block the
-    /// entire connection flow. Returns the number of nodes that are reachable.
+    /// entire connection flow.
+    ///
+    /// Returns how many nodes answered. Call [`Self::preconnect_report`] when the
+    /// caller also needs to name the ones that did not.
     pub async fn preconnect_all(&self) -> usize {
-        // Collect unique pools by node ID. Multiple domains pointing to the
-        // same node share a single connection pool, so we only need to test
-        // each node once.
+        self.preconnect_report().await.reachable.len()
+    }
+
+    /// Probe every unique backend node in parallel and report which answered.
+    ///
+    /// This is the availability check every entry point shares. Because no setup
+    /// call ever dials, a config pointing at a node that does not exist looks
+    /// perfectly valid until something connects; callers therefore treat
+    /// [`PreconnectReport::any_reachable`] being false as a failed start rather
+    /// than reporting a connection that was never established.
+    pub async fn preconnect_report(&self) -> PreconnectReport {
+        // Collect unique pools by backend node ID. Multiple domains pointing to
+        // the same backend share a single connection pool, so we only need to
+        // test each backend once.
         let mut seen_nodes: Vec<EndpointId> = Vec::new();
-        let mut unique_pools: Vec<Arc<IrohConnectionPool>> = Vec::new();
+        let mut unique_pools: Vec<(EndpointId, Arc<IrohConnectionPool>)> = Vec::new();
 
         let all_pools: Vec<&Arc<IrohConnectionPool>> = self
             .domains
@@ -319,10 +386,10 @@ impl EndpointGroup {
             .collect();
 
         for pool in all_pools {
-            let node_id = pool.node_id();
-            if !seen_nodes.iter().any(|id| *id == node_id) {
-                seen_nodes.push(node_id);
-                unique_pools.push(pool.clone());
+            let backend_id = pool.backend_id();
+            if !seen_nodes.contains(&backend_id) {
+                seen_nodes.push(backend_id);
+                unique_pools.push((backend_id, pool.clone()));
             }
         }
 
@@ -331,15 +398,17 @@ impl EndpointGroup {
             unique_pools.len()
         );
 
+        let mut report = PreconnectReport::default();
         if unique_pools.is_empty() {
-            return 0;
+            return report;
         }
 
         // Run connectivity tests in parallel, each capped at PRECONNECT_TIMEOUT.
         let mut join_set = tokio::task::JoinSet::new();
-        for pool in unique_pools {
+        for (backend_id, pool) in unique_pools {
             join_set.spawn(async move {
-                match tokio::time::timeout(PRECONNECT_TIMEOUT, pool.preconnect()).await {
+                let answered = match tokio::time::timeout(PRECONNECT_TIMEOUT, pool.preconnect()).await
+                {
                     Ok(true) => true,
                     Ok(false) => {
                         jni_log!("[preconnect] Node unreachable (preconnect returned false)");
@@ -352,23 +421,25 @@ impl EndpointGroup {
                         );
                         false
                     }
-                }
+                };
+                (backend_id, answered)
             });
         }
 
         // Overall cap: 10s for the entire preconnect phase.
-        let overall_deadline =
-            tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
-        let mut warmed = 0usize;
-        while let Ok(result) = tokio::time::timeout_at(
-            overall_deadline,
-            join_set.join_next(),
-        )
-        .await
+        let overall_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        let mut probed = 0usize;
+        while let Ok(result) = tokio::time::timeout_at(overall_deadline, join_set.join_next()).await
         {
             match result {
-                Some(Ok(true)) => warmed += 1,
-                Some(Ok(false)) => {}
+                Some(Ok((backend_id, true))) => {
+                    probed += 1;
+                    report.reachable.push(backend_id);
+                }
+                Some(Ok((backend_id, false))) => {
+                    probed += 1;
+                    report.unreachable.push(backend_id);
+                }
                 Some(Err(_e)) => {
                     jni_log!("[preconnect] Task failed");
                 }
@@ -376,14 +447,30 @@ impl EndpointGroup {
             }
         }
 
+        // A task the overall cap cut off never reported. Count it as unreachable:
+        // a backend may only be called usable when it actually answered, and
+        // `total()` must still equal the number of configured backends.
+        if probed < seen_nodes.len() {
+            let mut classified = report.reachable.clone();
+            classified.extend(report.unreachable.iter().copied());
+            let missing = seen_nodes
+                .iter()
+                .copied()
+                .filter(|id| !classified.contains(id));
+            report.unreachable.extend(missing);
+        }
+
         jni_log!(
             "[preconnect] Connectivity test done: {}/{} node(s) reachable",
-            warmed,
+            report.reachable.len(),
             seen_nodes.len()
         );
-        warmed
+        report
     }
 
+    /// The backend node IDs configured in this group (one per pool, deduplicated
+    /// per domain). These are the servers traffic is dialed to, i.e. the
+    /// `server_node_id`s from the client configuration.
     pub fn node_ids(&self) -> Vec<EndpointId> {
         let mut ids = Vec::new();
         for pools in self.domains.values() {
@@ -466,5 +553,146 @@ impl NodeConfig {
             server_node_id: self.server_node_id.clone(),
             server_ticket: self.server_ticket.clone(),
         }).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::endpoint::presets;
+
+    /// A syntactically valid backend node ID that no endpoint is bound to.
+    fn unused_backend_id() -> EndpointId {
+        iroh::SecretKey::generate()
+            .public()
+            .to_string()
+            .parse()
+            .expect("a generated public key is a valid node ID")
+    }
+
+    fn node(backend: EndpointId, domain: &str) -> NodeConfig {
+        NodeConfig {
+            server_node_id: Some(backend.to_string()),
+            server_ticket: None,
+            domains: vec![domain.to_string()],
+        }
+    }
+
+    /// Regression guard: the group must report the *configured* backend IDs.
+    ///
+    /// When every pool shares one caller-owned endpoint (the Android JNI shape),
+    /// `IrohConnectionPool::node_id()` answers with the same local endpoint ID
+    /// for all of them. Reporting that made `preconnect_all` dedupe every
+    /// backend into a single probe, so only one of N nodes was ever checked and
+    /// N-1 unreachable nodes went unnoticed.
+    #[tokio::test]
+    async fn node_ids_are_the_configured_backends_not_the_local_endpoint() {
+        let ep = Endpoint::builder(presets::N0)
+            .bind()
+            .await
+            .expect("binding a local endpoint needs no network");
+
+        let backend_a = unused_backend_id();
+        let backend_b = unused_backend_id();
+        assert_ne!(backend_a, backend_b);
+
+        let group = EndpointGroup::new_with_nodes_and_endpoint(
+            vec![node(backend_a, "a.example.com"), node(backend_b, "b.example.com")],
+            None,
+            LoadBalancingStrategy::RoundRobin,
+            ep.clone(),
+        )
+        .await
+        .expect("a bogus but well-formed node ID must still build a group");
+
+        let ids = group.node_ids();
+        assert_eq!(ids.len(), 2, "both backends must be listed: {ids:?}");
+        assert!(ids.contains(&backend_a), "{ids:?} is missing {backend_a}");
+        assert!(ids.contains(&backend_b), "{ids:?} is missing {backend_b}");
+        assert!(
+            !ids.contains(&ep.id()),
+            "the group reported its local endpoint ID {ids:?} instead of the backends"
+        );
+    }
+
+    /// Two distinct backends behind two domains must stay two pools, so the
+    /// dedup in `preconnect_all` probes each of them.
+    #[tokio::test]
+    async fn distinct_backends_stay_distinct_pools() {
+        let ep = Endpoint::builder(presets::N0)
+            .bind()
+            .await
+            .expect("binding a local endpoint needs no network");
+
+        let backend_a = unused_backend_id();
+        let backend_b = unused_backend_id();
+
+        let group = EndpointGroup::new_with_nodes_and_endpoint(
+            vec![node(backend_a, "a.example.com"), node(backend_b, "b.example.com")],
+            None,
+            LoadBalancingStrategy::RoundRobin,
+            ep,
+        )
+        .await
+        .unwrap();
+
+        // One pool per backend, and each domain load-balances over its own pool.
+        for (domain, expected) in [("a.example.com", backend_a), ("b.example.com", backend_b)] {
+            let pools = group
+                .domains
+                .get(domain)
+                .expect("the domain must have a pool");
+            assert_eq!(pools.pools.len(), 1, "{domain} should map to one pool");
+            assert_eq!(pools.pools[0].backend_id(), expected);
+        }
+    }
+
+    /// A group with no backend must not look like a reachable one: the callers
+    /// treat an empty report as a failed start, so `total()` has to be 0 rather
+    /// than "all of nothing answered".
+    #[tokio::test]
+    async fn group_without_backends_reports_nothing_probed() {
+        let ep = Endpoint::builder(presets::N0).bind().await.unwrap();
+        let group = EndpointGroup::new_with_nodes_and_endpoint(
+            Vec::new(),
+            None,
+            LoadBalancingStrategy::RoundRobin,
+            ep,
+        )
+        .await
+        .unwrap();
+
+        let report = group.preconnect_report().await;
+        assert_eq!(report.total(), 0);
+        assert!(!report.any_reachable());
+        assert_eq!(report.unreachable_ids(), "");
+    }
+
+    /// The report is what callers put in their error messages, so the summary
+    /// must name exactly the backends that failed and nothing else.
+    #[test]
+    fn report_names_only_the_unreachable_backends() {
+        let reached = unused_backend_id();
+        let failed = unused_backend_id();
+
+        let report = PreconnectReport {
+            reachable: vec![reached],
+            unreachable: vec![failed],
+        };
+
+        assert_eq!(report.total(), 2);
+        assert!(report.any_reachable());
+        assert_eq!(report.unreachable_ids(), failed.to_string());
+        assert!(!report.unreachable_ids().contains(&reached.to_string()));
+
+        let all_failed = PreconnectReport {
+            reachable: Vec::new(),
+            unreachable: vec![reached, failed],
+        };
+        assert!(!all_failed.any_reachable());
+        assert_eq!(
+            all_failed.unreachable_ids(),
+            format!("{}, {}", reached, failed)
+        );
     }
 }

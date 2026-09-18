@@ -1,0 +1,9 @@
+[package]
+name = 'nexapipe-proto'
+version = '0.1.0'
+edition = '2024'
+description = 'Wire format of the nexapipe L4 (TCP/UDP) tunnel'
+license = 'MIT'
+
+# Deliberately dependency-free: both the server and every client build link this,
+# and it must stay cheap to compile for the Android target.

@@ -7,17 +7,12 @@ use iroh::endpoint::Connection;
 use totp_rs::{Algorithm, Secret, TOTP};
 
 /// TOTP algorithm variants
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TotpAlgorithm {
+    #[default]
     SHA1,
     SHA256,
     SHA512,
-}
-
-impl Default for TotpAlgorithm {
-    fn default() -> Self {
-        TotpAlgorithm::SHA1
-    }
 }
 
 impl TotpAlgorithm {

@@ -87,6 +87,80 @@ const PINNED_RELAY_URL: &str = "https://aps1-1.relay.n0.iroh.link.";
 static RELAY_MODE: Mutex<String> = Mutex::new(String::new());
 static CUSTOM_RELAY_URL: Mutex<String> = Mutex::new(String::new());
 
+// Reason behind the last failed native call, so Kotlin can read it back.
+//
+// The start entry points return a bare `jint` and therefore cannot carry a message. Without this
+// the caller could not tell "the port is already in use" from "the configured node ID does not
+// parse" and guessed the former for both: a malformed endpoint ID (e.g. 65 hex characters, an odd
+// length) looked like a port conflict, burned 10 ports x 3 attempts, and finally reported
+// "Failed to start proxy on ports 8080..8089" — a message that named neither the node nor the
+// real cause.
+static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// Result code for a failure the caller must not retry: the configuration itself is wrong, so the
+/// next port would fail identically, and [`LAST_ERROR`] holds a message meant for the user.
+const RESULT_CONFIG_ERROR: jint = -2;
+
+fn set_last_error(message: impl Into<String>) {
+    if let Ok(mut guard) = LAST_ERROR.lock() {
+        *guard = Some(message.into());
+    }
+}
+
+fn clear_last_error() {
+    if let Ok(mut guard) = LAST_ERROR.lock() {
+        *guard = None;
+    }
+}
+
+fn take_last_error() -> Option<String> {
+    match LAST_ERROR.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => None,
+    }
+}
+
+/// Parse a node ID with the same parser the connection path uses.
+///
+/// Returns the parser's reason on failure. Checking up front means a bad ID is reported before any
+/// port is bound, instead of surfacing as a bind failure from inside endpoint-group construction.
+fn node_id_error(node_id: &str) -> Option<String> {
+    node_id
+        .parse::<iroh::EndpointId>()
+        .err()
+        .map(|e| e.to_string())
+}
+
+/// First configured endpoint that does not parse, as a message for the user.
+///
+/// Mirrors `parse_endpoint_addr` (which reads `server_node_id` first, then `server_ticket`), so a
+/// problem is caught here — before any port is bound — instead of surfacing as a bind failure from
+/// inside endpoint-group construction.
+fn first_invalid_node_id(domain_mappings: &[DomainMapping], nodes: &[NodeConfig]) -> Option<String> {
+    for mapping in domain_mappings {
+        if let Some(node_id) = mapping.server_node_id.as_deref() {
+            if let Some(reason) = node_id_error(node_id) {
+                return Some(format!(
+                    "Invalid endpoint ID '{node_id}' for domain '{}': {reason}. \
+                     Endpoint IDs are 64 hexadecimal characters.",
+                    mapping.domain
+                ));
+            }
+        }
+    }
+    for node in nodes {
+        if let Some(node_id) = node.server_node_id.as_deref() {
+            if let Some(reason) = node_id_error(node_id) {
+                return Some(format!(
+                    "Invalid endpoint ID '{node_id}': {reason}. \
+                     Endpoint IDs are 64 hexadecimal characters."
+                ));
+            }
+        }
+    }
+    None
+}
+
 struct ProxyState {
     conn_pool: Option<IrohConnectionPool>,
     endpoint_group: Option<Arc<EndpointGroup>>,
@@ -788,6 +862,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
         Some(r) => r,
         None => {
             jni_log!("Runtime not initialized");
+            set_last_error("Native runtime not initialized");
             return -1;
         }
     };
@@ -796,6 +871,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
         Some(s) => s,
         None => {
             jni_log!("State not initialized");
+            set_last_error("Native state not initialized");
             return -1;
         }
     };
@@ -815,6 +891,15 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
         domain_mappings = guard.domain_mappings.clone();
     }
 
+    // Pre-flight: every configured endpoint ID must parse. Checked before anything is bound, so a
+    // malformed ID is reported as a malformed ID (and not retried as if the port were taken).
+    if let Some(message) = first_invalid_node_id(&domain_mappings, &nodes) {
+        jni_log!("[DEBUG:jni] nativeStartProxy rejected: {}", message);
+        set_last_error(message);
+        return RESULT_CONFIG_ERROR;
+    }
+    clear_last_error();
+
     let listen_addr = format!("127.0.0.1:{}", listen_port);
     jni_log!(
         "[DEBUG:jni] nativeStartProxy called for port {}",
@@ -828,6 +913,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
         Some(ep) => ep,
         None => {
             jni_log!("[DEBUG:jni] No iroh endpoint available; call nativeStartIroh first");
+            set_last_error("No iroh endpoint available; call nativeStartIroh first");
             return -1;
         }
     };
@@ -990,12 +1076,74 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
         }
         Ok(Err(e)) => {
             jni_log!("[DEBUG:jni] Proxy start error: {}", e);
-            -1
+            let code = if e.contains("Parse error") || e.contains("No nodes or domain mappings") {
+                RESULT_CONFIG_ERROR
+            } else {
+                -1
+            };
+            set_last_error(e);
+            code
         }
         Err(_) => {
             jni_log!("[DEBUG:jni] Panic occurred during proxy start");
+            set_last_error("Native proxy start panicked");
             -1
         }
+    }
+}
+
+/// Returns the reason behind the last failed native call, and clears it.
+///
+/// The start entry points return only an int, so this is how Kotlin learns what actually went
+/// wrong (a malformed node ID, an occupied port, ...). Returns null when there is nothing to
+/// report.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeTakeLastError(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let message = match take_last_error() {
+        Some(message) => message,
+        None => return std::ptr::null_mut(),
+    };
+    match env.new_string(message) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Validates a node ID with the exact parser the connection path uses.
+///
+/// Returns null when it parses, otherwise the parser's reason. Callers use this for pre-flight
+/// checks and to give immediate feedback while the user edits a node.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeValidateNodeId(
+    mut env: JNIEnv,
+    _class: JClass,
+    node_id: JString,
+) -> jstring {
+    if env.exception_check().unwrap_or(false) {
+        jni_log!("JNI exception pending before nativeValidateNodeId");
+        env.exception_clear().ok();
+        return std::ptr::null_mut();
+    }
+
+    let node_id = match env.get_string(&node_id) {
+        Ok(s) => match s.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return std::ptr::null_mut(),
+        },
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let reason = match node_id_error(node_id.trim()) {
+        Some(reason) => reason,
+        None => return std::ptr::null_mut(),
+    };
+
+    match env.new_string(reason) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
     }
 }
 

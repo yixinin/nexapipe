@@ -6,6 +6,12 @@ pub struct ShutdownSignal {
     shutdown_requested: AtomicBool,
 }
 
+impl Default for ShutdownSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ShutdownSignal {
     pub fn new() -> Self {
         ShutdownSignal {

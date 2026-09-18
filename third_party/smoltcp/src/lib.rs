@@ -1,5 +1,12 @@
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![deny(unsafe_code)]
+// Vendored fork of smoltcp 0.12.0 (see the `[patch.crates-io]` section in the root
+// Cargo.toml). Upstream is not lint-clean under this toolchain and, being a path
+// dependency, this crate is exempt from the `--cap-lints allow` cargo applies to
+// registry dependencies — so its ~23 warnings would otherwise drown out the ones
+// for the crates we own. Lint silencing only: the fork's logic is untouched.
+#![allow(unused)]
+#![allow(mismatched_lifetime_syntaxes)]
 
 //! The _smoltcp_ library is built in a layered structure, with the layers corresponding
 //! to the levels of API abstraction. Only the highest layers would be used by a typical

@@ -1,5 +1,7 @@
-﻿use crate::auth::{AuthConfig, AuthMessage, TotpValidator};
+use crate::auth::{AuthConfig, AuthMessage, TotpValidator};
 use crate::http;
+use crate::l4;
+use crate::passthrough;
 use crate::routes::{BackendInfo, RouteConfig};
 use ::http::Request;
 use hyper_util::client::legacy;
@@ -9,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_stream::StreamExt;
 
 type HttpClient = legacy::Client<
-    hyper_rustls::HttpsConnector<legacy::connect::HttpConnector>,
+    legacy::connect::HttpConnector,
     http_body_util::Full<bytes::Bytes>,
 >;
 
@@ -22,6 +24,8 @@ pub async fn handle_bidi_stream(
     recv: iroh::endpoint::RecvStream,
     config: &RouteConfig,
     client: &HttpClient,
+    limiter: &Arc<l4::FlowLimiter>,
+    peer: &str,
 ) -> anyhow::Result<()> {
     let mut recv = recv;
     let mut buf = Vec::with_capacity(8192);
@@ -33,6 +37,22 @@ pub async fn handle_bidi_stream(
             Ok(None) => break,
             Ok(Some(n)) => {
                 buf.extend_from_slice(&read_buf[..n]);
+
+                // An L4 tunnel says so in its first byte, so it is recognised
+                // rather than sniffed. This has to happen before the HTTP header
+                // loop below: a preface is not a request line, and the client may
+                // send its first payload in the same segment, which `buf` already
+                // holds and must hand over intact.
+                if buf.first().is_some_and(|b| l4::is_l4_stream(*b)) {
+                    return l4::handle_iroh_stream(send, recv, buf, config, limiter, peer).await;
+                }
+
+                // TLS is terminated by the backend, so a ClientHello is not a
+                // request: hand the raw bytes (and both halves of the stream)
+                // to the passthrough path, which routes on SNI.
+                if buf.first().is_some_and(|b| passthrough::is_tls_handshake(*b)) {
+                    return passthrough::handle_iroh_stream(send, recv, buf, config).await;
+                }
 
                 if let Some(pos) = find_headers_end(&buf) {
                     let headers_end = pos + 4;
@@ -75,20 +95,17 @@ pub async fn handle_bidi_stream(
         Some(h) => config.get_backend(h, path).await,
         None => BackendInfo {
             url: config.default_backend().await,
-            verify_cert: true,
             path_rewrite: None,
-            redirect_to_https: false,
             path_pattern: "/".to_string(),
             path_is_prefix: true,
         },
     };
 
     tracing::debug!(
-        "Request: host={:?}, path={} -> backend={}, verify_cert={}",
+        "Request: host={:?}, path={} -> backend={}",
         host,
         path,
-        backend_info.url,
-        backend_info.verify_cert
+        backend_info.url
     );
     tracing::debug!("Received request: {} {}", request.method(), request.uri());
 
@@ -97,8 +114,15 @@ pub async fn handle_bidi_stream(
         handle_websocket_stream(send, recv, &request, &backend_info.url).await?;
     } else {
         let mut send = send;
-        http::proxy_to_backend_streaming(client, &request, &backend_info.url, body_data, &mut send, &mut recv)
-            .await?;
+        http::proxy_to_backend_streaming(
+            client,
+            &request,
+            &backend_info.url,
+            body_data,
+            &mut send,
+            &mut recv,
+        )
+        .await?;
     }
 
     Ok(())
@@ -207,6 +231,7 @@ async fn handle_websocket_stream(
                     Ok(None) => return "iroh_finished",
                     Ok(Some(n)) => {
                         if let Err(e) = backend_write.write_all(&buf[..n]).await {
+                            tracing::debug!("WebSocket backend write failed: {}", e);
                             return "backend_write_error";
                         }
                     }
@@ -223,6 +248,7 @@ async fn handle_websocket_stream(
                     Ok(0) => return "backend_finished",
                     Ok(n) => {
                         if let Err(e) = send.write_all(&buf[..n]).await {
+                            tracing::debug!("WebSocket iroh write failed: {}", e);
                             return "iroh_write_error";
                         }
                     }
@@ -273,17 +299,21 @@ async fn perform_authentication(
     conn: &Connection,
     config: &AuthConfig,
 ) -> Result<String, anyhow::Error> {
-    let (mut send, mut recv) = conn.accept_bi().await
+    let (mut send, mut recv) = conn
+        .accept_bi()
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to open auth stream: {}", e))?;
 
     // Step 1: Receive AUTH_START
     let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf).await
+    recv.read_exact(&mut len_buf)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to read AUTH_START length: {}", e))?;
     let msg_len = u32::from_le_bytes(len_buf) as usize;
 
     let mut msg_buf = vec![0u8; msg_len];
-    recv.read_exact(&mut msg_buf).await
+    recv.read_exact(&mut msg_buf)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to read AUTH_START message: {}", e))?;
 
     let start_msg = AuthMessage::from_bytes(&msg_buf)
@@ -298,7 +328,8 @@ async fn perform_authentication(
     let nonce: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
     let challenge_msg = AuthMessage::Challenge { nonce };
 
-    let challenge_bytes = challenge_msg.to_bytes()
+    let challenge_bytes = challenge_msg
+        .to_bytes()
         .map_err(|e| anyhow::anyhow!("Failed to serialize challenge: {}", e))?;
     let len = challenge_bytes.len() as u32;
     send.write_all(&len.to_le_bytes()).await?;
@@ -306,21 +337,25 @@ async fn perform_authentication(
 
     // Step 3: Receive AUTH_RESPONSE
     let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf).await
+    recv.read_exact(&mut len_buf)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to read AUTH_RESPONSE length: {}", e))?;
     let msg_len = u32::from_le_bytes(len_buf) as usize;
 
     let mut msg_buf = vec![0u8; msg_len];
-    recv.read_exact(&mut msg_buf).await
+    recv.read_exact(&mut msg_buf)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to read AUTH_RESPONSE message: {}", e))?;
 
     let response_msg = AuthMessage::from_bytes(&msg_buf)
         .map_err(|e| anyhow::anyhow!("Failed to parse AUTH_RESPONSE: {}", e))?;
 
     let (resp_client_id, _timestamp, totp_code) = match response_msg {
-        AuthMessage::Response { client_id, timestamp, totp_code } => {
-            (client_id, timestamp, totp_code)
-        }
+        AuthMessage::Response {
+            client_id,
+            timestamp,
+            totp_code,
+        } => (client_id, timestamp, totp_code),
         _ => return Err(anyhow::anyhow!("Expected AUTH_RESPONSE message")),
     };
 
@@ -340,7 +375,8 @@ async fn perform_authentication(
         }
     };
 
-    let result_bytes = result_msg.to_bytes()
+    let result_bytes = result_msg
+        .to_bytes()
         .map_err(|e| anyhow::anyhow!("Failed to serialize auth result: {}", e))?;
     let len = result_bytes.len() as u32;
     send.write_all(&len.to_le_bytes()).await?;
@@ -351,7 +387,10 @@ async fn perform_authentication(
     if is_valid {
         Ok(client_id)
     } else {
-        Err(anyhow::anyhow!("Invalid TOTP code for client '{}'", client_id))
+        Err(anyhow::anyhow!(
+            "Invalid TOTP code for client '{}'",
+            client_id
+        ))
     }
 }
 
@@ -362,11 +401,20 @@ pub async fn handle_connection(
     auth_config: Option<Arc<tokio::sync::RwLock<AuthConfig>>>,
 ) {
     let peer_id = conn.remote_id();
+    let peer = peer_id.to_string();
     tracing::info!("New connection from peer: {}", peer_id);
+
+    // One counter for the whole connection: the L4 path hands out a slot per flow and
+    // answers `TooManyFlows` once it is full, so a client with many UDP flows fails the
+    // one that does not fit instead of blocking inside `open_bi`.
+    let limiter = Arc::new(l4::FlowLimiter::new(l4::DEFAULT_MAX_FLOWS_PER_CONNECTION));
 
     let paths = conn.paths();
     if let Some(selected_path) = paths.iter().find(|p| p.is_selected()) {
-        tracing::info!("Initial connection type: {}", get_connection_type(&selected_path));
+        tracing::info!(
+            "Initial connection type: {}",
+            get_connection_type(&selected_path)
+        );
     } else {
         tracing::info!("Initial connection type: Unknown (no selected path)");
     }
@@ -375,15 +423,12 @@ pub async fn handle_connection(
     tokio::spawn(async move {
         let mut path_events = conn_clone.path_events();
         while let Some(event) = path_events.next().await {
-            match event {
-                iroh::endpoint::PathEvent::Selected { remote_addr, .. } => {
-                    if remote_addr.is_ip() {
-                        tracing::info!("Connection upgraded: Relay -> Direct");
-                    } else if remote_addr.is_relay() {
-                        tracing::info!("Connection downgraded: Direct -> Relay");
-                    }
+            if let iroh::endpoint::PathEvent::Selected { remote_addr, .. } = event {
+                if remote_addr.is_ip() {
+                    tracing::info!("Connection upgraded: Relay -> Direct");
+                } else if remote_addr.is_relay() {
+                    tracing::info!("Connection downgraded: Direct -> Relay");
                 }
-                _ => {}
             }
         }
     });
@@ -394,7 +439,11 @@ pub async fn handle_connection(
         if cfg.enabled {
             match perform_authentication(&conn, &cfg).await {
                 Ok(client_id) => {
-                    tracing::info!("Client '{}' authenticated successfully from {}", client_id, peer_id);
+                    tracing::info!(
+                        "Client '{}' authenticated successfully from {}",
+                        client_id,
+                        peer_id
+                    );
                 }
                 Err(e) => {
                     tracing::warn!("Authentication failed for {}: {}", peer_id, e);
@@ -411,11 +460,20 @@ pub async fn handle_connection(
             Ok((send, recv)) => {
                 let config_clone = config.clone();
                 let client_clone = client.clone();
+                let limiter_clone = limiter.clone();
+                let peer_clone = peer.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_bidi_stream(send, recv, &config_clone, &client_clone).await
+                    if let Err(e) = handle_bidi_stream(
+                        send,
+                        recv,
+                        &config_clone,
+                        &client_clone,
+                        &limiter_clone,
+                        &peer_clone,
+                    )
+                    .await
                     {
-                        tracing::error!("Failed to handle stream from {}: {}", peer_id, e);
+                        tracing::error!("Failed to handle stream from {}: {}", peer_clone, e);
                     }
                 });
             }

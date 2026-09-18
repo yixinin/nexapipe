@@ -10,6 +10,12 @@ pub struct RoundRobinBalancer {
     index: AtomicUsize,
 }
 
+impl Default for RoundRobinBalancer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RoundRobinBalancer {
     pub fn new() -> Self {
         Self {
@@ -27,6 +33,12 @@ impl RoundRobinBalancer {
 }
 
 pub struct RandomBalancer;
+
+impl Default for RandomBalancer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl RandomBalancer {
     pub fn new() -> Self {
