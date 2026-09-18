@@ -562,7 +562,7 @@ mod tests {
                 tcp_route("db.test", tcp_backend),
                 udp_route("turn.test", udp_backend, None),
             ],
-            "http://default:80".to_string(),
+            Some("http://default:80".to_string()),
         )
     }
 
@@ -777,7 +777,7 @@ mod tests {
         let idle = Duration::from_millis(150);
         let config = RouteConfig::new(
             vec![udp_route("turn.test", &backend_addr.to_string(), Some(idle))],
-            "http://default:80".to_string(),
+            Some("http://default:80".to_string()),
         );
 
         let (mut client, server) = tokio::io::duplex(4096);

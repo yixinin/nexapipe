@@ -219,11 +219,11 @@ async fn run_server_mode(
 
     let mut routes = Vec::new();
 
-    if let Err(e) = config::validate_backend(
-        "default_backend",
-        RouteMode::Http,
-        &proxy_config.default_backend,
-    ) {
+    // Optional: without it an unrouted `Host` is answered 404 instead of being
+    // forwarded somewhere arbitrary.
+    if let Some(default_backend) = &proxy_config.default_backend
+        && let Err(e) = config::validate_backend("default_backend", RouteMode::Http, default_backend)
+    {
         tracing::error!("{}", e);
         std::process::exit(1);
     }
@@ -294,7 +294,6 @@ async fn run_server_mode(
     }
 
     tracing::info!("Starting proxy with domain-based and path-based routing");
-    tracing::info!("Default backend: {}", proxy_config.default_backend);
 
     // Load 2FA auth config
     let auth_config = match ProxyConfig::load_with_auth(config_path) {

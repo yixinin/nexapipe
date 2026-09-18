@@ -62,7 +62,16 @@ pub async fn proxy_request(
     let headers_clone = req.headers().clone();
     let method = req.method().clone();
 
-    let backend_info: BackendInfo = config.get_backend(host, path).await;
+    let backend_info: BackendInfo = match config.get_backend(host, path).await {
+        Some(info) => info,
+        None => {
+            // No route and no `default_backend`: saying 404 beats guessing.
+            return Ok(create_error_response(
+                hyper::StatusCode::NOT_FOUND,
+                &format!("No route for host {host} and no default_backend is configured"),
+            ));
+        }
+    };
 
     let rewritten_path = if let Some(rewrite_pattern) = &backend_info.path_rewrite {
         if backend_info.path_is_prefix && path.starts_with(&backend_info.path_pattern) {

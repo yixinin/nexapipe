@@ -179,18 +179,24 @@ pub struct L4RouteInfo {
 #[derive(Debug, Clone)]
 pub struct RouteConfig {
     routes: Arc<RwLock<Vec<Route>>>,
-    default_backend: Arc<RwLock<String>>,
+    default_backend: Arc<RwLock<Option<String>>>,
 }
 
 impl RouteConfig {
-    pub fn new(routes: Vec<Route>, default_backend: String) -> Self {
+    pub fn new(routes: Vec<Route>, default_backend: Option<String>) -> Self {
         Self {
             routes: Arc::new(RwLock::new(routes)),
             default_backend: Arc::new(RwLock::new(default_backend)),
         }
     }
 
-    pub async fn get_backend(&self, host: &str, path: &str) -> BackendInfo {
+    /// Backend for an HTTP request, or `None` when nothing serves it.
+    ///
+    /// `None` means the caller must answer 404 — not pick some address at
+    /// random. The old behaviour of falling back to a required
+    /// `default_backend` meant a mistyped host silently reached an unrelated
+    /// service; with it optional, the honest answer is "no route".
+    pub async fn get_backend(&self, host: &str, path: &str) -> Option<BackendInfo> {
         tracing::debug!("Looking up backend for host={}, path={}", host, path);
 
         // Only `http` routes take requests. A passthrough route exists so its
@@ -210,25 +216,36 @@ impl RouteConfig {
                 host,
                 path
             );
-            BackendInfo {
+            return Some(BackendInfo {
                 url: backend_url,
                 path_rewrite: route.path_rewrite().clone(),
                 path_pattern: route.path_pattern().to_string(),
                 path_is_prefix: route.path_is_prefix(),
+            });
+        }
+
+        let default_backend = self.default_backend.read().await.clone();
+        match default_backend {
+            Some(default_backend) => {
+                tracing::debug!(
+                    "No route matched, using default backend: {} for host={}, path={}",
+                    default_backend,
+                    host,
+                    path
+                );
+                Some(BackendInfo {
+                    url: default_backend,
+                    path_rewrite: None,
+                    path_pattern: "/".to_string(),
+                    path_is_prefix: true,
+                })
             }
-        } else {
-            let default_backend = self.default_backend.read().await.clone();
-            tracing::debug!(
-                "No route matched, using default backend: {} for host={}, path={}",
-                default_backend,
-                host,
-                path
-            );
-            BackendInfo {
-                url: default_backend,
-                path_rewrite: None,
-                path_pattern: "/".to_string(),
-                path_is_prefix: true,
+            None => {
+                tracing::debug!(
+                    "No route matched and no default_backend is configured: \
+                     host={host}, path={path} -> 404"
+                );
+                None
             }
         }
     }
@@ -299,7 +316,7 @@ impl RouteConfig {
         self.routes.read().await.clone()
     }
 
-    pub async fn default_backend(&self) -> String {
+    pub async fn default_backend(&self) -> Option<String> {
         self.default_backend.read().await.clone()
     }
 
@@ -309,10 +326,13 @@ impl RouteConfig {
         tracing::info!("Routes updated successfully");
     }
 
-    pub async fn update_default_backend(&self, new_default: String) {
+    pub async fn update_default_backend(&self, new_default: Option<String>) {
         let mut default_backend = self.default_backend.write().await;
-        *default_backend = new_default.clone();
-        tracing::info!("Default backend updated to: {}", new_default);
+        match &new_default {
+            Some(url) => tracing::info!("Default backend updated to: {}", url),
+            None => tracing::info!("Default backend removed: unrouted hosts now get 404"),
+        }
+        *default_backend = new_default;
     }
 }
 
@@ -388,7 +408,7 @@ mod tests {
                 http_route("fn.iroh.iakl.top", &["http://10.0.0.5:8080"]),
                 http_route("mt.iroh.iakl.top", &["http://10.0.0.6:9000"]),
             ],
-            "http://default:80".to_string(),
+            Some("http://default:80".to_string()),
         );
 
         assert_eq!(
@@ -396,7 +416,11 @@ mod tests {
             Some("caddy:443".to_string())
         );
         assert_eq!(
-            config.get_backend("fn.iroh.iakl.top", "/").await.url,
+            config
+                .get_backend("fn.iroh.iakl.top", "/")
+                .await
+                .expect("the http route serves this host")
+                .url,
             "http://10.0.0.5:8080"
         );
         // A host that is only served over plain HTTP has no TLS backend, and
@@ -428,12 +452,16 @@ mod tests {
                 // A UDP service on the same name.
                 l4_route("fn.iroh.iakl.top", RouteMode::Udp, "10.0.0.60:3478", None),
             ],
-            "http://default:80".to_string(),
+            Some("http://default:80".to_string()),
         );
 
         // Plain HTTP request.
         assert_eq!(
-            config.get_backend("fn.iroh.iakl.top", "/").await.url,
+            config
+                .get_backend("fn.iroh.iakl.top", "/")
+                .await
+                .expect("the http route serves this host")
+                .url,
             "http://10.0.0.5:8080"
         );
         // TLS session, routed by SNI.
@@ -475,7 +503,11 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            config.get_backend("nothing.iroh.iakl.top", "/").await.url,
+            config
+                .get_backend("nothing.iroh.iakl.top", "/")
+                .await
+                .expect("an unrouted host falls back to the default backend")
+                .url,
             "http://default:80"
         );
     }
@@ -487,7 +519,7 @@ mod tests {
                 passthrough_route("*", &["caddy:443"]),
                 passthrough_route("other.iakl.top", &["caddy-alt:443"]),
             ],
-            "http://default:80".to_string(),
+            Some("http://default:80".to_string()),
         );
 
         assert_eq!(
@@ -524,7 +556,7 @@ mod tests {
                 l4_route("db.iroh.iakl.top", RouteMode::Tcp, "10.0.0.50:5432", None),
                 http_route("web.iroh.iakl.top", &["http://10.0.0.5:8080"]),
             ],
-            "http://default:80".to_string(),
+            Some("http://default:80".to_string()),
         );
 
         let tcp = config
@@ -555,7 +587,11 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            config.get_backend("web.iroh.iakl.top", "/").await.url,
+            config
+                .get_backend("web.iroh.iakl.top", "/")
+                .await
+                .expect("the http route serves this host")
+                .url,
             "http://10.0.0.5:8080"
         );
     }
@@ -566,7 +602,7 @@ mod tests {
         // to it, a mistyped domain would quietly reach it instead of being refused.
         let config = RouteConfig::new(
             vec![l4_route("db.iroh.iakl.top", RouteMode::Tcp, "10.0.0.50:5432", None)],
-            "http://default:80".to_string(),
+            Some("http://default:80".to_string()),
         );
 
         assert!(
@@ -600,7 +636,7 @@ mod tests {
                     Some(&[6432]),
                 ),
             ],
-            "http://default:80".to_string(),
+            Some("http://default:80".to_string()),
         );
 
         // Each port selects its own route, and each route dials its own backend: the
@@ -634,7 +670,7 @@ mod tests {
     async fn without_client_ports_every_port_matches() {
         let config = RouteConfig::new(
             vec![l4_route("db.iroh.iakl.top", RouteMode::Tcp, "10.0.0.50:5432", None)],
-            "http://default:80".to_string(),
+            Some("http://default:80".to_string()),
         );
 
         for port in [1u16, 443, 5432, 65535] {
@@ -680,6 +716,31 @@ mod tests {
 
         // An HTTP route has no L4 knobs, and asking for them must not invent one.
         assert_eq!(http_route("a.test", &["http://b:80"]).idle_timeout(), None);
+    }
+
+    /// Without a `default_backend`, an unrouted host has nowhere to go and says so.
+    ///
+    /// This is why the key is optional: a config that routes every domain it
+    /// serves used to be forced to name one anyway, and that placeholder then
+    /// quietly absorbed every mistyped or unknown `Host`.
+    #[tokio::test]
+    async fn without_a_default_backend_an_unrouted_host_is_refused() {
+        let config = RouteConfig::new(
+            vec![http_route("fn.iroh.iakl.top", &["http://10.0.0.5:8080"])],
+            None,
+        );
+
+        assert!(config.get_backend("typo.iroh.iakl.top", "/").await.is_none());
+        assert_eq!(config.default_backend().await, None);
+        // The routed host is unaffected.
+        assert_eq!(
+            config
+                .get_backend("fn.iroh.iakl.top", "/")
+                .await
+                .expect("the http route serves this host")
+                .url,
+            "http://10.0.0.5:8080"
+        );
     }
 
     #[test]

@@ -173,7 +173,18 @@ pub struct LogConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProxyConfig {
-    pub default_backend: String,
+    /// Fallback for an HTTP request whose `Host` matches no route.
+    ///
+    /// Optional on purpose: when it is absent, an unrouted host is answered with
+    /// 404 rather than quietly forwarded to whatever service happens to be
+    /// listed. A config that routes every domain it serves does not need one,
+    /// and requiring it only invited a placeholder that silently absorbed
+    /// mistyped and unknown hosts.
+    ///
+    /// `passthrough` and L4 lookups never consult it — see
+    /// [`crate::routes::RouteConfig::get_l4_backend`].
+    #[serde(default)]
+    pub default_backend: Option<String>,
     pub debug: Option<bool>,
     pub routes: Option<Vec<RouteConfig>>,
     pub server: Option<ServerConfig>,

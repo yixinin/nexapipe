@@ -153,12 +153,16 @@ running on the Docker host are reachable.
 ## Configuration
 
 `config.toml` is the single source of truth for both the server and the client
-mode. Only `default_backend` is required.
+mode. Every key is optional.
 
 ### Top level
 
 ```toml
-default_backend = "http://10.0.0.72:15666"   # where unmatched hosts go
+# Where an HTTP request goes when its Host matches no `mode = "http"` route.
+# Optional: without it, an unrouted host is answered 404 instead of being
+# forwarded somewhere arbitrary. `passthrough`, `tcp` and `udp` lookups never
+# use it — they refuse instead.
+default_backend = "http://10.0.0.72:15666"
 debug = true
 ```
 

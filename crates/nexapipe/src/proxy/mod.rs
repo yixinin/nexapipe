@@ -31,13 +31,17 @@ const FIRST_BYTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 
 pub async fn run_proxy(
     routes: Vec<Route>,
-    default_backend: String,
+    default_backend: Option<String>,
     server_config: Option<ServerConfig>,
     iroh_config: Option<IrohConfig>,
     shutdown_signal: Arc<ShutdownSignal>,
     auth_config: Option<AuthConfig>,
 ) -> anyhow::Result<()> {
     let config = Arc::new(RouteConfig::new(routes, default_backend.clone()));
+    match &default_backend {
+        Some(url) => tracing::info!("Default backend: {}", url),
+        None => tracing::info!("No default backend: an unrouted host is answered with 404"),
+    }
     let http_client = Arc::new(http::create_http_client());
 
     // Wrap auth config in Arc<RwLock> for shared access
@@ -108,7 +112,6 @@ pub async fn run_proxy(
 
     tracing::info!("Iroh proxy endpoint started successfully");
     tracing::info!("Node ID: {}", node_id);
-    tracing::info!("Default backend: {}", default_backend);
 
     for (i, route) in config.routes().await.into_iter().enumerate() {
         tracing::info!(
