@@ -505,6 +505,12 @@ handshake before any traffic is proxied.
 Auth settings are read once at startup, so restart the server after adding a
 client. See `config.toml.2fa.example`.
 
+A client that has no credentials against a server that requires them is refused
+too: the QUIC handshake succeeds, and the server closes the connection once the
+handshake deadline (2 s) passes with no `AUTH_START`. The client watches for that
+close and reports a failed start naming the cause, instead of a green
+"connected" over a tunnel the server will not serve.
+
 The QR code carries a standard `otpauth://` URI, so any authenticator app can
 import it, not just the NexaPipe app:
 
