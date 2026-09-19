@@ -136,7 +136,8 @@ running on the Docker host are reachable.
 | `-c, --config <PATH>` | Config file (default `config.toml`). |
 | `--local-proxy` | Run as a client-side local HTTP proxy instead of a server. |
 | `--generate-secret` | Print a new iroh secret key for a stable endpoint identity. |
-| `--generate-2fa <CLIENT_ID>` | Generate a TOTP secret and print an enrollment QR code. |
+| `--generate-2fa <CLIENT_ID>` | Generate a TOTP secret, write it to the config and print an enrollment QR code. |
+| `--force` | With `--generate-2fa`: rotate the secret of a client that already has one. |
 | `--show-2fa <CLIENT_ID>` | Print the QR code of a client already in `[auth.clients]`. |
 | `--issuer <NAME>` | Issuer label shown by the authenticator app. |
 | `--qr-format <FMT>` | `unicode` (default), `plain`, `ascii`, `svg`, `none`. |
@@ -469,13 +470,17 @@ passthrough.
 When `[auth] enabled = true`, every client connection must complete a TOTP
 handshake before any traffic is proxied.
 
-1. Generate a secret and a scannable QR code:
+1. Generate a secret and a scannable QR code. The secret is written into
+   `[auth.clients]` of your `config.toml` as it is printed, so step 2 is only
+   about turning 2FA on:
 
    ```bash
    cargo run -p nexapipe -- --generate-2fa client-001 --qr-format unicode
    ```
 
-2. Add the printed secret to the server config:
+2. Make sure `[auth]` is on in the server config. The command adds
+   `[auth.clients.client-001]` for you and never flips `enabled` — that switch
+   affects every client, so it stays yours to pull:
 
    ```toml
    [auth]
@@ -487,7 +492,7 @@ handshake before any traffic is proxied.
    max_attempts = 5
    lockout_duration = 300
 
-   [auth.clients.client-001]
+   [auth.clients.client-001]     # written by --generate-2fa
    secret = "JBSWY3DPEHPK3PXP"
    ```
 
@@ -524,6 +529,13 @@ Notes:
   overrides it for a single run. Both default to `NexaPipe`.
 - An already configured client can be printed again later, for another device:
   `cargo run -p nexapipe -- --show-2fa client-001`.
+- `--generate-2fa` on a client that already has a secret prints **that** secret
+  instead of a new one, so the QR code always matches the server. Add `--force`
+  to rotate it: the config is updated, and every device enrolled with the old
+  secret has to scan again.
+- The write edits `config.toml` in place, keeping comments and formatting. If the
+  file cannot be read or written (missing, not valid TOML, read-only), the secret
+  is only printed and you add it by hand.
 - `algorithm`, `time_step` and `digits` are read when the QR code is generated,
   not when it is scanned: a client that has already imported the credentials
   keeps the values it was enrolled with, so leave them stable.

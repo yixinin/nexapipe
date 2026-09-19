@@ -526,6 +526,12 @@ pub struct AuthTomlConfig {
 pub struct ClientAuthToml {
     pub secret: String,
     pub created_at: Option<String>,
+    /// Runtime counters written back by the server (see
+    /// `config_watcher::save_auth_state`); read here so a lockout survives a
+    /// restart.
+    pub failed_attempts: Option<u32>,
+    pub locked_until: Option<u64>,
+    pub last_used: Option<u64>,
 }
 
 impl ProxyConfig {
@@ -561,9 +567,9 @@ impl ProxyConfig {
                                             .map(|d| d.as_secs().to_string())
                                             .unwrap_or_else(|_| "0".to_string())
                                     }),
-                                    last_used: None,
-                                    failed_attempts: 0,
-                                    locked_until: None,
+                                    last_used: client_toml.last_used,
+                                    failed_attempts: client_toml.failed_attempts.unwrap_or(0),
+                                    locked_until: client_toml.locked_until,
                                 },
                             );
                         }
@@ -597,6 +603,81 @@ impl ProxyConfig {
 
         Ok((base, auth_config))
     }
+
+    /// Writes `secret` under `[auth.clients.<client_id>]` of the config file at
+    /// `path`, creating `[auth]` and `[auth.clients]` when they are missing.
+    ///
+    /// The document is edited as TOML instead of being re-serialized from a
+    /// `ProxyConfig`, so comments, key order and the layout of every other
+    /// section survive — which is the whole point, this edits the file a human
+    /// wrote. `force` is what allows an existing secret to be replaced: a device
+    /// that already imported the old one stops authenticating the instant it
+    /// changes, so callers keep the existing secret unless told otherwise.
+    ///
+    /// `[auth] enabled` is deliberately left alone: flipping it on would turn
+    /// 2FA on for every client, not just the one being enrolled.
+    pub fn write_client_secret(
+        path: &str,
+        client_id: &str,
+        secret: &str,
+        force: bool,
+    ) -> anyhow::Result<ClientSecretWrite> {
+        let content =
+            fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+        let mut doc: toml_edit::DocumentMut = content
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{path} is not valid TOML, secret not written ({e})"))?;
+
+        let auth = sub_table(doc.as_table_mut(), "auth", path)?;
+        let clients = sub_table(auth, "clients", path)?;
+        let client = sub_table(clients, client_id, path)?;
+
+        let replaced = client.contains_key("secret");
+        if replaced && !force {
+            anyhow::bail!("client \"{client_id}\" already has a secret in {path}");
+        }
+        client.insert("secret", toml_edit::value(secret));
+
+        fs::write(path, doc.to_string())
+            .map_err(|e| anyhow::anyhow!("cannot write {path}: {e}"))?;
+
+        Ok(if replaced {
+            ClientSecretWrite::Replaced
+        } else {
+            ClientSecretWrite::Added
+        })
+    }
+}
+
+/// What [`ProxyConfig::write_client_secret`] did to the config file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientSecretWrite {
+    /// A `[auth.clients.<id>]` section was added, creating `[auth]` if needed.
+    Added,
+    /// The client already had a secret, and it was replaced.
+    Replaced,
+}
+
+/// `parent[key]` as a table, creating it when it is missing.
+///
+/// A table created here is implicit: it is left out of the output while it holds
+/// nothing of its own, so a config with no `[auth]` at all gains the one leaf
+/// section instead of two empty headers above it.
+fn sub_table<'a>(
+    parent: &'a mut dyn toml_edit::TableLike,
+    key: &str,
+    path: &str,
+) -> anyhow::Result<&'a mut dyn toml_edit::TableLike> {
+    let item = match parent.entry(key) {
+        toml_edit::Entry::Occupied(entry) => entry.into_mut(),
+        toml_edit::Entry::Vacant(entry) => {
+            let mut table = toml_edit::Table::new();
+            table.set_implicit(true);
+            entry.insert(toml_edit::Item::Table(table))
+        }
+    };
+    item.as_table_like_mut()
+        .ok_or_else(|| anyhow::anyhow!("{path}: [{key}] is not a table, secret not written"))
 }
 
 #[cfg(test)]
@@ -936,5 +1017,128 @@ domains = ["fn.iroh.iakl.top"]
         // business — a TLS target is conventionally written either way.
         assert!(validate_backend("route b", RouteMode::Passthrough, "caddy:443").is_ok());
         assert!(validate_backend("route b", RouteMode::Passthrough, "https://caddy:443").is_ok());
+    }
+
+    /// A config file in a scratch directory, for the functions that write.
+    fn scratch_config(source: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, source).expect("write scratch config");
+        (dir, path.to_string_lossy().into_owned())
+    }
+
+    /// The client the server would see after a write, read back through the
+    /// very loader `--generate-2fa` and the server share.
+    fn secret_of(path: &str, client_id: &str) -> Option<String> {
+        let (_, auth) = ProxyConfig::load_with_auth(path).expect("config still parses");
+        auth.and_then(|auth| auth.clients.get(client_id).map(|c| c.secret.clone()))
+    }
+
+    #[test]
+    fn client_secret_is_appended_without_rewriting_the_file() {
+        // `--generate-2fa` edits a file a human wrote, so the comment, the key
+        // order and the layout of everything outside `[auth]` have to survive.
+        let (_dir, path) = scratch_config(
+            "# my proxy\n\
+             default_backend = \"http://127.0.0.1:15666\"\n\
+             \n\
+             [[routes]]\n\
+             host_pattern = \"a.example\"\n\
+             backends = [\"http://127.0.0.1:8080\"]\n",
+        );
+
+        let outcome =
+            ProxyConfig::write_client_secret(&path, "client-001", "JBSWY3DPEHPK3PXP", false)
+                .expect("secret should be written");
+        assert_eq!(outcome, ClientSecretWrite::Added);
+
+        let written = fs::read_to_string(&path).expect("read back");
+        assert!(written.starts_with("# my proxy\n"));
+        assert!(written.contains("default_backend = \"http://127.0.0.1:15666\""));
+        assert!(written.contains("[[routes]]"));
+        assert!(written.contains("[auth.clients.client-001]"));
+        assert_eq!(
+            secret_of(&path, "client-001").as_deref(),
+            Some("JBSWY3DPEHPK3PXP")
+        );
+    }
+
+    #[test]
+    fn client_secret_joins_an_existing_auth_section() {
+        let (_dir, path) = scratch_config(
+            "[auth]\n\
+             enabled = true\n\
+             \n\
+             [auth.clients.other]\n\
+             secret = \"AAAAAAAAAAAAAAAA\"\n",
+        );
+
+        let outcome =
+            ProxyConfig::write_client_secret(&path, "client-002", "JBSWY3DPEHPK3PXP", false)
+                .expect("secret should be written");
+        assert_eq!(outcome, ClientSecretWrite::Added);
+
+        let written = fs::read_to_string(&path).expect("read back");
+        assert!(written.contains("[auth.clients.other]"));
+        assert_eq!(
+            secret_of(&path, "other").as_deref(),
+            Some("AAAAAAAAAAAAAAAA"),
+            "the neighbouring client must not be touched"
+        );
+        assert_eq!(
+            secret_of(&path, "client-002").as_deref(),
+            Some("JBSWY3DPEHPK3PXP")
+        );
+        // 2FA was already on and stays on; enabling it is the operator's call.
+        let (_, auth) = ProxyConfig::load_with_auth(&path).expect("config parses");
+        assert!(auth.expect("[auth] exists").enabled);
+    }
+
+    #[test]
+    fn client_secret_needs_force_to_replace_one() {
+        let (_dir, path) = scratch_config(
+            "[auth]\n\
+             enabled = true\n\
+             \n\
+             [auth.clients.client-001]\n\
+             secret = \"OLDOLDOLDOLDOLD\"\n",
+        );
+
+        let err = ProxyConfig::write_client_secret(&path, "client-001", "JBSWY3DPEHPK3PXP", false)
+            .expect_err("an enrolled client must not lose its secret by accident");
+        assert!(err.to_string().contains("already has a secret"));
+        assert_eq!(
+            secret_of(&path, "client-001").as_deref(),
+            Some("OLDOLDOLDOLDOLD")
+        );
+
+        let outcome =
+            ProxyConfig::write_client_secret(&path, "client-001", "JBSWY3DPEHPK3PXP", true)
+                .expect("force replaces it");
+        assert_eq!(outcome, ClientSecretWrite::Replaced);
+        assert_eq!(
+            secret_of(&path, "client-001").as_deref(),
+            Some("JBSWY3DPEHPK3PXP")
+        );
+    }
+
+    #[test]
+    fn client_ids_that_are_not_bare_keys_are_quoted() {
+        // `[auth.clients.client.001]` would nest three tables; the id has to be
+        // quoted so it stays one key.
+        let (_dir, path) = scratch_config("default_backend = \"http://127.0.0.1:15666\"\n");
+
+        ProxyConfig::write_client_secret(&path, "client.001", "JBSWY3DPEHPK3PXP", false)
+            .expect("secret should be written");
+
+        let written = fs::read_to_string(&path).expect("read back");
+        assert!(
+            written.contains("[auth.clients.\"client.001\"]"),
+            "{written}"
+        );
+        assert_eq!(
+            secret_of(&path, "client.001").as_deref(),
+            Some("JBSWY3DPEHPK3PXP")
+        );
     }
 }

@@ -3,8 +3,13 @@
 // Provides TOTP code generation and authentication handshake.
 
 use crate::ClientError;
+use hmac::{Hmac, Mac};
 use iroh::endpoint::Connection;
+use sha2::Sha256;
 use totp_rs::{Algorithm, Secret, TOTP};
+
+/// HMAC-SHA256 keyed by the TOTP secret, used to sign auth challenges.
+type HmacSha256 = Hmac<Sha256>;
 
 /// TOTP algorithm variants
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -131,6 +136,16 @@ impl TwoFactorAuth {
         &self.client_id
     }
 
+    /// Sign a server challenge: HMAC-SHA256(secret, nonce || timestamp_le).
+    ///
+    /// Keep in sync with `hmac_signature` in `crates/nexapipe/src/auth/totp.rs`.
+    pub fn sign_challenge(&self, nonce: &[u8], timestamp: i64) -> Vec<u8> {
+        let mut mac = HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts any key length");
+        mac.update(nonce);
+        mac.update(&timestamp.to_le_bytes());
+        mac.finalize().into_bytes().to_vec()
+    }
+
     /// Authenticate with the server over a connection
     pub async fn authenticate(&self, conn: &Connection) -> Result<(), ClientError> {
         use crate::auth::auth_protocol::AuthMessage;
@@ -179,18 +194,28 @@ impl TwoFactorAuth {
         let challenge_msg = AuthMessage::from_bytes(&msg_buf)
             .map_err(|e| ClientError::Other(format!("Deserialization error: {}", e)))?;
 
-        let _nonce = match challenge_msg {
+        let nonce = match challenge_msg {
             AuthMessage::Challenge { nonce } => nonce,
             _ => return Err(ClientError::Other("Expected AUTH_CHALLENGE".to_string())),
         };
 
-        // Step 3: Generate and send AUTH_RESPONSE
+        // Step 3: Generate and send AUTH_RESPONSE. The signature proves
+        // possession of the secret and binds the response to this connection's
+        // challenge; the timestamp is taken now, not reused from AUTH_START, so
+        // the server's freshness window is measured from the actual response.
         let totp_code = self.generate_code()?;
+
+        let response_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let signature = self.sign_challenge(&nonce, response_timestamp);
 
         let response_msg = AuthMessage::Response {
             client_id: self.client_id.clone(),
-            timestamp,
+            timestamp: response_timestamp,
             totp_code,
+            signature,
         };
 
         let response_bytes = response_msg
@@ -252,6 +277,8 @@ pub mod auth_protocol {
             client_id: String,
             timestamp: i64,
             totp_code: String,
+            /// HMAC-SHA256(secret, nonce || timestamp_le) over the challenge.
+            signature: Vec<u8>,
         },
         #[serde(rename = "AUTH_OK")]
         Ok,

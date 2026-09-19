@@ -1,3 +1,4 @@
+use crate::auth::AuthConfig;
 use crate::config::ProxyConfig;
 use crate::proxy::{HttpClient, spawn_health_checks};
 use crate::routes::RouteConfig;
@@ -104,3 +105,53 @@ impl ConfigWatcher {
 }
 
 pub type SharedConfigWatcher = Arc<ConfigWatcher>;
+
+/// Persists the runtime 2FA counters of `config` into the file at `path`.
+///
+/// A lockout only means anything if it survives a restart, so
+/// `failed_attempts`, `locked_until` and `last_used` are written back whenever
+/// the connection layer changes them. Only those three keys of
+/// `[auth.clients.<id>]` are touched — and only for clients that already have
+/// a section on disk, so a stale in-memory entry cannot resurrect a client
+/// the operator removed. Everything else in the file, comments included,
+/// survives byte for byte, exactly like [`ProxyConfig::write_client_secret`].
+pub fn save_auth_state(path: &str, config: &AuthConfig) -> anyhow::Result<()> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+    let mut doc: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|e| anyhow::anyhow!("{path} is not valid TOML, auth state not written ({e})"))?;
+
+    let clients = doc
+        .as_table_mut()
+        .get_mut("auth")
+        .and_then(|item| item.as_table_like_mut())
+        .and_then(|auth| auth.get_mut("clients"))
+        .and_then(|item| item.as_table_like_mut())
+        .ok_or_else(|| anyhow::anyhow!("{path} has no [auth.clients] table, auth state not written"))?;
+
+    for (id, client) in &config.clients {
+        let Some(table) = clients.get_mut(id).and_then(|item| item.as_table_like_mut()) else {
+            // Not on disk: the operator edited the file under us; writing a
+            // section without a secret would break the next load.
+            continue;
+        };
+        set_counter(table, "failed_attempts", client.failed_attempts as u64);
+        set_counter(table, "locked_until", client.locked_until.unwrap_or(0));
+        set_counter(table, "last_used", client.last_used.unwrap_or(0));
+    }
+
+    std::fs::write(path, doc.to_string())
+        .map_err(|e| anyhow::anyhow!("cannot write {path}: {e}"))
+}
+
+/// Writes `value` under `key`, or removes the key when the counter is back at
+/// zero — a config file should not accumulate `failed_attempts = 0` lines for
+/// every client that ever mistyped a code.
+fn set_counter(table: &mut dyn toml_edit::TableLike, key: &str, value: u64) {
+    if value != 0 {
+        table.insert(key, toml_edit::value(value as i64));
+    } else {
+        table.remove(key);
+    }
+}

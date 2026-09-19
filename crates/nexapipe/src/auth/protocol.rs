@@ -1,10 +1,17 @@
-﻿//! Authentication protocol for client-server handshake.
+//! Authentication protocol for client-server handshake.
 //!
 //! Protocol flow:
 //! 1. Client -> Server: AUTH_START { client_id, timestamp }
 //! 2. Server -> Client: AUTH_CHALLENGE { nonce }
-//! 3. Client -> Server: AUTH_RESPONSE { client_id, timestamp, totp_code }
+//! 3. Client -> Server: AUTH_RESPONSE { client_id, timestamp, totp_code, signature }
 //! 4. Server -> Client: AUTH_OK | AUTH_FAILED { reason }
+//!
+//! The response is signed: `signature` is
+//! HMAC-SHA256(secret, nonce || timestamp.to_le_bytes()) over the client's
+//! Base32-decoded TOTP secret, so a response only validates against the
+//! challenge that was issued for this very connection — an intercepted
+//! response cannot be replayed over a new one, and the timestamp bounds how
+//! long even the right response stays acceptable.
 
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +31,10 @@ pub enum AuthMessage {
         client_id: String,
         timestamp: i64,
         totp_code: String,
+        /// HMAC-SHA256 over `nonce || timestamp.to_le_bytes()` keyed with the
+        /// client's TOTP secret, proving the response was built for this
+        /// connection's challenge by someone holding the secret.
+        signature: Vec<u8>,
     },
     /// Server confirms authentication success
     #[serde(rename = "AUTH_OK")]
@@ -42,33 +53,5 @@ impl AuthMessage {
     /// Deserialize message from bytes
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(bytes)
-    }
-}
-
-/// Authentication state for a connection
-#[derive(Debug, Clone, PartialEq)]
-pub enum AuthState {
-    /// Not yet authenticated
-    Unauthenticated,
-    /// Authentication in progress
-    InProgress { client_id: String, nonce: Vec<u8> },
-    /// Successfully authenticated
-    Authenticated { client_id: String },
-    /// Authentication failed
-    Failed { reason: String },
-}
-
-impl AuthState {
-    /// Check if we can proceed with proxying
-    pub fn is_authenticated(&self) -> bool {
-        matches!(self, AuthState::Authenticated { .. })
-    }
-
-    /// Get client ID if authenticated
-    pub fn client_id(&self) -> Option<&str> {
-        match self {
-            AuthState::Authenticated { client_id } => Some(client_id),
-            _ => None,
-        }
     }
 }

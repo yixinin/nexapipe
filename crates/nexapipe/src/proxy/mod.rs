@@ -120,8 +120,8 @@ pub async fn run_proxy(
     });
     tracing::info!("Config watcher started, monitoring: {}", config_path);
 
-    // Wrap auth config in Arc<RwLock> for shared access
-    let auth_config = auth_config.map(|cfg| Arc::new(tokio::sync::RwLock::new(cfg)));
+    // 2FA state: the shared config plus the file its lockout counters persist to.
+    let auth_state = auth_config.map(|cfg| conn::AuthState::new(cfg, config_path));
 
     let mut builder = Endpoint::builder(presets::N0).alpns(vec![ALPN_NEXAPIPE.to_vec()]);
 
@@ -249,9 +249,9 @@ pub async fn run_proxy(
                     Some(incoming) => {
                         let config_clone = config.clone();
                         let http_client_clone = http_client.clone();
-                        let auth_config_clone = auth_config.clone();
+                        let auth_state_clone = auth_state.clone();
                         tokio::spawn(async move {
-                            conn::handle_incoming(incoming, config_clone, http_client_clone, auth_config_clone).await;
+                            conn::handle_incoming(incoming, config_clone, http_client_clone, auth_state_clone).await;
                         });
                     }
                     None => {

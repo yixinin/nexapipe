@@ -1,4 +1,5 @@
-use crate::auth::{AuthConfig, AuthMessage, TotpValidator};
+use crate::auth::{AuthConfig, AuthError, AuthMessage, TotpValidator};
+use crate::config_watcher::save_auth_state;
 use crate::http;
 use crate::l4;
 use crate::passthrough;
@@ -45,6 +46,37 @@ mod auth_close_code {
     pub const REQUIRED: u32 = 2;
     /// The handshake ran, but the client is unknown or its code was rejected.
     pub const REJECTED: u32 = 3;
+}
+
+/// The live 2FA state a connection authenticates against.
+///
+/// The config is shared: every connection reads it to validate, and the ones
+/// that fail write their lockout counters back into it. The path is where
+/// those counters are persisted, so a lockout survives a restart.
+#[derive(Clone)]
+pub struct AuthState {
+    config: Arc<tokio::sync::RwLock<AuthConfig>>,
+    path: String,
+}
+
+impl AuthState {
+    /// Wraps a freshly loaded config together with the file it came from.
+    pub fn new(config: AuthConfig, path: impl Into<String>) -> Self {
+        Self {
+            config: Arc::new(tokio::sync::RwLock::new(config)),
+            path: path.into(),
+        }
+    }
+
+    /// The shared config to validate against.
+    pub fn config(&self) -> &Arc<tokio::sync::RwLock<AuthConfig>> {
+        &self.config
+    }
+
+    /// The config file the runtime counters are persisted to.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
 }
 
 fn find_headers_end(buf: &[u8]) -> Option<usize> {
@@ -354,7 +386,7 @@ enum AuthFailure {
 /// Protocol:
 /// 1. Receive AUTH_START from client
 /// 2. Send AUTH_CHALLENGE with nonce
-/// 3. Receive AUTH_RESPONSE with TOTP code
+/// 3. Receive AUTH_RESPONSE with TOTP code and an HMAC over the nonce
 /// 4. Validate and send AUTH_OK or AUTH_FAILED
 ///
 /// The caller bounds this with a deadline, so every read in here has to be
@@ -362,7 +394,8 @@ enum AuthFailure {
 /// using `read_exact`.
 async fn perform_authentication(
     conn: &Connection,
-    config: &AuthConfig,
+    auth: &AuthState,
+    peer: &str,
 ) -> Result<String, AuthFailure> {
     let (mut send, mut recv) = conn
         .accept_bi()
@@ -391,7 +424,9 @@ async fn perform_authentication(
 
     // Step 2: Send AUTH_CHALLENGE
     let nonce: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
-    let challenge_msg = AuthMessage::Challenge { nonce };
+    let challenge_msg = AuthMessage::Challenge {
+        nonce: nonce.clone(),
+    };
 
     let challenge_bytes = challenge_msg
         .to_bytes()
@@ -412,12 +447,13 @@ async fn perform_authentication(
     let response_msg = AuthMessage::from_bytes(&response_bytes)
         .map_err(|_| AuthFailure::NotStarted("expected AUTH_RESPONSE message".to_string()))?;
 
-    let (resp_client_id, _timestamp, totp_code) = match response_msg {
+    let (resp_client_id, resp_timestamp, signature, totp_code) = match response_msg {
         AuthMessage::Response {
             client_id,
             timestamp,
             totp_code,
-        } => (client_id, timestamp, totp_code),
+            signature,
+        } => (client_id, timestamp, signature, totp_code),
         _ => {
             return Err(AuthFailure::NotStarted(
                 "expected AUTH_RESPONSE message".to_string(),
@@ -431,15 +467,104 @@ async fn perform_authentication(
         ));
     }
 
-    // Step 4: Validate TOTP code
-    let validator = TotpValidator::new(config.clone());
-    let is_valid = validator.validate(&client_id, &totp_code).unwrap_or(false);
+    // Step 4: Verify the response. The signature binds it to this
+    // connection's challenge and the timestamp keeps it fresh; only then does
+    // the TOTP code decide. The whole check runs under one read lock; the
+    // write lock below is taken only when a counter actually moves.
+    let outcome = {
+        let cfg = auth.config().read().await;
+        TotpValidator::new(&cfg).verify_response(
+            &client_id,
+            &nonce,
+            resp_timestamp,
+            &signature,
+            &totp_code,
+        )
+    };
 
+    // Only a wrong TOTP code counts toward the lockout: a skewed clock or a
+    // mismatched signature is a refusal, not a failed attempt, and counting
+    // those would let whoever replays a captured response lock its rightful
+    // owner out.
+    let (is_valid, wire_reason) = match outcome {
+        Ok(true) => {
+            let mut cfg = auth.config().write().await;
+            // Clear the counters only when there is something to clear, so a
+            // healthy client does not turn every connection into a disk write.
+            let dirty = cfg
+                .clients
+                .get(&client_id)
+                .is_some_and(|c| c.failed_attempts != 0 || c.locked_until.is_some());
+            if dirty {
+                if let Some(client) = cfg.clients.get_mut(&client_id) {
+                    client.record_success();
+                }
+                if let Err(e) = save_auth_state(auth.path(), &cfg) {
+                    tracing::warn!(
+                        "2FA: failed to persist auth state for '{}' to {}: {}",
+                        client_id,
+                        auth.path(),
+                        e
+                    );
+                }
+            }
+            (true, None)
+        }
+        Ok(false) => {
+            let mut cfg = auth.config().write().await;
+            let max_attempts = cfg.max_attempts;
+            let lockout_duration = cfg.lockout_duration;
+            if let Some(client) = cfg.clients.get_mut(&client_id) {
+                client.record_failure(max_attempts, lockout_duration);
+                if let Err(e) = save_auth_state(auth.path(), &cfg) {
+                    tracing::warn!(
+                        "2FA: failed to persist lockout for '{}' to {}: {}",
+                        client_id,
+                        auth.path(),
+                        e
+                    );
+                }
+            }
+            (false, Some("Invalid TOTP code".to_string()))
+        }
+        Err(e) => {
+            // Refusals are logged with their real reason; on the wire the
+            // lockout stays visible (a user can wait it out) while everything
+            // else reads as a generic rejection, so the AUTH_FAILED reason is
+            // not an oracle for which client IDs exist.
+            match &e {
+                AuthError::ClientNotFound => {
+                    tracing::warn!("2FA: unknown client '{}' from {}", client_id, peer);
+                }
+                AuthError::InvalidSecret | AuthError::TotpCreationFailed => {
+                    tracing::error!(
+                        "2FA: client '{}' cannot be validated, the server's auth config is broken: {}",
+                        client_id,
+                        e
+                    );
+                }
+                AuthError::LockedOut => {
+                    tracing::warn!("2FA: client '{}' from {} is locked out", client_id, peer);
+                }
+                _ => {
+                    tracing::warn!("2FA: response from {} for '{}' rejected: {}", peer, client_id, e);
+                }
+            }
+            let reason = if matches!(e, AuthError::LockedOut) {
+                e.to_string()
+            } else {
+                "Invalid TOTP code".to_string()
+            };
+            (false, Some(reason))
+        }
+    };
+
+    let fail_reason = wire_reason.unwrap_or_else(|| "Invalid TOTP code".to_string());
     let result_msg = if is_valid {
         AuthMessage::Ok
     } else {
         AuthMessage::Failed {
-            reason: "Invalid TOTP code".to_string(),
+            reason: fail_reason.clone(),
         }
     };
 
@@ -460,8 +585,9 @@ async fn perform_authentication(
         Ok(client_id)
     } else {
         Err(AuthFailure::Rejected(format!(
-            "invalid TOTP code for client '{}'",
-            client_id
+            "authentication failed for client '{}': {}",
+            client_id,
+            fail_reason
         )))
     }
 }
@@ -510,7 +636,7 @@ pub async fn handle_connection(
     conn: Connection,
     config: Arc<RouteConfig>,
     client: Arc<HttpClient>,
-    auth_config: Option<Arc<tokio::sync::RwLock<AuthConfig>>>,
+    auth_state: Option<AuthState>,
 ) {
     let peer_id = conn.remote_id();
     let peer = peer_id.to_string();
@@ -546,12 +672,13 @@ pub async fn handle_connection(
     });
 
     // ===== 2FA Authentication Handshake =====
-    if let Some(auth_cfg) = &auth_config {
-        let cfg = auth_cfg.read().await;
-        if cfg.enabled {
-            let outcome =
-                tokio::time::timeout(AUTH_HANDSHAKE_TIMEOUT, perform_authentication(&conn, &cfg))
-                    .await;
+    if let Some(auth) = &auth_state {
+        if auth.config().read().await.enabled {
+            let outcome = tokio::time::timeout(
+                AUTH_HANDSHAKE_TIMEOUT,
+                perform_authentication(&conn, auth, &peer),
+            )
+            .await;
             match outcome {
                 Ok(Ok(client_id)) => {
                     tracing::info!(
@@ -634,13 +761,13 @@ pub async fn handle_incoming(
     incoming: Incoming,
     config: Arc<RouteConfig>,
     client: Arc<HttpClient>,
-    auth_config: Option<Arc<tokio::sync::RwLock<AuthConfig>>>,
+    auth_state: Option<AuthState>,
 ) {
     match incoming.accept() {
         Ok(accepting) => match accepting.await {
             Ok(conn) => {
                 tokio::spawn(async move {
-                    handle_connection(conn, config, client, auth_config).await;
+                    handle_connection(conn, config, client, auth_state).await;
                 });
             }
             Err(e) => {

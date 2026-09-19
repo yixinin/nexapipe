@@ -1,7 +1,9 @@
 use clap::{Parser, ValueEnum};
 use iroh::SecretKey;
 use nexapipe::auth::AuthConfig;
-use nexapipe::config::{IrohConfig, LocalProxyConfig, ProxyConfig, ServerConfig};
+use nexapipe::config::{
+    ClientSecretWrite, IrohConfig, LocalProxyConfig, ProxyConfig, ServerConfig,
+};
 use nexapipe::proxy::{run_local_proxy, run_proxy};
 use nexapipe::routes::RouteConfig;
 use nexapipe::shutdown::{ShutdownSignal, wait_for_shutdown_signal};
@@ -47,6 +49,13 @@ struct Cli {
         help = "Print the QR code of a client already configured in [auth.clients]"
     )]
     show_2fa: Option<String>,
+
+    #[arg(
+        long,
+        help = "With --generate-2fa: issue a new secret even when the client already has \
+                one in [auth.clients], and replace it in the config"
+    )]
+    force: bool,
 
     #[arg(
         long,
@@ -290,12 +299,19 @@ fn print_2fa_enrollment(cli: &Cli) -> anyhow::Result<()> {
 
     let (auth_config, config_loaded) = load_auth_config(&cli.config);
 
+    // The QR code has to carry the secret the server will accept, so a client
+    // that is already configured keeps the one it has: running --generate-2fa
+    // twice must not hand out a second secret and silently lock the app out.
     let (client_id, secret, generated) = if let Some(client_id) = &cli.generate_2fa {
-        (
-            client_id.trim().to_string(),
-            nexapipe::auth::TotpValidator::generate_secret(),
-            true,
-        )
+        let client_id = client_id.trim().to_string();
+        match auth_config.clients.get(&client_id) {
+            Some(client) if !cli.force => (client_id, client.secret.clone(), false),
+            _ => (
+                client_id,
+                nexapipe::auth::TotpValidator::generate_secret(),
+                true,
+            ),
+        }
     } else if let Some(client_id) = &cli.show_2fa {
         let client_id = client_id.trim().to_string();
         let client = auth_config.clients.get(&client_id).ok_or_else(|| {
@@ -332,6 +348,9 @@ fn print_2fa_enrollment(cli: &Cli) -> anyhow::Result<()> {
         uri.secret,
         if generated {
             "   (newly generated)"
+        } else if cli.generate_2fa.is_some() {
+            // Kept from the config: see the branch above.
+            "   (already in the config)"
         } else {
             ""
         }
@@ -363,13 +382,16 @@ fn print_2fa_enrollment(cli: &Cli) -> anyhow::Result<()> {
     )?;
 
     if generated {
-        println!("Add the secret to {} on the server:", cli.config);
-        println!("[auth.clients.{}]", toml_key(&uri.client_id));
-        println!("secret = \"{}\"", uri.secret);
-        println!();
-        println!("The 2FA settings are read once at startup, so restart the server to pick");
-        println!("up the new client. Scanning the code above only imports the credentials");
-        println!("into the app; it does not change anything on the server.");
+        save_generated_secret(cli, &client_id, &uri.secret, auth_config.enabled);
+    } else if cli.generate_2fa.is_some() {
+        println!(
+            "Client \"{}\" already has a secret in {}, so that is the one above:",
+            uri.client_id, cli.config
+        );
+        println!("issuing a new one would enroll the app with credentials the server");
+        println!("rejects. Pass --force to rotate it instead — the secret in the config");
+        println!("is then replaced, and every device enrolled with the old one has to");
+        println!("scan again.");
     } else {
         println!(
             "This secret already comes from {}, so the server needs no change.",
@@ -379,6 +401,56 @@ fn print_2fa_enrollment(cli: &Cli) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Puts a freshly generated secret into the config file, so the server ends up
+/// holding the same credentials the QR code carries and nothing has to be copied
+/// by hand.
+///
+/// Failing is not fatal: the secret is on screen either way, the file may not
+/// exist yet or may not be writable, and the snippet can still be typed in.
+fn save_generated_secret(cli: &Cli, client_id: &str, secret: &str, auth_enabled: bool) {
+    let outcome = ProxyConfig::write_client_secret(&cli.config, client_id, secret, cli.force);
+    let written = match outcome {
+        Ok(ClientSecretWrite::Added) => {
+            println!(
+                "Wrote the secret to {} as [auth.clients.{}].",
+                cli.config,
+                toml_key(client_id)
+            );
+            true
+        }
+        Ok(ClientSecretWrite::Replaced) => {
+            println!(
+                "Replaced the secret of [auth.clients.{}] in {}: every device enrolled",
+                toml_key(client_id),
+                cli.config
+            );
+            println!("with the old one has to scan again.");
+            true
+        }
+        Err(e) => {
+            // Not fatal, but loud: without the file the server never sees it.
+            eprintln!("warning: {e:#}, so add it by hand:");
+            println!("[auth.clients.{}]", toml_key(client_id));
+            println!("secret = \"{}\"", secret);
+            false
+        }
+    };
+    println!();
+
+    // Only worth saying when there is a file to edit: a config that could not be
+    // written has no `[auth]` to enable either.
+    if written && !auth_enabled {
+        eprintln!(
+            "warning: [auth] enabled is not true in {}, so the server will not ask for this \
+             secret; add enabled = true under [auth]",
+            cli.config
+        );
+    }
+    println!("The 2FA settings are read once at startup, so restart the server to pick");
+    println!("up the new client. Scanning the code above only imports the credentials");
+    println!("into the app; it does not change anything on the server.");
 }
 
 /// Prints (and, with `--qr-out`, writes) a QR code of `link` in whatever format
@@ -675,7 +747,10 @@ fn write_qr_file(path: &str, link: &str, invert: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Quotes a TOML key, as `[auth.clients."client-001"]` requires.
+/// Renders a TOML key the way it is written into the config file, as
+/// `[auth.clients."client.001"]` requires while `client-001` stays bare. Sharing
+/// one renderer with `write_client_secret` keeps the section named in a message
+/// identical to the one that ends up in the file.
 fn toml_key(key: &str) -> String {
-    format!("\"{}\"", key.replace('\\', "\\\\").replace('"', "\\\""))
+    toml_edit::Key::new(key).to_string()
 }
