@@ -21,7 +21,27 @@ const CONNECTION_IDLE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::fr
 const CONNECTION_CLEANUP_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(5);
 /// Per-pool timeout for preconnect / warm-up. Much shorter than CONNECTION_TIMEOUT
 /// so that a single unreachable node does not hold up the entire preconnect phase.
-pub(crate) const PRECONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+///
+/// Sized to fit a slow relay handshake plus [`AUTH_REQUIRED_GRACE`]: cutting the
+/// observation short would turn a backend that demands 2FA into one that merely
+/// looks unreachable, with the real reason lost.
+pub(crate) const PRECONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(8);
+
+/// How long a freshly established connection is watched for a 2FA refusal when
+/// this client has no credentials.
+///
+/// Only such a client needs it: one with credentials fails the handshake itself
+/// and knows at once. Without credentials the QUIC handshake succeeds and
+/// nothing else happens, so the server is the only party that knows the
+/// connection is unusable — it says so by closing once its own handshake
+/// deadline (`AUTH_HANDSHAKE_TIMEOUT` in `crates/nexapipe/src/conn/mod.rs`)
+/// passes. This wait covers that deadline plus a round trip.
+const AUTH_REQUIRED_GRACE: tokio::time::Duration = tokio::time::Duration::from_secs(3);
+
+/// The application error code the server closes a connection with when it
+/// requires 2FA the client never performed. Must match `auth_close_code::REQUIRED`
+/// in `crates/nexapipe/src/conn/mod.rs`.
+const AUTH_REQUIRED_CLOSE_CODE: u32 = 2;
 
 struct PooledConnection {
     conn: Connection,
@@ -47,6 +67,12 @@ struct IrohConnectionPoolInner {
     /// Optional client 2FA credentials. When set, every freshly established
     /// connection is authenticated with the server before it is pooled/used.
     two_factor: Mutex<Option<TwoFactorAuth>>,
+    /// Why the last preconnect failed with "2FA required", when the server said
+    /// so: a client without credentials cannot fail the handshake on its own, so
+    /// the refusal is only visible as a close, and this hands the reason to
+    /// whoever reports the failure. Read (and cleared) by
+    /// [`IrohConnectionPool::take_auth_required`].
+    auth_required: Mutex<Option<String>>,
     /// Whether this pool created (and therefore owns) its iroh endpoint.
     ///
     /// `new()` binds a dedicated endpoint, so `close_all` must close it.
@@ -62,6 +88,10 @@ impl IrohConnectionPool {
         let (transport, tuning) = crate::transport::transport_config_with_tuning();
         #[cfg(feature = "tracing")]
         tracing::info!("QUIC transport tuning: {}", tuning.describe());
+        // `tuning` is only read by the log line above; keep the binding "used"
+        // when `tracing` is off so it is not reported as unused.
+        #[cfg(not(feature = "tracing"))]
+        let _ = &tuning;
         let ep = Endpoint::builder(presets::N0)
             .transport_config(transport)
             .bind()
@@ -72,6 +102,7 @@ impl IrohConnectionPool {
             ep: Arc::new(Mutex::new(Some(ep))),
             endpoint_addr,
             two_factor: Mutex::new(None),
+            auth_required: Mutex::new(None),
             owns_endpoint: true,
         });
         spawn_cleanup_task(Arc::downgrade(&inner));
@@ -84,12 +115,22 @@ impl IrohConnectionPool {
             ep: Arc::new(Mutex::new(Some(ep))),
             endpoint_addr,
             two_factor: Mutex::new(None),
+            auth_required: Mutex::new(None),
             owns_endpoint: false,
         });
         spawn_cleanup_task(Arc::downgrade(&inner));
         Self { inner }
     }
 
+    /// The **local** iroh endpoint's own ID — this client's identity on the
+    /// network, not the ID of the backend this pool talks to.
+    ///
+    /// Careful: pools that share a caller-owned endpoint (`new_with_endpoint`)
+    /// all report the *same* ID here, because they all use one local endpoint.
+    /// Do not use this to tell backends apart; use [`Self::backend_id`].
+    ///
+    /// Returns the all-zero ID when the endpoint lock is momentarily held or the
+    /// endpoint has already been closed.
     pub fn node_id(&self) -> EndpointId {
         match self.inner.ep.try_lock() {
             Ok(ep) => {
@@ -106,10 +147,29 @@ impl IrohConnectionPool {
         }
     }
 
+    /// The **remote** node this pool dials: the configured `server_node_id`.
+    ///
+    /// Unlike [`Self::node_id`] this is a plain copy of the address the pool was
+    /// built with, so it needs no lock, never returns a placeholder, and is
+    /// stable across every pool in a group. Pool identity / deduplication must
+    /// be based on this.
+    pub fn backend_id(&self) -> EndpointId {
+        self.inner.endpoint_addr.id
+    }
+
     /// Configure client 2FA credentials. Connections established afterwards
     /// (including preconnect warm-ups) will run the 2FA handshake first.
     pub async fn set_two_factor(&self, auth: Option<TwoFactorAuth>) {
         *self.inner.two_factor.lock().await = auth;
+    }
+
+    /// Takes the reason the backend last refused a connection for missing 2FA,
+    /// and clears it.
+    ///
+    /// Only ever set after a preconnect that ended in [`AUTH_REQUIRED_CLOSE_CODE`],
+    /// i.e. when the server wants credentials this client does not have.
+    pub async fn take_auth_required(&self) -> Option<String> {
+        self.inner.auth_required.lock().await.take()
     }
 
     /// Connect to the backend and run the 2FA handshake when configured.
@@ -206,10 +266,10 @@ impl IrohConnectionPool {
     pub async fn preconnect(&self) -> bool {
         {
             let connections = self.inner.connections.lock().await;
-            if let Some(pooled) = connections.last() {
-                if pooled.is_live() {
-                    return true;
-                }
+            if let Some(pooled) = connections.last()
+                && pooled.is_live()
+            {
+                return true;
             }
         }
 
@@ -223,6 +283,8 @@ impl IrohConnectionPool {
                 Ok(Err(e)) => {
                     #[cfg(feature = "tracing")]
                     tracing::warn!("preconnect failed: {}", e);
+                    #[cfg(not(feature = "tracing"))]
+                    let _ = &e;
                     return false;
                 }
                 Err(_) => {
@@ -232,6 +294,22 @@ impl IrohConnectionPool {
                 }
             }
         };
+
+        // A client without credentials never opens the auth stream, so a
+        // completed QUIC handshake tells it nothing: whether the connection can
+        // ever carry traffic is the server's call, and it answers by closing
+        // once its handshake deadline passes. Watch for that instead of
+        // reporting a connection the server already refused as a warm one.
+        if self.inner.two_factor.lock().await.is_none()
+            && let Some(reason) = wait_for_auth_required(&conn).await
+        {
+            #[cfg(feature = "tracing")]
+            tracing::warn!("preconnect refused by the server: {}", reason);
+            #[cfg(not(feature = "tracing"))]
+            let _ = &reason;
+            *self.inner.auth_required.lock().await = Some(reason);
+            return false;
+        }
 
         self.return_connection(conn).await;
         true
@@ -273,6 +351,27 @@ impl IrohConnectionPool {
             tracing::info!("Closing iroh endpoint");
             endpoint.close().await;
         }
+    }
+}
+
+/// Waits for a backend that demands 2FA to say so.
+///
+/// Returns the reason the server gave when it closes the connection with
+/// [`AUTH_REQUIRED_CLOSE_CODE`], and `None` when the connection stays up — or
+/// dies for any other reason, which is not what this is looking for.
+async fn wait_for_auth_required(conn: &Connection) -> Option<String> {
+    let closed = tokio::select! {
+        _ = tokio::time::sleep(AUTH_REQUIRED_GRACE) => return None,
+        error = conn.closed() => error,
+    };
+
+    match closed {
+        iroh::endpoint::ConnectionError::ApplicationClosed(close)
+            if close.error_code.into_inner() == AUTH_REQUIRED_CLOSE_CODE as u64 =>
+        {
+            Some(String::from_utf8_lossy(&close.reason).into_owned())
+        }
+        _ => None,
     }
 }
 

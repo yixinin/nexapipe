@@ -93,29 +93,64 @@ pub async fn run_local_proxy(
 
     // 2FA: if `[local_proxy.two_factor]` is configured and enabled, every new connection
     // performs an authentication handshake first.
-    if let Some(tf) = two_factor_config {
-        if tf.enabled.unwrap_or(false) {
-            let auth = TwoFactorAuth::new(
-                &tf.client_id,
-                &tf.secret,
-                TotpAlgorithm::from_name(tf.algorithm.as_deref().unwrap_or("sha1")),
-            )?;
-            endpoint_group.set_two_factor(Some(auth)).await;
-            tracing::info!(
-                "2FA enabled for local proxy, client_id: {}",
-                tf.client_id
-            );
-        }
+    if let Some(tf) = two_factor_config
+        && tf.enabled.unwrap_or(false)
+    {
+        let auth = TwoFactorAuth::new(
+            &tf.client_id,
+            &tf.secret,
+            TotpAlgorithm::from_name(tf.algorithm.as_deref().unwrap_or("sha1")),
+        )?;
+        endpoint_group.set_two_factor(Some(auth)).await;
+        tracing::info!("2FA enabled for local proxy, client_id: {}", tf.client_id);
     }
 
     let node_ids = endpoint_group.node_ids();
-    tracing::info!(
-        "Connected to {} endpoint(s): {:?}",
-        node_ids.len(),
-        node_ids
-    );
+    tracing::info!("Configured {} backend(s): {:?}", node_ids.len(), node_ids);
 
-    let local_proxy = Arc::new(LocalProxy::new(&listen_addr, proxy_domains, Arc::new(endpoint_group)).await?);
+    // Reachability gate. Nothing above dials: `parse_endpoint_addr` only checks
+    // the format and `EndpointGroup::new_*` only binds a local endpoint, so a
+    // node ID that does not exist gets this far looking valid. Probing here —
+    // before the listen socket is bound — is what keeps the process from
+    // announcing a proxy that forwards to nothing.
+    let report = endpoint_group.preconnect_report().await;
+    if !report.any_reachable() {
+        if report.total() == 0 {
+            anyhow::bail!(
+                "No backend is configured: neither [local_proxy] server_node_id/server_ticket \
+                 nor any [[local_proxy.nodes]] entry is set"
+            );
+        }
+        // A backend that answered and then closed for missing 2FA looks exactly
+        // like an unreachable one from here, so name the real cause: the fix is
+        // on this side of the connection, not on the server's.
+        if report.any_auth_required() {
+            anyhow::bail!(
+                "The server requires 2FA but this client has no credentials: {} accepted the \
+                 connection and then refused it. Set [local_proxy.two_factor] with the client id \
+                 and secret the server lists under [auth.clients].",
+                report.unreachable_ids()
+            );
+        }
+        anyhow::bail!(
+            "No backend is reachable: all {} configured node(s) failed to connect ({})",
+            report.total(),
+            report.unreachable_ids()
+        );
+    }
+    if !report.unreachable.is_empty() {
+        tracing::warn!(
+            "{} of {} backend(s) unreachable, continuing with the remaining {}: {}",
+            report.unreachable.len(),
+            report.total(),
+            report.reachable.len(),
+            report.unreachable_ids()
+        );
+    }
+    tracing::info!("{} backend(s) reachable", report.reachable.len());
+
+    let local_proxy =
+        Arc::new(LocalProxy::new(&listen_addr, proxy_domains, Arc::new(endpoint_group)).await?);
 
     let local_proxy_clone = local_proxy.clone();
     tokio::spawn(async move {

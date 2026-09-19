@@ -7,15 +7,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// TOTP algorithm variants
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum TotpAlgorithm {
+    #[default]
     SHA1,
     SHA256,
     SHA512,
 }
 
-impl Default for TotpAlgorithm {
-    fn default() -> Self {
-        TotpAlgorithm::SHA1
+impl TotpAlgorithm {
+    /// Canonical lowercase name, as used by `[auth] algorithm`, the clients and
+    /// the `otpauth://` URI.
+    pub fn name(&self) -> &'static str {
+        match self {
+            TotpAlgorithm::SHA1 => "sha1",
+            TotpAlgorithm::SHA256 => "sha256",
+            TotpAlgorithm::SHA512 => "sha512",
+        }
     }
 }
 
@@ -25,6 +33,10 @@ pub struct AuthConfig {
     /// Whether 2FA is enabled
     #[serde(default)]
     pub enabled: bool,
+    /// Issuer label shown by authenticator apps that import the enrollment QR
+    /// code produced by `nexapipe --generate-2fa`
+    #[serde(default = "default_issuer")]
+    pub issuer: String,
     /// TOTP algorithm to use
     #[serde(default)]
     pub algorithm: TotpAlgorithm,
@@ -51,6 +63,9 @@ pub struct AuthConfig {
 fn default_time_step() -> u32 {
     30
 }
+fn default_issuer() -> String {
+    crate::auth::otpauth::DEFAULT_ISSUER.to_string()
+}
 fn default_digits() -> u32 {
     6
 }
@@ -68,6 +83,7 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            issuer: default_issuer(),
             algorithm: TotpAlgorithm::default(),
             time_step: default_time_step(),
             digits: default_digits(),

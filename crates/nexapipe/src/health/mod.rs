@@ -1,12 +1,7 @@
+use crate::http::HttpClient;
 use crate::lb::BackendPool;
-use hyper_util::client::legacy;
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
-
-type HttpClient = legacy::Client<
-    hyper_rustls::HttpsConnector<legacy::connect::HttpConnector>,
-    http_body_util::Full<bytes::Bytes>,
->;
+use tokio::time::{Duration, sleep};
 
 pub struct HealthChecker {
     backend_pool: Arc<BackendPool>,

@@ -1,9 +1,25 @@
-version: "3"
 services:
   nexapipe:
     build: .
     container_name: nexapipe
+    restart: unless-stopped
     volumes:
       - ./config.toml:/app/config.toml
+      # Log files, written by the [log] section of config.toml.
+      # `docker compose exec nexapipe tail -f /app/logs/nexapipe.log`
+      - ./logs:/app/logs
+    environment:
+      # Directory inside the container that receives the log files. Overrides
+      # [log] dir so the files always land in the mounted volume.
+      - NEXAPIPE_LOG_DIR=/app/logs
+      # Timestamps and rotated file names use local time.
+      - TZ=Asia/Shanghai
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # stdout is still logged (that is what `docker logs` shows); cap it so the
+    # json-file driver cannot grow without bound.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

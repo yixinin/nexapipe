@@ -40,12 +40,13 @@
 //! Values are read from the environment once per endpoint construction, so a tuning
 //! experiment does not need a rebuild:
 //!
-//! | variable                        | default | meaning                                |
-//! |---------------------------------|---------|----------------------------------------|
-//! | `NEXAPIPE_QUIC_STREAM_WINDOW`   | 4194304 | per-stream receive window, bytes       |
-//! | `NEXAPIPE_QUIC_SEND_WINDOW`     | 16777216| connection send window, bytes          |
-//! | `NEXAPIPE_QUIC_INITIAL_MTU`     | 0       | 0 = keep iroh's 1200; else 1200..=65535|
-//! | `NEXAPIPE_QUIC_KEEPALIVE_MS`    | 0       | 0 = keep iroh's 5s                     |
+//! | variable                          | default | meaning                                |
+//! |-----------------------------------|---------|----------------------------------------|
+//! | `NEXAPIPE_QUIC_STREAM_WINDOW`     | 4194304 | per-stream receive window, bytes       |
+//! | `NEXAPIPE_QUIC_SEND_WINDOW`       | 16777216| connection send window, bytes          |
+//! | `NEXAPIPE_QUIC_MAX_BIDI_STREAMS`  | 1024    | concurrent bi-streams a peer may open  |
+//! | `NEXAPIPE_QUIC_INITIAL_MTU`       | 0       | 0 = keep iroh's 1200; else 1200..=65535|
+//! | `NEXAPIPE_QUIC_KEEPALIVE_MS`      | 0       | 0 = keep iroh's 5s                     |
 //!
 //! Android has no useful environment, so it always runs the compiled-in defaults.
 
@@ -55,9 +56,9 @@ use std::time::Duration;
 /// Per-stream receive window. 4 MiB sustains ~160 Mbps at 200 ms RTT and ~320 Mbps at
 /// 100 ms RTT, instead of iroh's ~50 Mbps / ~100 Mbps.
 ///
-/// Worst-case buffer memory is `max_concurrent_bidi_streams * stream_receive_window`
-/// (100 * 4 MiB = 400 MiB) and only materialises if 100 streams are simultaneously
-/// blocked on an application that refuses to read — which this proxy never does for long.
+/// Worst-case buffer memory is `max_concurrent_bidi_streams * stream_receive_window`,
+/// and it only materialises if that many streams are simultaneously blocked on an
+/// application that refuses to read — which this proxy never does for long.
 pub const DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 4 * 1024 * 1024;
 
 /// Connection-wide send window. iroh's 10 MB is already generous; 16 MB gives two full
@@ -65,11 +66,26 @@ pub const DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 4 * 1024 * 1024;
 /// monopolise the connection buffer.
 pub const DEFAULT_SEND_WINDOW: u64 = 16 * 1024 * 1024;
 
+/// How many bi-streams a peer may have open at once.
+///
+/// iroh's default is 100, which is sized for HTTP: one request is one stream, and a
+/// browser opens a handful. The L4 tunnel breaks that assumption — a single Android TUN
+/// device opens **one stream per UDP flow**, and a handful of applications is easily
+/// more than 100. Past the limit quinn does not fail the open: it blocks it until a
+/// slot frees, so the symptom is a flow that hangs rather than an error.
+///
+/// 1024 leaves room for a few hundred flows on several devices at once. The server
+/// additionally caps L4 flows per connection (`l4::DEFAULT_MAX_FLOWS_PER_CONNECTION`,
+/// 256) so that a runaway client gets an explicit `TooManyFlows` instead of driving
+/// this number into memory pressure.
+pub const DEFAULT_MAX_BIDI_STREAMS: u64 = 1024;
+
 /// Fallback used when an override is nonsense (e.g. a varint that is too large).
 const FALLBACK_STREAM_RECEIVE_WINDOW: u64 = 1_250_000;
 
 const ENV_STREAM_WINDOW: &str = "NEXAPIPE_QUIC_STREAM_WINDOW";
 const ENV_SEND_WINDOW: &str = "NEXAPIPE_QUIC_SEND_WINDOW";
+const ENV_MAX_BIDI_STREAMS: &str = "NEXAPIPE_QUIC_MAX_BIDI_STREAMS";
 const ENV_INITIAL_MTU: &str = "NEXAPIPE_QUIC_INITIAL_MTU";
 const ENV_KEEPALIVE_MS: &str = "NEXAPIPE_QUIC_KEEPALIVE_MS";
 
@@ -80,6 +96,8 @@ pub struct TransportTuning {
     pub stream_receive_window: u64,
     /// Connection-wide send window in bytes.
     pub send_window: u64,
+    /// Concurrent bi-streams a peer may open. See [`DEFAULT_MAX_BIDI_STREAMS`].
+    pub max_concurrent_bidi_streams: u64,
     /// `None` keeps iroh's initial MTU (1200) and its MTU discovery ramp.
     pub initial_mtu: Option<u16>,
     /// `None` keeps iroh's connection keep-alive (5 s).
@@ -91,6 +109,7 @@ impl Default for TransportTuning {
         Self {
             stream_receive_window: DEFAULT_STREAM_RECEIVE_WINDOW,
             send_window: DEFAULT_SEND_WINDOW,
+            max_concurrent_bidi_streams: DEFAULT_MAX_BIDI_STREAMS,
             initial_mtu: None,
             keep_alive_interval: None,
         }
@@ -118,6 +137,15 @@ impl TransportTuning {
                 tuning.send_window = v;
             } else {
                 warn_ignored(ENV_SEND_WINDOW, v);
+            }
+        }
+        if let Some(v) = env_u64(ENV_MAX_BIDI_STREAMS) {
+            // Zero would forbid every stream the peer opens, which for this proxy means
+            // "nothing works at all"; that is a typo, not a configuration.
+            if v >= 1 {
+                tuning.max_concurrent_bidi_streams = v;
+            } else {
+                warn_ignored(ENV_MAX_BIDI_STREAMS, v);
             }
         }
         if let Some(v) = env_u64(ENV_INITIAL_MTU) {
@@ -148,8 +176,17 @@ impl TransportTuning {
     /// above keeps iroh's value.
     pub fn transport_config(&self) -> QuicTransportConfig {
         let mut builder = QuicTransportConfig::builder()
-            .stream_receive_window(varint(self.stream_receive_window, ENV_STREAM_WINDOW))
-            .send_window(self.send_window);
+            .stream_receive_window(varint(
+                self.stream_receive_window,
+                ENV_STREAM_WINDOW,
+                FALLBACK_STREAM_RECEIVE_WINDOW,
+            ))
+            .send_window(self.send_window)
+            .max_concurrent_bidi_streams(varint(
+                self.max_concurrent_bidi_streams,
+                ENV_MAX_BIDI_STREAMS,
+                DEFAULT_MAX_BIDI_STREAMS,
+            ));
 
         if let Some(mtu) = self.initial_mtu {
             builder = builder.initial_mtu(mtu);
@@ -164,9 +201,11 @@ impl TransportTuning {
     /// One-line summary for the startup log, so the numbers in a benchmark run are auditable.
     pub fn describe(&self) -> String {
         format!(
-            "stream_receive_window={}B send_window={}B initial_mtu={} keep_alive={}",
+            "stream_receive_window={}B send_window={}B max_concurrent_bidi_streams={} \
+             initial_mtu={} keep_alive={}",
             self.stream_receive_window,
             self.send_window,
+            self.max_concurrent_bidi_streams,
             self.initial_mtu
                 .map(|m| m.to_string())
                 .unwrap_or_else(|| "iroh-default".to_string()),
@@ -203,14 +242,13 @@ fn env_u64(key: &str) -> Option<u64> {
     }
 }
 
-fn varint(value: u64, what: &str) -> VarInt {
+fn varint(value: u64, what: &str, fallback: u64) -> VarInt {
     match VarInt::from_u64(value) {
         Ok(v) => v,
         Err(_) => {
             warn_ignored(what, value);
-            // 1.25 MB is always a valid varint, so this cannot panic.
-            VarInt::from_u64(FALLBACK_STREAM_RECEIVE_WINDOW)
-                .expect("fallback window fits in a QUIC varint")
+            // Every fallback here is small, so this cannot panic.
+            VarInt::from_u64(fallback).expect("fallback fits in a QUIC varint")
         }
     }
 }
@@ -237,6 +275,10 @@ mod tests {
         let tuning = TransportTuning::default();
         assert_eq!(tuning.stream_receive_window, 4 * 1024 * 1024);
         assert!(tuning.stream_receive_window > 1_250_000);
+        // iroh allows 100 concurrent bi-streams. One UDP flow is one stream, so that is
+        // nowhere near enough for a TUN device; the L4 path needs the raised limit or
+        // flows start queueing inside `open_bi` instead of failing.
+        assert!(tuning.max_concurrent_bidi_streams > 100);
         // Not exposed: multipath / NAT traversal must stay on iroh's values.
         assert_eq!(tuning.initial_mtu, None);
     }

@@ -104,16 +104,16 @@ impl BackendPool {
 
         let selected = &self.backends[idx];
         let url = selected.read().await.url.clone();
-        tracing::debug!(
-            "Selected backend: {} (strategy={:?})",
-            url,
-            self.strategy
-        );
+        tracing::debug!("Selected backend: {} (strategy={:?})", url, self.strategy);
         url
     }
 
     pub fn len(&self) -> usize {
         self.backends.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.backends.is_empty()
     }
 
     pub fn strategy(&self) -> LoadBalancingStrategy {

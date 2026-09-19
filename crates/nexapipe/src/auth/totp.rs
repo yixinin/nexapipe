@@ -1,16 +1,32 @@
 //! TOTP validation logic.
 
 use super::config::{AuthConfig, TotpAlgorithm};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use totp_rs::{Algorithm, TOTP};
 
-/// TOTP validator for verifying client codes
-pub struct TotpValidator {
-    config: AuthConfig,
+/// HMAC-SHA256 keyed by the client's TOTP secret.
+type HmacSha256 = Hmac<Sha256>;
+
+/// How far an AUTH_RESPONSE timestamp may sit from the server clock, in
+/// seconds. The signature already pins the response to one challenge; the
+/// timestamp bounds how long even a correctly signed response stays
+/// acceptable, so an intercepted one cannot be replayed next week.
+const TIMESTAMP_WINDOW_SECS: i64 = 30;
+
+/// TOTP validator for verifying client codes.
+///
+/// Borrows the [`AuthConfig`] it validates against: the config is shared and
+/// mutated by the connection layer (lockout counters), so owning a clone here
+/// would both copy the whole client map per connection and validate against a
+/// snapshot nobody can correct.
+pub struct TotpValidator<'a> {
+    config: &'a AuthConfig,
 }
 
-impl TotpValidator {
-    /// Create a new TOTP validator from config
-    pub fn new(config: AuthConfig) -> Self {
+impl<'a> TotpValidator<'a> {
+    /// Create a new TOTP validator borrowing the given config.
+    pub fn new(config: &'a AuthConfig) -> Self {
         Self { config }
     }
 
@@ -23,8 +39,24 @@ impl TotpValidator {
         }
     }
 
-    /// Validate a TOTP code for a given client
-    pub fn validate(&self, client_id: &str, code: &str) -> Result<bool, AuthError> {
+    /// Verifies one AUTH_RESPONSE against the challenge this connection
+    /// issued.
+    ///
+    /// Everything a response must prove is checked here, in order: the client
+    /// is known and not locked out, its secret decodes, its timestamp is
+    /// fresh, its signature matches HMAC-SHA256(secret, nonce || timestamp),
+    /// and finally the TOTP code is current. Only the last step can return
+    /// `Ok(false)`: a wrong code is a user mistake and counts toward the
+    /// lockout, while every `Err` is a refusal the caller logs instead of
+    /// counting.
+    pub fn verify_response(
+        &self,
+        client_id: &str,
+        nonce: &[u8],
+        timestamp: i64,
+        signature: &[u8],
+        code: &str,
+    ) -> Result<bool, AuthError> {
         if !self.config.enabled {
             return Ok(true);
         }
@@ -43,6 +75,16 @@ impl TotpValidator {
             .decode_secret()
             .map_err(|_| AuthError::InvalidSecret)?;
 
+        let now = current_timestamp();
+        if (now - timestamp).abs() > TIMESTAMP_WINDOW_SECS {
+            return Err(AuthError::StaleTimestamp);
+        }
+
+        let expected = hmac_signature(&secret, nonce, timestamp);
+        if !constant_time_eq(signature, &expected) {
+            return Err(AuthError::ChallengeMismatch);
+        }
+
         let totp = TOTP::new(
             self.get_algorithm(),
             self.config.digits as usize,
@@ -52,29 +94,46 @@ impl TotpValidator {
         )
         .map_err(|_| AuthError::TotpCreationFailed)?;
 
-        let is_valid = totp.check_current(code).unwrap_or(false);
-
-        Ok(is_valid)
-    }
-
-    /// Record a failed attempt for a client
-    pub fn record_failure(&mut self, client_id: &str) {
-        if let Some(client) = self.config.clients.get_mut(client_id) {
-            client.record_failure(self.config.max_attempts, self.config.lockout_duration);
-        }
-    }
-
-    /// Record a successful authentication
-    pub fn record_success(&mut self, client_id: &str) {
-        if let Some(client) = self.config.clients.get_mut(client_id) {
-            client.record_success();
-        }
+        Ok(totp.check_current(code).unwrap_or(false))
     }
 
     /// Generate a new TOTP secret for a client (for setup)
     pub fn generate_secret() -> String {
         totp_rs::Secret::generate_secret().to_encoded().to_string()
     }
+}
+
+/// The signature a client attaches to AUTH_RESPONSE:
+/// HMAC-SHA256(secret, nonce || timestamp.to_le_bytes()).
+///
+/// Keep in sync with `TwoFactorAuth::sign_challenge` in
+/// `crates/nexapipe-client/src/auth.rs`.
+pub(crate) fn hmac_signature(secret: &[u8], nonce: &[u8], timestamp: i64) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(nonce);
+    mac.update(&timestamp.to_le_bytes());
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Length-safe constant-time comparison: an HMAC-SHA256 tag is never secret
+/// in length (32 bytes), but comparing it byte-wise stops the first mismatch
+/// from leaking how many leading bytes were right.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn current_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Authentication errors
@@ -85,6 +144,10 @@ pub enum AuthError {
     TotpCreationFailed,
     LockedOut,
     InvalidCode,
+    /// The response timestamp sits outside the acceptance window.
+    StaleTimestamp,
+    /// The response signature does not match the challenge that was issued.
+    ChallengeMismatch,
     ProtocolError(String),
 }
 
@@ -98,6 +161,13 @@ impl std::fmt::Display for AuthError {
                 write!(f, "Client is locked out due to too many failed attempts")
             }
             AuthError::InvalidCode => write!(f, "Invalid TOTP code"),
+            AuthError::StaleTimestamp => write!(
+                f,
+                "Response timestamp is more than {TIMESTAMP_WINDOW_SECS}s away from the server clock"
+            ),
+            AuthError::ChallengeMismatch => {
+                write!(f, "Response signature does not match the challenge")
+            }
             AuthError::ProtocolError(msg) => write!(f, "Protocol error: {}", msg),
         }
     }

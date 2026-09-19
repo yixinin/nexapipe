@@ -1,2 +1,12 @@
 target
 .workbuddy
+
+# run_android.ps1 logcat capture (same name is already ignored inside ui-android/)
+nexa_vpn_log.txt
+
+# Runtime log files written by the [log] section of config.toml. The directory
+# itself stays tracked so the docker-compose bind mount does not create it as
+# root on the host.
+logs/*
+!logs/.gitkeep
+config.toml

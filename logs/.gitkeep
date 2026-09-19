@@ -1,0 +1,3 @@
+Runtime log files written by the [log] section of config.toml. The directory
+itself is tracked so that the docker-compose bind mount does not create it as
+root on the host.

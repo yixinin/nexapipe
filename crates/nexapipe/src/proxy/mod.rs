@@ -1,12 +1,14 @@
-﻿pub mod local_proxy;
+pub mod local_proxy;
 
 use crate::auth::AuthConfig;
-use crate::config::{IrohConfig, LocalProxyConfig, ServerConfig};
+use crate::config::{IrohConfig, LocalProxyConfig, RouteMode, ServerConfig};
+use crate::config_watcher::ConfigWatcher;
 use crate::conn;
 use crate::health::HealthChecker;
 use crate::http;
 use crate::log;
-use crate::routes::{Route, RouteConfig};
+use crate::passthrough;
+use crate::routes::RouteConfig;
 use crate::shutdown::ShutdownSignal;
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::client::legacy;
@@ -16,33 +18,110 @@ use iroh::endpoint::presets;
 use iroh::{Endpoint, RelayMap, RelayUrl, SecretKey};
 use iroh_tickets::Ticket;
 use iroh_tickets::endpoint::EndpointTicket;
-use rustls_pemfile::{certs, pkcs8_private_keys};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use std::fs;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio_rustls::TlsAcceptor;
 
-type HttpClient = legacy::Client<
-    hyper_rustls::HttpsConnector<legacy::connect::HttpConnector>,
-    http_body_util::Full<bytes::Bytes>,
->;
+/// Shared by the startup path and the config watcher, which spawns checkers for
+/// routes that appear in a reload.
+pub type HttpClient = legacy::Client<legacy::connect::HttpConnector, http_body_util::Full<bytes::Bytes>>;
+
+/// One background `GET /health` probe per `http` route.
+///
+/// Called again after a reload, so it only starts checkers for routes it has not
+/// seen before: a probe runs until the process ends, and re-starting one per
+/// reload would pile up tasks that all poke the same backend. The trade-off is
+/// that a route deleted from the config keeps being probed — harmless, because
+/// its pool is no longer reachable from the routing table, but it does keep
+/// logging if that backend really is gone.
+pub async fn spawn_health_checks(
+    config: &Arc<RouteConfig>,
+    http_client: &Arc<HttpClient>,
+    seen: &tokio::sync::Mutex<std::collections::HashSet<String>>,
+) {
+    let mut seen = seen.lock().await;
+
+    for route in config.routes().await {
+        // Only an http:// backend answers `GET /health`. A passthrough backend is
+        // a TLS listener and an L4 backend is whatever the route points at — a
+        // database, a TURN server, an SSH daemon. Probing either would fail, mark
+        // the backend down, and the pool would then quietly fall back to its first
+        // entry. There is nothing to probe without speaking the protocol, so the
+        // pool is left alone; a dead backend shows up as a connect error when a
+        // flow arrives.
+        // A route serving `http` *and* something else is still probed: the pool
+        // is shared, so its health is what the other modes dial into as well.
+        if !route.serves(RouteMode::Http) {
+            tracing::info!(
+                "Route {}: modes={:?}, skipping the HTTP health check",
+                route.host_pattern(),
+                route.modes()
+            );
+            continue;
+        }
+
+        let key = format!(
+            "{}|{:?}",
+            route.host_pattern(),
+            route.backend_pool().backends().await
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+
+        let backend_pool = route.backend_pool().clone();
+        let http_client_clone = http_client.clone();
+        let health_checker = HealthChecker::new(
+            backend_pool,
+            http_client_clone,
+            tokio::time::Duration::from_secs(10),
+            tokio::time::Duration::from_secs(5),
+            3,
+            "/health",
+        );
+        tokio::spawn(async move {
+            health_checker.run().await;
+        });
+    }
+}
+
+/// How long the plaintext listener waits for a first byte before handing the
+/// connection to the HTTP server. Long enough for a TLS `ClientHello` to
+/// arrive, short enough not to park the task.
+const FIRST_BYTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub async fn run_proxy(
-    routes: Vec<Route>,
-    default_backend: String,
+    config: Arc<RouteConfig>,
     server_config: Option<ServerConfig>,
     iroh_config: Option<IrohConfig>,
+    config_path: &str,
     shutdown_signal: Arc<ShutdownSignal>,
     auth_config: Option<AuthConfig>,
 ) -> anyhow::Result<()> {
-    let config = Arc::new(RouteConfig::new(routes, default_backend.clone()));
     let http_client = Arc::new(http::create_http_client());
 
-    // Wrap auth config in Arc<RwLock> for shared access
-    let auth_config = auth_config.map(|cfg| Arc::new(tokio::sync::RwLock::new(cfg)));
+    let health_seen = Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+    spawn_health_checks(&config, &http_client, &health_seen).await;
+
+    // The watcher needs both to apply a reload: it rebuilds the routes and
+    // restarts whatever health checks the new routes need.
+    let config_watcher = Arc::new(ConfigWatcher::new(
+        config_path.to_string(),
+        config.clone(),
+        http_client.clone(),
+        health_seen,
+    ));
+    tokio::spawn({
+        let config_watcher_clone = config_watcher.clone();
+        async move {
+            config_watcher_clone.start_watch().await;
+        }
+    });
+    tracing::info!("Config watcher started, monitoring: {}", config_path);
+
+    // 2FA state: the shared config plus the file its lockout counters persist to.
+    let auth_state = auth_config.map(|cfg| conn::AuthState::new(cfg, config_path));
 
     let mut builder = Endpoint::builder(presets::N0).alpns(vec![ALPN_NEXAPIPE.to_vec()]);
 
@@ -55,7 +134,10 @@ pub async fn run_proxy(
                     tracing::info!("Using configured secret key for stable endpoint identity");
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to parse secret_key from config, generating new one: {}", e);
+                    tracing::warn!(
+                        "Failed to parse secret_key from config, generating new one: {}",
+                        e
+                    );
                 }
             }
         }
@@ -106,28 +188,6 @@ pub async fn run_proxy(
 
     tracing::info!("Iroh proxy endpoint started successfully");
     tracing::info!("Node ID: {}", node_id);
-    tracing::info!("Default backend: {}", default_backend);
-
-    if let Some(ref server) = server_config {
-        let tls_enabled = server.tls_enabled.unwrap_or(false);
-        tracing::info!("Server TLS enabled: {}", tls_enabled);
-
-        if tls_enabled {
-            if let (Some(cert_path), Some(key_path)) =
-                (server.cert_path.as_ref(), server.key_path.as_ref())
-            {
-                if fs::metadata(cert_path).is_ok() && fs::metadata(key_path).is_ok() {
-                    tracing::info!(
-                        "TLS certificate files found: {} and {}",
-                        cert_path,
-                        key_path
-                    );
-                } else {
-                    tracing::warn!("TLS certificate or key file not found");
-                }
-            }
-        }
-    }
 
     for (i, route) in config.routes().await.into_iter().enumerate() {
         tracing::info!(
@@ -182,65 +242,6 @@ pub async fn run_proxy(
         }
     });
 
-    if let Some(ref server) = server_config {
-        let tls_enabled = server.tls_enabled.unwrap_or(false);
-        if tls_enabled {
-            if let (Some(cert_path), Some(key_path)) =
-                (server.cert_path.as_ref(), server.key_path.as_ref())
-            {
-                match load_tls_acceptor(cert_path, key_path) {
-                    Ok(tls_acceptor) => {
-                        let tls_listen_addr = server
-                            .tls_listen_addr
-                            .clone()
-                            .unwrap_or_else(|| "0.0.0.0:8443".to_string());
-                        let https_listener = TcpListener::bind(&tls_listen_addr).await?;
-                        tracing::info!("HTTPS server listening on: {}", tls_listen_addr);
-
-                        let config_clone = config.clone();
-                        let http_client_clone = http_client.clone();
-                        let shutdown_signal_clone = shutdown_signal.clone();
-
-                        tokio::spawn(async move {
-                            if let Err(e) = start_https_server(
-                                https_listener,
-                                tls_acceptor,
-                                config_clone,
-                                http_client_clone,
-                                shutdown_signal_clone,
-                            )
-                            .await
-                            {
-                                tracing::error!("HTTPS server failed: {}", e);
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to load TLS certificates: {}", e);
-                    }
-                }
-            } else {
-                tracing::warn!("TLS enabled but no certificate/key paths provided");
-            }
-        }
-    }
-
-    for route in config.routes().await.into_iter() {
-        let backend_pool = route.backend_pool().clone();
-        let http_client_clone = http_client.clone();
-        let health_checker = HealthChecker::new(
-            backend_pool,
-            http_client_clone,
-            tokio::time::Duration::from_secs(10),
-            tokio::time::Duration::from_secs(5),
-            3,
-            "/health",
-        );
-        tokio::spawn(async move {
-            health_checker.run().await;
-        });
-    }
-
     loop {
         tokio::select! {
             incoming = ep.accept() => {
@@ -248,9 +249,9 @@ pub async fn run_proxy(
                     Some(incoming) => {
                         let config_clone = config.clone();
                         let http_client_clone = http_client.clone();
-                        let auth_config_clone = auth_config.clone();
+                        let auth_state_clone = auth_state.clone();
                         tokio::spawn(async move {
-                            conn::handle_incoming(incoming, config_clone, http_client_clone, auth_config_clone).await;
+                            conn::handle_incoming(incoming, config_clone, http_client_clone, auth_state_clone).await;
                         });
                     }
                     None => {
@@ -284,16 +285,31 @@ async fn start_http_server(
         tokio::select! {
             result = listener.accept() => {
                 let (stream, addr) = result?;
-                tracing::debug!("New HTTP connection from: {}", addr);
+                tracing::debug!("New connection on the plaintext listener from: {}", addr);
 
                 let config_clone = config.clone();
                 let client_clone = client.clone();
                 let remote_addr_str = addr.to_string();
 
                 tokio::spawn(async move {
+                    // The listener speaks HTTP, but a client may also open a
+                    // TLS session straight at it. One peeked byte tells the two
+                    // apart — a request line can never start with 0x16 — and a
+                    // TLS session goes to the passthrough path, since this
+                    // process has no key material and never decrypts anything.
+                    if is_tls_connection(&stream).await {
+                        tracing::debug!("TLS session on the plaintext listener from: {}", remote_addr_str);
+                        if let Err(e) =
+                            passthrough::handle_tcp_stream(stream, Vec::new(), &config_clone).await
+                        {
+                            tracing::error!("TLS passthrough failed for {}: {}", remote_addr_str, e);
+                        }
+                        return;
+                    }
+
                     let http_builder = Builder::new(hyper_util::rt::TokioExecutor::new());
                     let service = service_fn(move |req: hyper::Request<Incoming>| {
-                        proxy_handler(req, config_clone.clone(), client_clone.clone(), false, remote_addr_str.clone())
+                        proxy_handler(req, config_clone.clone(), client_clone.clone(), remote_addr_str.clone())
                     });
 
                     let io = TokioIo::new(stream);
@@ -313,11 +329,21 @@ async fn start_http_server(
     Ok(())
 }
 
+/// True when the peer opened a TLS session rather than sending a request.
+async fn is_tls_connection(stream: &tokio::net::TcpStream) -> bool {
+    let mut first = [0u8; 1];
+    match tokio::time::timeout(FIRST_BYTE_TIMEOUT, stream.peek(&mut first)).await {
+        Ok(Ok(1)) => passthrough::is_tls_handshake(first[0]),
+        // EOF, error, or a peer that never sends anything: hand it to the HTTP
+        // server, which owns read timeouts and error responses.
+        _ => false,
+    }
+}
+
 async fn proxy_handler(
     req: hyper::Request<Incoming>,
     config: Arc<RouteConfig>,
     client: Arc<HttpClient>,
-    is_https: bool,
     remote_addr: String,
 ) -> Result<
     hyper::Response<http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, hyper::Error>>,
@@ -335,7 +361,7 @@ async fn proxy_handler(
         ));
     }
 
-    let response = match http::proxy_request(&client, req, config.clone(), is_https).await {
+    let response = match http::proxy_request(&client, req, config.clone()).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!("Proxy request failed: {}", e);
@@ -381,86 +407,6 @@ pub async fn run_local_proxy(
     shutdown_signal: Arc<ShutdownSignal>,
 ) -> anyhow::Result<()> {
     local_proxy::run_local_proxy(local_proxy_config, shutdown_signal).await
-}
-
-fn load_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<Arc<TlsAcceptor>> {
-    let file = std::fs::File::open(cert_path)
-        .map_err(|e| anyhow::anyhow!("failed to open cert file: {}", e))?;
-    let mut reader = std::io::BufReader::new(file);
-    let certs: Vec<CertificateDer<'static>> = certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("failed to parse cert file: {}", e))?;
-
-    let file = std::fs::File::open(key_path)
-        .map_err(|e| anyhow::anyhow!("failed to open key file: {}", e))?;
-    let mut reader = std::io::BufReader::new(file);
-    let keys: Vec<PrivatePkcs8KeyDer<'static>> = pkcs8_private_keys(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("failed to parse key file: {}", e))?;
-
-    let key = keys
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
-    let key = PrivateKeyDer::Pkcs8(key);
-
-    let config = rustls::ServerConfig::builder_with_protocol_versions(&[
-        &rustls::version::TLS13,
-        &rustls::version::TLS12,
-    ])
-    .with_no_client_auth()
-    .with_single_cert(certs, key)
-    .map_err(|e| anyhow::anyhow!("Failed to create TLS config: {}", e))?;
-
-    Ok(Arc::new(TlsAcceptor::from(Arc::new(config))))
-}
-
-async fn start_https_server(
-    listener: TcpListener,
-    tls_acceptor: Arc<TlsAcceptor>,
-    config: Arc<RouteConfig>,
-    client: Arc<HttpClient>,
-    shutdown_signal: Arc<ShutdownSignal>,
-) -> anyhow::Result<()> {
-    loop {
-        tokio::select! {
-            result = listener.accept() => {
-                let (stream, addr) = result?;
-                tracing::debug!("New HTTPS connection from: {}", addr);
-
-                let tls_acceptor_clone = tls_acceptor.clone();
-                let config_clone = config.clone();
-                let client_clone = client.clone();
-                let remote_addr_str = addr.to_string();
-
-                tokio::spawn(async move {
-                    match tls_acceptor_clone.accept(stream).await {
-                        Ok(tls_stream) => {
-                            let http_builder = Builder::new(hyper_util::rt::TokioExecutor::new());
-                            let service = service_fn(move |req: hyper::Request<Incoming>| {
-                                proxy_handler(req, config_clone.clone(), client_clone.clone(), true, remote_addr_str.clone())
-                            });
-
-                            let io = TokioIo::new(tls_stream);
-                            if let Err(e) = http_builder.serve_connection_with_upgrades(io, service).await {
-                                tracing::error!("Failed to serve HTTPS connection: {}", e);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("TLS handshake failed: {}", e);
-                        }
-                    }
-                });
-            }
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
-                if shutdown_signal.is_shutdown_requested() {
-                    tracing::info!("Shutdown signal received, stopping HTTPS server");
-                    break;
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";

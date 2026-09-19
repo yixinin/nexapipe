@@ -9,7 +9,7 @@ debug = true
 
 [server]
 listen_addr = "0.0.0.0:8080"
-tls_enabled = false
+# TLS is terminated by the backend (Caddy), not here. See README.md, "TLS".
 
 [iroh]
 # secret_key = "your-hex-encoded-secret-key"
@@ -27,8 +27,41 @@ window = 1              # Time window tolerance (accept +/- N steps)
 max_attempts = 5        # Max failed attempts before lockout
 lockout_duration = 300  # Lockout duration in seconds (5 minutes)
 
+# Issuer label shown by the authenticator app, and used for both halves of the
+# otpauth:// URI (the label before the colon and the `issuer` parameter).
+# Falls back to "NexaPipe" when unset, and can be overridden per run with
+# `--issuer` when printing the QR code.
+issuer = "NexaPipe"
+
 # Client configurations.
-# Generate secrets using: nexapipe --generate-2fa <client-id>
+#
+# Generate a secret and its enrollment QR code with:
+#
+#   nexapipe --generate-2fa client-001
+#   nexapipe --generate-2fa client-001 --qr-format svg --qr-out client-001.svg
+#   nexapipe --generate-2fa client-001 --config config.toml.2fa.example
+#
+# Scanning is standard otpauth://, so any authenticator app works, not just the
+# NexaPipe app. A client already configured here can be shown again with:
+#
+#   nexapipe --show-2fa client-001 --config config.toml.2fa.example
+#
+# That only carries the 2FA half. To hand a client everything at once — the
+# endpoint, the domains and the 2FA credentials in a single scan — print an
+# endpoint invite instead:
+#
+#   nexapipe --generate-invite client-001 --config config.toml.2fa.example
+#   nexapipe --generate-invite client-001 --invite-name Home --qr-out invite.svg
+#
+# The identity comes from [iroh] secret_key below (so the code stays valid
+# across restarts) unless --endpoint-id is passed, and the domains come from
+# [local_proxy] proxy_domains unless --invite-domains is passed. Dropping the
+# client id prints the same invite without the 2FA block. The code carries the
+# TOTP secret in the clear, so treat it like a password.
+#
+# Warning: changing algorithm, time_step or digits here does NOT change what the
+# app does once it has scanned the code. Those values are only read when the
+# enrollment QR code is generated; keep them stable after clients are enrolled.
 [auth.clients.client-001]
 secret = "JBSWY3DPEHPK3PXP" # Base32-encoded secret
 created_at = "1723756800"

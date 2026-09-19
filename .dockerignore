@@ -1,6 +1,12 @@
 target/
+**/target/
 certs/
 .git/
 .gitignore
+.dockerignore
+.workbuddy/
 examples/
+ui-android/
+ui-desktop/
+logs/
 *.md
