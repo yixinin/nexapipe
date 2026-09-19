@@ -48,12 +48,20 @@ jobs:
             cross: true
 
           # ---------- Linux (musl, statically linked) ----------
+          # musl defaults to crt-static, and rustc then decides the target cannot produce a
+          # cdylib: cargo only warns ("dropping unsupported crate type `cdylib`") and exits 0,
+          # so the .so simply does not exist when packaging runs. -C target-feature=-crt-static
+          # brings it back. It is applied to the cdylib step only (see "Build client cdylib"),
+          # so the nexapipe binary itself stays statically linked. Never put it in
+          # .cargo/config.toml — that would make every musl binary dynamic.
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             cross: true
+            lib_rustflags: -C target-feature=-crt-static
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest
             cross: true
+            lib_rustflags: -C target-feature=-crt-static
 
           # ---------- macOS (cross-compile the Intel build on an arm64 runner) ----------
           - target: aarch64-apple-darwin
@@ -130,37 +138,79 @@ jobs:
       - name: Build client cdylib (cross)
         if: ${{ matrix.cross }}
         shell: bash
-        run: cross build --release --locked --target ${{ matrix.target }} -p ${{ env.LIB_NAME }} --features jni,local-proxy
+        run: |
+          set -euo pipefail
+          # Per-target rustc flags must go through CARGO_TARGET_<TRIPLE>_RUSTFLAGS under cross;
+          # a plain RUSTFLAGS would be dropped inside the container.
+          if [ -n "${{ matrix.lib_rustflags }}" ]; then
+            var="CARGO_TARGET_$(printf '%s' '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
+            export "$var=${{ matrix.lib_rustflags }}"
+            echo "Using $var=${{ matrix.lib_rustflags }}"
+          fi
+          cross build --release --locked --target ${{ matrix.target }} -p ${{ env.LIB_NAME }} --features jni,local-proxy
 
       - name: Build client cdylib (native)
         if: ${{ !matrix.cross }}
         shell: bash
-        run: cargo build --release --locked --target ${{ matrix.target }} -p ${{ env.LIB_NAME }} --features jni,local-proxy
+        run: |
+          set -euo pipefail
+          if [ -n "${{ matrix.lib_rustflags }}" ]; then
+            var="CARGO_TARGET_$(printf '%s' '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
+            export "$var=${{ matrix.lib_rustflags }}"
+            echo "Using $var=${{ matrix.lib_rustflags }}"
+          fi
+          cargo build --release --locked --target ${{ matrix.target }} -p ${{ env.LIB_NAME }} --features jni,local-proxy
 
-      - name: Resolve client library file name
+      # config.toml is gitignored (it is the operator's live config), so the archive ships the
+      # example instead; README.md is included so an unpacked release still documents the format.
+      - name: Resolve artifact file names
         shell: bash
         run: |
           set -euo pipefail
           case "${{ runner.os }}" in
             Windows)
+              echo "BIN_FILE=${BIN_NAME}.exe" >> "$GITHUB_ENV"
               echo "LIB_FILE=nexapipe_client.dll" >> "$GITHUB_ENV"
               # MSVC also emits an import library, which is convenient for linking from C/C++
               echo "LIB_FILE_EXTRA=nexapipe_client.dll.lib" >> "$GITHUB_ENV"
               ;;
             macOS)
+              echo "BIN_FILE=${BIN_NAME}" >> "$GITHUB_ENV"
               echo "LIB_FILE=libnexapipe_client.dylib" >> "$GITHUB_ENV"
               echo "LIB_FILE_EXTRA=" >> "$GITHUB_ENV"
               ;;
             *)
+              echo "BIN_FILE=${BIN_NAME}" >> "$GITHUB_ENV"
               echo "LIB_FILE=libnexapipe_client.so" >> "$GITHUB_ENV"
               echo "LIB_FILE_EXTRA=" >> "$GITHUB_ENV"
               ;;
           esac
 
+      # Fail here, with the release directory listed, instead of letting the packaging step
+      # die on an opaque `cp: cannot stat ...`.
+      - name: Verify built artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="target/${{ matrix.target }}/release"
+          missing=0
+          for f in "$BIN_FILE" "$LIB_FILE"; do
+            if [ ! -f "$dir/$f" ]; then
+              echo "::error::expected artifact is missing: $dir/$f"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "--- $dir ---"
+            ls -l "$dir" || true
+            exit 1
+          fi
+          ls -lh "$dir/$BIN_FILE" "$dir/$LIB_FILE"
+
       - name: Smoke test
         if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
         shell: bash
-        run: ./target/${{ matrix.target }}/release/${BIN_NAME} --version
+        run: ./target/${{ matrix.target }}/release/${BIN_FILE} --version
 
       - name: Package (unix)
         if: runner.os != 'Windows'
@@ -169,9 +219,9 @@ jobs:
           set -euo pipefail
           PKG="${BIN_NAME}-${VERSION}-${{ matrix.target }}"
           mkdir -p "dist/$PKG"
-          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/$PKG/"
+          cp "target/${{ matrix.target }}/release/${BIN_FILE}" "dist/$PKG/"
           cp "target/${{ matrix.target }}/release/${LIB_FILE}" "dist/$PKG/"
-          cp config.toml config.toml.2fa.example LICENSE "dist/$PKG/"
+          cp config.toml.2fa.example README.md LICENSE "dist/$PKG/"
           tar -czf "dist/$PKG.tar.gz" -C dist "$PKG"
           rm -rf "dist/$PKG"
           ls -lh dist
@@ -183,12 +233,12 @@ jobs:
           $pkg = "$env:BIN_NAME-$env:VERSION-${{ matrix.target }}"
           $stage = "dist/$pkg"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/$env:BIN_NAME.exe" $stage
+          Copy-Item "target/${{ matrix.target }}/release/$env:BIN_FILE" $stage
           Copy-Item "target/${{ matrix.target }}/release/$env:LIB_FILE" $stage
           if ($env:LIB_FILE_EXTRA -and (Test-Path "target/${{ matrix.target }}/release/$env:LIB_FILE_EXTRA")) {
             Copy-Item "target/${{ matrix.target }}/release/$env:LIB_FILE_EXTRA" $stage
           }
-          Copy-Item config.toml, config.toml.2fa.example, LICENSE $stage
+          Copy-Item config.toml.2fa.example, README.md, LICENSE $stage
           Compress-Archive -Path $stage -DestinationPath "dist/$pkg.zip" -Force
           Remove-Item -Recurse -Force $stage
           Get-ChildItem dist

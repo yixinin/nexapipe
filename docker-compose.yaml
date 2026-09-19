@@ -4,6 +4,9 @@ services:
     container_name: nexapipe
     restart: unless-stopped
     volumes:
+      # `config.toml` is gitignored (it is the operator's live config), so create it first with
+      # `cp config.toml.2fa.example config.toml`. A missing host path makes Docker create an
+      # empty *directory* there and the server then fails to read it.
       - ./config.toml:/app/config.toml
       # Log files, written by the [log] section of config.toml.
       # `docker compose exec nexapipe tail -f /app/logs/nexapipe.log`

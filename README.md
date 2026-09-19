@@ -85,7 +85,7 @@ never have to be told apart by guessing:
 | `third_party/smoltcp` | Vendored smoltcp 0.12 with a patch for the sequence-number underflow panic. Wired in through `[patch.crates-io]`. Do not edit. |
 | `ui-android/` | Android app (submodule → `yixinin/nexapipe-android`). |
 | `ui-desktop/` | Tauri 2 desktop app (submodule → `yixinin/nexapipe-desktop`). |
-| `config.toml` | Example server + local-proxy configuration. |
+| `config.toml.2fa.example` | Example server + local-proxy configuration (2FA enabled). Copy it to `config.toml` — that name is gitignored, it is the operator's live config. |
 | `run_android.ps1` | One-shot Android debug loop (build → install → launch → logcat). |
 
 ---
@@ -94,6 +94,7 @@ never have to be told apart by guessing:
 
 ```bash
 cargo build --release -p nexapipe
+cp config.toml.2fa.example config.toml   # config.toml is gitignored; start from the example
 cargo run -p nexapipe -- --config config.toml
 ```
 
