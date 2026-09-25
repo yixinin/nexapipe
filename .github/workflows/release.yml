@@ -893,7 +893,12 @@ jobs:
           BUILD_TOOLS_DIR=$(ls -d "${ANDROID_SDK_ROOT}"/build-tools/* | sort -V | tail -n 1)
           "${BUILD_TOOLS_DIR}/apksigner" verify --verbose --print-certs "$APK"
 
-          OUT="nexapipe-${{ steps.opts.outputs.version_name }}-arm64-v8a.apk"
+          # The APK carries the GUI's product name, "nexa", exactly like the desktop
+          # bundles (tauri.conf.json productName -> nexa_*.dmg/.deb) and this app's own
+          # app_name/app_title. Only the server archives keep the "nexapipe-" prefix.
+          # Renaming it back to nexapipe-* would make one Release contain two names for
+          # one product, and read as if the .apk were part of the CLI.
+          OUT="nexa-${{ steps.opts.outputs.version_name }}-arm64-v8a.apk"
           cp "$APK" "$OUT"
           sha256sum "$OUT" > "${OUT}.sha256"
 
@@ -911,8 +916,8 @@ jobs:
         with:
           name: dist-apk
           path: |
-            ui-android/nexapipe-${{ steps.opts.outputs.version_name }}-arm64-v8a.apk
-            ui-android/nexapipe-${{ steps.opts.outputs.version_name }}-arm64-v8a.apk.sha256
+            ui-android/nexa-${{ steps.opts.outputs.version_name }}-arm64-v8a.apk
+            ui-android/nexa-${{ steps.opts.outputs.version_name }}-arm64-v8a.apk.sha256
           if-no-files-found: error
           retention-days: 7
 
