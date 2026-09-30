@@ -407,6 +407,21 @@ response_secs = 30</pre>
       undecryptable.</li>
   </ul>
 
+  <h3 class="subhead">Android: it asks before taking another app's VPN</h3>
+  <ul class="changelog">
+    <li>Android allows one VPN slot per user, and <code>establish()</code> revokes whoever holds it
+      without asking anybody. Nexa used to look only at the <em>default</em> network, so a per-app or
+      split-tunnel VPN was invisible and was dropped silently.</li>
+    <li>Every VPN Android reports is now detected, and the first connection asks: take over, or
+      cancel. Cancel costs nothing &mdash; nothing has been started yet.</li>
+    <li>"Remember my choice" is optional and can be taken back from the settings, because a
+      remembered cancel must not become a setting you cannot find again.</li>
+    <li>An always-on VPN is refused outright, and says why: Android restores it immediately, and it
+      may be a work-profile VPN you are not allowed to break.</li>
+    <li>Taking the slot is never automatic: a rebuild after a network switch no longer revokes
+      another app's VPN by the way.</li>
+  </ul>
+
   <h2>Changelog</h2>
 
   <h3 class="subhead">Added</h3>
@@ -442,6 +457,9 @@ response_secs = 30</pre>
     <li>Desktop: masks are computed in Rust rather than in the UI, so a full value no longer reaches
       the page that is drawing it shortened, and an invite's secret is filed by Rust instead of
       being handed to the frontend in full.</li>
+    <li>Android: another app's VPN is no longer disconnected without asking. The guard detects every
+      VPN Android reports rather than only the default network's, and the first connection asks
+      instead of refusing &mdash; or silently revoking.</li>
   </ul>
 
   <h2>Before upgrading</h2>
@@ -461,6 +479,8 @@ response_secs = 30</pre>
       there is no system prompt to borrow, the app asks for your login password itself.</li>
     <li>Desktop: bundles are signed, so an in-app update from 0.3.x verifies as usual through
       <code>latest.json</code>.</li>
+    <li>Android: the first connection asks if another app's VPN holds the slot. Cancel leaves that
+      VPN running and Nexa stopped; a remembered choice can be changed in the settings.</li>
   </ul>
 
   <footer class="site">

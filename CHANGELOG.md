@@ -102,6 +102,19 @@ lives in `docs/releases/`, and only that directory reaches the site.
   them. The Node ID is masked the same way, and `reveal_credential` and
   `reveal_node_id` are now the only two commands that answer with a whole value
   — which is what makes them the two the OS lock has to sit in front of.
+- **Android: Nexa no longer disconnects another app's VPN without asking.**
+  Android allows one `VpnService` TUN per user, and `establish()` revokes
+  whoever holds the slot without asking anybody. Nexa only checked whether a VPN
+  was the *default* network, so a per-app or split-tunnel VPN was invisible to
+  the guard and was dropped silently — and even when one was seen the only
+  outcome was a refusal, so running Nexa beside another VPN meant stopping that
+  app by hand. Every VPN Android reports is now detected (`allNetworks` with
+  `TRANSPORT_VPN`), and the first `establish()` asks: take over, or cancel, with
+  an optional "remember my choice" that the settings can take back. An
+  always-on VPN is refused outright and says why, because Android restores it
+  immediately and it may be a work-profile VPN the user is not allowed to break.
+  Taking the slot is never automatic: a rebuild after a network switch does not
+  take it back.
 
 ## [0.3.0] — 2026-09-29
 
