@@ -500,7 +500,7 @@ items the numbers pointed at.
    unless an operator asks for it, so this reaches only a deployment that
    turned retries on. A **chunked** body is still read whole: the proxy
    re-frames it as one buffer with a length of its own.
-8. **What a second connection costs.** **Added on 2026-10-22, and the number a
+9. **What a second connection costs.** **Added on 2026-10-22, and the number a
    decision about choosing the protocol with ALPN needs.** The protocol is
    chosen today by the first byte of each stream, so **one** connection
    carries both the HTTP requests and the L4 tunnels a client makes to the
