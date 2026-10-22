@@ -12,17 +12,29 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.decodeFromString
 
-class SettingsManager(context: Context) {
-    private val prefs: SharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+// The tag the app's own log lines carry. At the file level rather than in the
+// companion, because the migration below is a function of its own and logs
+// under the same tag.
+private const val TAG = "SettingsManager"
+
+class SettingsManager internal constructor(
+    private val prefs: SharedPreferences,
     // 2FA secrets live in their own prefs file so backup rules can exclude
     // them as a whole; a TOTP seed must never leave the device. The endpoint
     // list itself *is* backed up, so every secret is pulled out of it on save
     // and kept here under its own endpoint ID instead.
-    private val secretPrefs: SharedPreferences = context.getSharedPreferences("NexaPipeSecrets", Context.MODE_PRIVATE)
-    private val json = Json { ignoreUnknownKeys = true }
+    private val secretPrefs: SharedPreferences,
     // Every credential written to `secretPrefs` goes through this, so the file
     // holds ciphertext even though it is a plain preferences file.
-    private val secrets = SecretStore()
+    private val secrets: SecretStore
+) {
+    constructor(context: Context) : this(
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE),
+        context.getSharedPreferences("NexaPipeSecrets", Context.MODE_PRIVATE),
+        SecretStore()
+    )
+
+    private val json = Json { ignoreUnknownKeys = true }
 
     init {
         migrateLegacyTwoFactor()
@@ -31,7 +43,6 @@ class SettingsManager(context: Context) {
     }
 
     companion object {
-        private const val TAG = "SettingsManager"
         const val PREFS_NAME = "NexaPipeSettings"
         const val KEY_NODES = "nodes"
         const val KEY_RELAY_MODE = "relay_mode"
@@ -440,22 +451,16 @@ class SettingsManager(context: Context) {
      * Moves a relay token that an older version wrote to [prefs] into
      * [secretPrefs].
      *
-     * Runs on every start but only does anything once: the key is removed from
-     * [prefs] whether or not the token is worth keeping, so a blank one — the
-     * value saved whenever a relay needs no token — does not leave the file
-     * marked as holding a credential.
+     * The rule and the file operations are [relayTokenMigration]'s; this is
+     * the call of it with this app's files and this device's keystore.
      */
     private fun migrateRelayAuthToken() {
-        if (!prefs.contains(KEY_RELAY_AUTH_TOKEN)) {
-            return
-        }
-        val token = prefs.getString(KEY_RELAY_AUTH_TOKEN, "") ?: ""
-        prefs.edit().remove(KEY_RELAY_AUTH_TOKEN).apply()
-        if (token.isBlank()) {
-            return
-        }
-        secretPrefs.edit { putString(KEY_RELAY_AUTH_TOKEN, secrets.seal(token)) }
-        Log.i(TAG, "Moved the relay auth token out of the backed-up preferences")
+        relayTokenMigration(
+            prefs,
+            secretPrefs,
+            seal = { secrets.sealOrNull(it) },
+            unseal = { secrets.unseal(it) }
+        )
     }
 
     /**
@@ -543,6 +548,10 @@ class SettingsManager(context: Context) {
         // stored blank, for the reasons given at [KEY_RELAY_AUTH_TOKEN].
         if (authToken.isBlank()) {
             secretPrefs.edit { remove(KEY_RELAY_AUTH_TOKEN) }
+            // The legacy copy goes with it. The read path falls back to the
+            // backed-up preferences, so a token the user has cleared would
+            // otherwise come back from there.
+            prefs.edit { remove(KEY_RELAY_AUTH_TOKEN) }
             return true
         }
         val sealed = secrets.sealOrNull(authToken)
@@ -587,9 +596,19 @@ class SettingsManager(context: Context) {
         return prefs.getString(KEY_RELAY_URL, "") ?: ""
     }
 
-    /** Loads the bearer token for the custom relay, if it needs one. */
+    /**
+     * Loads the bearer token for the custom relay, if it needs one.
+     *
+     * The secrets file is where the token lives once it has been sealed; the
+     * backed-up preferences are where it lives when this device cannot seal
+     * it. Both are read, and the secrets file wins — it is written whenever
+     * the token is saved, so it holds the newer of the two.
+     */
     fun loadRelayAuthToken(): String {
-        return secrets.unseal(secretPrefs.getString(KEY_RELAY_AUTH_TOKEN, ""))
+        return relayTokenRead(
+            secretPrefs.getString(KEY_RELAY_AUTH_TOKEN, null),
+            prefs.getString(KEY_RELAY_AUTH_TOKEN, null)
+        ) { secrets.unseal(it) }
     }
 
     /**
@@ -641,5 +660,87 @@ class SettingsManager(context: Context) {
     /** Records that the VPN permission was missing at boot, or that it was not. */
     fun saveVpnConsentMissing(missing: Boolean) {
         prefs.edit { putBoolean(KEY_VPN_CONSENT_MISSING, missing) }
+    }
+}
+
+/**
+ * Moves a relay token out of the backed-up preferences, if one is there.
+ *
+ * The rule is [relayTokenMove]'s; this is the part that acts on it. It is a
+ * function of its own so it can be driven without a device:
+ *
+ * - A token that can be sealed is written to the secrets file, sealed, and
+ *   only then removed from the file it came out of — and only if that write
+ *   reached the disk. A write that failed leaves the token where it was,
+ *   where the read path still finds it.
+ * - A token that cannot be sealed stays where it is. It is not written in the
+ *   clear into the file whose whole point is that it holds ciphertext, and
+ *   the read path reads that location too, so the tunnel keeps its
+ *   credential.
+ * - A blank value is not a credential: the key goes, and nothing is written.
+ *
+ * Both writes are committed rather than queued, so the order they reach the
+ * disk is the order they are made in: the sealed copy is on the disk before
+ * the cleartext one is taken off it, and a process that dies between the two
+ * leaves the token where it was instead of nowhere.
+ */
+internal fun relayTokenMigration(
+    prefs: SharedPreferences,
+    secretPrefs: SharedPreferences,
+    seal: (String) -> String?,
+    unseal: (String?) -> String
+) {
+    val key = SettingsManager.KEY_RELAY_AUTH_TOKEN
+    if (!prefs.contains(key)) {
+        return
+    }
+    val token = prefs.getString(key, "") ?: ""
+    when (val move = relayTokenMove(token) { seal(it) }) {
+        RelayTokenMove.None -> {
+            // Not a credential: the value saved whenever a relay needs no
+            // token. The key goes anyway, so the file does not carry a key
+            // that looks like a credential.
+            prefs.edit(commit = true) { remove(key) }
+        }
+        is RelayTokenMove.Move -> {
+            // A token the secrets file already holds is the newer one — it is
+            // written there whenever the token is saved — so the copy in the
+            // backed-up file is dropped rather than moved over it.
+            val stored = secretPrefs.getString(key, null)
+            if (!stored.isNullOrBlank() && unseal(stored).isNotBlank()) {
+                prefs.edit(commit = true) { remove(key) }
+                Log.i(TAG, "Dropped the superseded relay auth token from the backed-up preferences")
+                return
+            }
+            // The sealed copy is written — and committed, not queued —
+            // before the token is removed from the file it came out of: the
+            // two are different files, so the order they reach the disk is
+            // this order rather than SharedPreferences' to choose, and a
+            // process that dies between them leaves the token where it was
+            // instead of nowhere. Once, at startup, on one small value: the
+            // block is the price of not losing a credential.
+            //
+            // The commit is not the KTX `edit(commit = true)`: that one
+            // throws the result away, and the result is the answer to
+            // "did the write reach the disk". The token is only taken off
+            // the file it came out of once it is on the disk here.
+            @Suppress("ApplySharedPref", "UseKtx")
+            val written = secretPrefs.edit().putString(key, move.sealed).commit()
+            if (!written) {
+                // The write did not reach the disk, so the token stays where
+                // it is: removing it now is the step that could lose it, and
+                // the read path finds it there.
+                Log.w(TAG, "Left the relay auth token where it was: the secrets file could not be written")
+                return
+            }
+            prefs.edit(commit = true) { remove(key) }
+            Log.i(TAG, "Moved the relay auth token out of the backed-up preferences")
+        }
+        RelayTokenMove.Keep -> {
+            Log.w(
+                TAG,
+                "Left the relay auth token where it was: this device cannot seal it yet"
+            )
+        }
     }
 }

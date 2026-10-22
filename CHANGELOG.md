@@ -57,6 +57,25 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **A name the configuration does not name exactly is found by an index.**
+  The client kept a map of the configured domains, and a name that was not in
+  it exactly — which is **every** name a TUN device asks about, since those
+  are the names of the sites it visits rather than the names the operator
+  configured — was looked for by walking the whole map and asking each entry
+  whether it covered the name. That walk happened on every request and every
+  flow.
+  The wildcard patterns are now indexed by the name they cover: `*.example.com`
+  by `example.com`, and the catch-all `*` by nothing. A pattern covers a name
+  when the name ends with the pattern's suffix **at a label boundary**, and
+  those suffixes are exactly the name's own label-aligned ones, so the lookup
+  asks for them and the first one that is in the index is the longest pattern
+  that covers the name — the same answer the walk gave, without the walk.
+  A pattern that matches nothing — `*.`, the catch-all in another spelling,
+  which the rule refuses — is indexed under no name at all, so it serves
+  nothing and cannot widen what a client proxies.
+  The six tests that pin the wildcard behaviour, including the one that says
+  a wildcard does not serve its own apex, pass unchanged.
+
 - **Three small things on the server's response path.**
   The **WebSocket's copy loop** moved 8 KiB at a time where the HTTP path
   coalesces into 64 KiB, and it had **no bound at all** -- only the handshake
@@ -79,6 +98,7 @@ lookup, which is what a config written before the key existed does.
   is the h2 half's, and the pool's own 120-second idle timeout was only
   enforced lazily, at the next checkout. A connection to a backend that
   stopped answering now sits in the pool for 120 seconds and no longer.
+
 
 - **The server answers the handshake in the form it was asked in.** The
   handshake message has two forms — the JSON one every client already speaks,
@@ -743,6 +763,34 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **A relay token is no longer written in the clear by its own migration.**
+  The Android app moves a relay bearer token out of the backed-up preferences
+  and into the secrets file, which is excluded from the backup precisely
+  because it holds ciphertext. The move used `seal`, which hands the value
+  back in the clear on a device with no keystore — so on exactly the devices
+  that could not protect the token, the migration wrote it in the clear into
+  the file that says it holds none, and removed it from the file it came out
+  of. A token that cannot be sealed now moves nowhere: it stays where it is
+  until the keystore can hold it, and the decision is a tested function
+  rather than a line of bookkeeping.
+  "Where it is" is the **backed-up** preferences, so a token this device
+  cannot seal rides the backup for as long as the keystore is unavailable —
+  the trade is a credential that is preserved over one that never leaves the
+  device, and the migration moves it on the first start that can seal it.
+  Staying there keeps it usable as well as safe: the app reads the token
+  out of both files, so a token this device cannot seal is still the token
+  the tunnel authenticates with. The move is a write whose success is
+  checked now — the sealed copy is committed to the disk before the
+  cleartext one is taken off it, and a write that failed leaves the token
+  where it was instead of losing it from both files.
+- **A credential bought by an enrollment goes through the same check.** The
+  enrollment writes the pool's credential itself, and it wrote it without the
+  comparison that closes the connections of the identity that is gone: the
+  identity changed and the connections of the old identity stayed in the
+  pool, serving traffic under an identity the server had already been told
+  was gone.
+  Every write of the credential goes through one place now, and that place
+  compares the identity and closes the connections when it changed.
 - **The WebSocket request line is rebuilt from the parsed request.** The
   client rebuilt the line it sends from the raw bytes of the one it
   received, and the HTTP version came out of that split — so a request line
