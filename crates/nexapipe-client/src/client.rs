@@ -282,15 +282,30 @@ mod tests {
             }
 
             // The head of the stream: enough to decode the preface.
-            let mut head = [0u8; 64];
-            let read = recv
-                .read(&mut head)
-                .await
-                .expect("the head is read")
-                .expect("the stream is not finished");
-            let (preface, _) = Preface::decode(&head[..read])
-                .expect("the preface decodes")
-                .expect("the preface is whole");
+            //
+            // Read in a loop rather than once, because one read is not a
+            // promise that the whole preface arrived. A preface may be split
+            // across segments — the protocol says so, and the server's own
+            // reader loops for the same reason — and `Preface::decode` says
+            // "not enough bytes yet" rather than failing. A far side that
+            // read once would fail on a split for a reason that has nothing
+            // to do with the thing this test is about.
+            let mut head = Vec::new();
+            let preface = loop {
+                let mut chunk = [0u8; 64];
+                let read = recv
+                    .read(&mut chunk)
+                    .await
+                    .expect("the head is read")
+                    .expect("the stream is not finished");
+                head.extend_from_slice(&chunk[..read]);
+                match Preface::decode(&head) {
+                    Ok(Some((preface, _))) => break preface,
+                    // Not enough yet: the rest of it is on its way.
+                    Ok(None) => continue,
+                    Err(e) => panic!("the preface decodes: {e}"),
+                }
+            };
             assert_eq!(preface.host, "db.test", "the far side was told the host");
             assert_eq!(preface.port, 5432, "the far side was told the port");
 
