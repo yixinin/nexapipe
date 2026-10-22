@@ -9,9 +9,22 @@ name: CI
 # and the job that publishes them only ever run from a tag, so this is the one
 # place a broken Dockerfile is caught before a release depends on it.
 #
-# The `test` job runs the root workspace on Linux and macOS. Windows is covered
-# by `windows-test` below, which used to be `windows-check`, a `cargo check`:
-# the integration tests spawn the built binary, and the cfg(unix) halves of the
+# The jobs are few on purpose. Twenty-eight of them, half of them running the
+# same three commands on the same runner, is a list nobody reads and a wall
+# of checkboxes nobody checks. What a pull request needs is a short list of
+# things that can fail, each of them failing for a reason of its own. So:
+#
+#   - the checks that share a toolchain share a job, and the checks that
+#     share a runner share a job;
+#   - a job that covers one part of the tree runs only when that part
+#     changed, which is what the `changes` job decides;
+#   - a check that cannot fail the build does not run on every pull request
+#     (the benchmarks).
+#
+# The `test` job runs the root workspace on Linux, macOS and Windows.
+# Windows is one of the matrix legs rather than a job of its own: it used to
+# be `windows-check`, a `cargo check`, and it is `cargo test` now, because the
+# integration tests spawn the built binary and the cfg(unix) halves of the
 # config watcher and of shutdown have no Windows counterpart to run them
 # against. Those halves are `#[cfg(unix)]` gated rather than left to fail, so
 # what a Windows run reports is the half that does exist, which is the half
@@ -19,11 +32,11 @@ name: CI
 # anything that fails once it runs still reached a tag.
 #
 # Jobs that exist purely because the default feature set cannot see the code they cover:
-#   - android-ndk: the fd-based entry point of crates/nexapipe-client/src/tun_proxy.rs is
+#   - the android job: the fd-based entry point of crates/nexapipe-client/src/tun_proxy.rs is
 #               cfg(target_os = "android"); a host check covers the shared stack but not
 #               the Android half. Without this job a break there only surfaces when the
 #               release APK is built from a tag.
-#   - features: `local-proxy` / `webpki-roots` / `uniffi` change which optional
+#   - the features job: `local-proxy` / `webpki-roots` / `uniffi` change which optional
 #               dependencies are compiled, so the combinations that matter are listed
 #               explicitly instead of relying on --all-features.
 #
@@ -31,13 +44,17 @@ name: CI
 # workspace and has its own Cargo.lock, so it needs its own check/clippy/test/audit
 # jobs. The frontend job runs vue-tsc + vite + the i18n/token linters.
 #
-# Android app jobs (android-app / android-lint): gradle unit tests, debug build and
-# lint. The Rust .so is deliberately NOT built here — JNI is loaded at runtime, and
-# the Rust side is covered by the android-ndk job and by release.yml.
+# The Android app job runs gradle unit tests, a debug build and lint. The Rust
+# .so is deliberately NOT built here — JNI is loaded at runtime, and the Rust
+# side is covered by the same job's NDK check and by release.yml.
 on:
   push:
     branches: [main, master]
   pull_request:
+    # A pull request that touches nothing but Markdown changes no code, so
+    # there is nothing here for it to catch.
+    paths-ignore:
+      - "**/*.md"
   workflow_dispatch:
 
 permissions:
@@ -52,45 +69,76 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  fmt:
-    name: rustfmt
+  # What the pull request touches. Every job below that covers one part of
+  # the tree is gated on one of these outputs, so a change to the server
+  # does not run the Android build and a change to the desktop app does not
+  # run the container image.
+  #
+  # The script behind it is .github/scripts/changed-paths.sh, which the
+  # CodeQL workflow runs as well.
+  changes:
+    name: changed paths
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
+
+    outputs:
+      rust: ${{ steps.paths.outputs.rust }}
+      client: ${{ steps.paths.outputs.client }}
+      android: ${{ steps.paths.outputs.android }}
+      desktop: ${{ steps.paths.outputs.desktop }}
+      image: ${{ steps.paths.outputs.image }}
+      desktop_lockfile: ${{ steps.paths.outputs.desktop_lockfile }}
+      codeql: ${{ steps.paths.outputs.codeql }}
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
-      # Pin the toolchain here as the other jobs do. Without it this job would
-      # use whatever rustfmt the runner image happens to ship, so a format change
-      # in a new rustfmt release would fail a PR that touched no Rust at all.
-      # `toolchain` is pinned alongside the action: its default is `stable`,
-      # which moves, so an unpinned toolchain leaves the results of CI and of a
-      # release build dependent on the calendar. Bump the two together.
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
         with:
-          toolchain: 1.98.1
-          components: rustfmt
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
+          # The whole history: the diff is taken against the merge base of
+          # the pull request, and a shallow clone does not have it.
+          fetch-depth: 0
+      - id: paths
+        env:
+          # Both are empty on a push, which the script reads as "no base":
+          # everything is in scope, because a push to main is the state of
+          # the world.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: .github/scripts/changed-paths.sh
 
-  clippy:
-    name: clippy
+  # The formatting and the lints, which want the same toolchain and the same
+  # checkout, so they share a job.
+  #
+  # The toolchain is pinned here as it is in every other job. Without it this
+  # job would use whatever rustfmt and clippy the runner image happens to
+  # ship, so a lint added by a new toolchain release would turn this job red
+  # on a pull request that changed no Rust at all. `toolchain` is pinned
+  # alongside the action: its default is `stable`, which moves, so an
+  # unpinned toolchain leaves the results of CI and of a release build
+  # dependent on the calendar. Bump the two together.
+  lint:
+    name: lint (rustfmt + clippy)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
-      # Pin the toolchain, as the fmt job does. Clippy runs with -D warnings, so
-      # a lint added by a new toolchain release turns this job red on a PR that
-      # changed no Rust at all.
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
         with:
           toolchain: 1.98.1
-          components: clippy
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
         with:
-          key: clippy
+          key: lint
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
       # -D warnings: without this clippy exits 0 and the job is decorative.
+      # `!cancelled()` so that a formatting failure does not hide the lint
+      # findings, and the other way round.
       - name: cargo clippy
+        if: ${{ !cancelled() }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   # The floor the workspace declares, built on exactly that toolchain.
@@ -108,6 +156,9 @@ jobs:
     name: msrv (1.95.0)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
       - name: Set up Rust
@@ -125,15 +176,27 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.timeout }}
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+
     strategy:
       fail-fast: false
       matrix:
-        # macOS matters because development happens on one: a test that only
-        # passes on the Linux runner is a test that breaks the maintainer's
-        # machine. Architecture variants do not change which cfg branch runs,
-        # so one runner per OS is enough.
-        os: [ubuntu-latest, macos-15]
+        include:
+          # macOS matters because development happens on one: a test that only
+          # passes on the Linux runner is a test that breaks the maintainer's
+          # machine. Architecture variants do not change which cfg branch runs,
+          # so one runner per OS is enough.
+          - os: ubuntu-latest
+            timeout: 45
+          - os: macos-15
+            timeout: 45
+          # 60 rather than 45: a Windows runner compiles the same dependency
+          # tree more slowly, and this one links and runs as well.
+          - os: windows-latest
+            timeout: 60
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
       - name: Set up Rust
@@ -143,8 +206,81 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
         with:
           key: test-${{ matrix.os }}
+      # The same command on all three runners, so the three agree on what
+      # "the tests pass" means. `--all-targets` is gone because `cargo test`
+      # already compiles the test targets that used to be the reason for it;
+      # the bench targets are compiled by the lint job and measured by the
+      # bench job, neither of which is a test.
       - name: cargo test
         run: cargo test --workspace --locked
+
+  # The optional dependency sets of the client, each of them compiled and run.
+  #
+  # One job and one runner rather than five parallel ones: the sets share
+  # most of their dependencies, and one target directory compiles those once
+  # instead of five times over. The five names are still reported one by one,
+  # so a failure says which set failed.
+  #
+  # Every entry here must be a subset of what release.yml passes to
+  # `cargo build -p nexapipe-client`, or the release is compiling a
+  # combination nothing here has ever type-checked.
+  #
+  # `jni,local-proxy` is that combination: the release cdylib is built
+  # with it on eight non-Android targets. `jni` on its own was missing
+  # from this matrix until v0.6.0, and the gap shipped a release whose
+  # every server archive failed to compile — `stop_tun_proxy` read a
+  # `tun_proxy` field gated behind `tun-proxy` + `android`, so it existed
+  # on every host build and had nothing to read. The android job below does
+  # compile `jni`, but its `target_os` makes the gate true, so it agreed with
+  # the working build and never saw the broken one.
+  features:
+    name: client features
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
+        with:
+          key: features
+      # Compiling tests is not running them: the `tun-proxy` unit tests (DNS
+      # cache semantics, virtual-IP allocation) sat green in the repo for a
+      # release without ever executing on a runner, because the workspace test
+      # job runs default features and this job only used to `check`.
+      #
+      # `!cancelled()` on each set: one set failing must not hide the other
+      # four, which is what five separate jobs used to do.
+      - name: local-proxy
+        if: ${{ !cancelled() }}
+        run: |
+          cargo check -p nexapipe-client --all-targets --features "local-proxy" --locked
+          cargo test -p nexapipe-client --features "local-proxy" --locked
+      - name: tun-proxy
+        if: ${{ !cancelled() }}
+        run: |
+          cargo check -p nexapipe-client --all-targets --features "tun-proxy" --locked
+          cargo test -p nexapipe-client --features "tun-proxy" --locked
+      - name: webpki-roots
+        if: ${{ !cancelled() }}
+        run: |
+          cargo check -p nexapipe-client --all-targets --features "webpki-roots" --locked
+          cargo test -p nexapipe-client --features "webpki-roots" --locked
+      - name: uniffi
+        if: ${{ !cancelled() }}
+        run: |
+          cargo check -p nexapipe-client --all-targets --features "uniffi" --locked
+          cargo test -p nexapipe-client --features "uniffi" --locked
+      - name: jni,local-proxy
+        if: ${{ !cancelled() }}
+        run: |
+          cargo check -p nexapipe-client --all-targets --features "jni,local-proxy" --locked
+          cargo test -p nexapipe-client --features "jni,local-proxy" --locked
 
   # The benchmarks. They exist so that a performance claim in this repository
   # is a measurement rather than an expectation — see docs/benchmarks.md.
@@ -154,12 +290,19 @@ jobs:
   # number that gates a build before anyone trusts it gets deleted, and the
   # budget that would gate it belongs to whoever has run these enough times to
   # know what normal variance looks like.
+  #
+  # Not on pull requests: a check that cannot fail the build is a cost with
+  # nothing to show for it on every proposal. The report is worth as much on
+  # the commit that landed as it is on the one that was proposed, and the
+  # commit that landed is measured on every push to main.
   bench:
     name: benchmarks
     runs-on: ubuntu-latest
     # 45 like the other jobs, but this one links the whole tree with LTO
     # before it measures anything, which is the slowest step in it.
     timeout-minutes: 45
+    if: github.event_name != 'pull_request'
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
       - name: Set up Rust
@@ -189,192 +332,63 @@ jobs:
           path: target/criterion
           if-no-files-found: ignore
 
-  # The root workspace's only Windows coverage. release.yml does build Windows
-  # binaries, but only from a tag, so this is what tells a PR that the crates
-  # still work there — and `cargo test` is what tells it: the integration tests
-  # are where the crates' public surface is used the way a caller uses it, and
-  # compiling them without running them only ever caught half a break.
-  windows-test:
-    name: cargo test (windows-latest)
-    runs-on: windows-latest
-    # 60 rather than the 45 the other jobs use: a Windows runner compiles the
-    # same dependency tree more slowly, and this one now links and runs as well.
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
-        with:
-          toolchain: 1.98.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
-        with:
-          key: windows-test
-      # The same command the Linux and macOS runners run, so the three agree on
-      # what "the tests pass" means. `--all-targets` is gone because `cargo
-      # test` already compiles the test targets that used to be the reason for
-      # it; the bench targets are compiled by the clippy job and measured by
-      # the bench job, neither of which is a test.
-      - name: cargo test
-        run: cargo test --workspace --locked
-
-  features:
-    name: client features (${{ matrix.features }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        # Every entry here must be a subset of what release.yml passes to
-        # `cargo build -p nexapipe-client`, or the release is compiling a
-        # combination nothing here has ever type-checked.
-        #
-        # `jni,local-proxy` is that combination: the release cdylib is built
-        # with it on eight non-Android targets. `jni` on its own was missing
-        # from this matrix until v0.6.0, and the gap shipped a release whose
-        # every server archive failed to compile — `stop_tun_proxy` read a
-        # `tun_proxy` field gated behind `tun-proxy` + `android`, so it existed
-        # on every host build and had nothing to read. The `android-ndk` job
-        # below does compile `jni`, but its `target_os` makes the gate true, so
-        # it agreed with the working build and never saw the broken one.
-        features:
-          - "local-proxy"
-          - "tun-proxy" # the shared smoltcp stack (host entry point)
-          - "webpki-roots"
-          - "uniffi"
-          - "jni,local-proxy" # the release cdylib's feature set, on a host target
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
-        with:
-          toolchain: 1.98.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
-        with:
-          key: features-${{ matrix.features }}
-      - name: cargo check
-        run: cargo check -p nexapipe-client --all-targets --features "${{ matrix.features }}" --locked
-      # Compiling tests is not running them: the `tun-proxy` unit tests (DNS
-      # cache semantics, virtual-IP allocation) sat green in the repo for a
-      # release without ever executing on a runner, because the workspace test
-      # job runs default features and this job only used to `check`.
-      - name: cargo test
-        run: cargo test -p nexapipe-client --features "${{ matrix.features }}" --locked
-
-  android-ndk:
-    name: android ndk (tun-proxy / jni)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
-
-      - name: Resolve Android NDK
-        id: ndk
-        run: |
-          set -euo pipefail
-          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          export ANDROID_SDK_ROOT="$SDK" ANDROID_HOME="$SDK"
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-
-          NDK_DIR=$(ls -1d "$SDK"/ndk/*/ 2>/dev/null | sort -V | tail -n 1 | sed 's:/$::' || true)
-          if [ -z "${NDK_DIR:-}" ]; then
-            SM=$(ls -1 "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n 1 || true)
-            [ -n "${SM:-}" ] || { echo "::error::no sdkmanager and no NDK under $SDK"; exit 1; }
-            yes | "$SM" --licenses > /dev/null 2>&1 || true
-            "$SM" --install "ndk;29.0.14206865" \
-              || echo "::warning::pinned NDK unavailable, falling back to whatever is in the image"
-            NDK_DIR=$(ls -1d "$SDK"/ndk/*/ 2>/dev/null | sort -V | tail -n 1 | sed 's:/$::' || true)
-          fi
-          [ -n "${NDK_DIR:-}" ] || { echo "::error::no NDK available"; exit 1; }
-          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
-          echo "NDK: $NDK_DIR"
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
-        with:
-          toolchain: 1.98.1
-          targets: aarch64-linux-android x86_64-linux-android
-
-      - name: Install cargo-ndk
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2 @ 2026-10-16
-        with:
-          tool: cargo-ndk
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
-        with:
-          key: android-check
-
-      # Both shipped ABIs are type-checked, not just the one that used to be the
-      # only one: a change that compiles for aarch64 and not for x86_64 is a
-      # change that breaks the emulator build at release time.
-      #
-      # The repo .cargo/config.toml hardcodes a Windows NDK linker path; --config
-      # takes precedence over both env vars and the config file.
-      - name: cargo ndk check (jni + local-proxy + tun-proxy)
-        run: |
-          set -euo pipefail
-          NDK_BIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          for PAIR in "arm64-v8a:aarch64-linux-android" "x86_64:x86_64-linux-android"; do
-            ABI="${PAIR%%:*}"
-            TRIPLE="${PAIR##*:}"
-            LINKER="${NDK_BIN}/${TRIPLE}26-clang"
-            cargo ndk --target "${ABI}" --platform 26 check \
-              -p nexapipe-client \
-              --features "jni local-proxy tun-proxy" \
-              --config "target.${TRIPLE}.linker='${LINKER}'"
-          done
-
-  audit:
-    name: dependency audit
+  # Everything the repository depends on, and everything that must not be in
+  # it. One job, because the checks are cheap and the runner they share is
+  # the same one: the advisories of the two Cargo.lock files, the licences
+  # and the sources deny.toml has an opinion about, the npm tree of the
+  # desktop frontend, the secrets in the history and the advisories a pull
+  # request introduces.
+  supply-chain:
+    name: supply chain (audit, deny, secrets)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
+        with:
+          # The secret scan reads every commit, so it needs the history.
+          fetch-depth: 0
       - name: Install cargo-audit
         uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2 @ 2026-10-16
         with:
           tool: cargo-audit@0.22.2
-      # RUSTSEC advisories for everything in Cargo.lock. Unmaintained/unsound
-      # advisories are informational (exit 0); vulnerabilities fail the job.
-      - name: cargo audit
-        run: cargo audit
-
-  # What cargo audit does not look at: the licences the tree carries, where
-  # the crates were fetched from, and the crates that sit at two versions at
-  # once. The policy is deny.toml, at the repository root, and it says the
-  # same thing about advisories that the audit job above does — the
-  # difference is the rest of the file.
-  supply-chain:
-    name: supply chain (cargo deny)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
-
+      # Pin the checker, not only the action that installs it: the policy
+      # file is schema-versioned (advisories and licences use `version = 2`)
+      # and a new cargo-deny release has to be adopted deliberately.
       - name: Install cargo-deny
         uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2 @ 2026-10-16
         with:
-          # Pin the checker, not only the action that installs it: the policy
-          # file is schema-versioned (advisories and licences use `version = 2`)
-          # and a new cargo-deny release has to be adopted deliberately.
           tool: cargo-deny@0.20.2
-
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7 @ 2026-10-08
+        with:
+          node-version-file: ui-desktop/.nvmrc
+          cache: npm
+          cache-dependency-path: ui-desktop/package-lock.json
+      # RUSTSEC advisories for everything in Cargo.lock. Unmaintained/unsound
+      # advisories are informational (exit 0); vulnerabilities fail the job.
+      - name: cargo audit
+        if: ${{ !cancelled() }}
+        run: cargo audit
+      # What cargo audit does not look at: the licences the tree carries, where
+      # the crates were fetched from, and the crates that sit at two versions at
+      # once. The policy is deny.toml, at the repository root, and it says the
+      # same thing about advisories that the audit step above does — the
+      # difference is the rest of the file.
       - name: cargo deny (server)
+        if: ${{ !cancelled() }}
         run: cargo deny check
-
       # src-tauri is its own workspace with its own Cargo.lock, so the run
       # above never sees it — and it is the larger of the two graphs.
       - name: cargo deny (desktop)
+        if: ${{ !cancelled() }}
         run: cargo deny --manifest-path ui-desktop/src-tauri/Cargo.toml check
-
-  secrets:
-    name: secret scan
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
-        with:
-          fetch-depth: 0
+      # Runtime dependencies only (--omit=dev), and only high/critical fail the build: upgrading a moderate
+      # advisory deep in the build chain costs far more than it is worth; dependabot can follow those slowly.
+      - name: npm audit
+        if: ${{ !cancelled() }}
+        working-directory: ui-desktop
+        run: npm audit --omit=dev --audit-level=high
       # Free for public repositories. If a repo ever becomes private, add
       # GITLEAKS_LICENSE (orgs need a paid licence) as a secret.
       #
@@ -383,26 +397,23 @@ jobs:
       # the test fixtures that look like credentials and nothing else, which is
       # what lets this run as a gate.
       - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3 @ 2026-05-30
+        if: ${{ !cancelled() }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITLEAKS_CONFIG: .gitleaks.toml
-
-  dependency-review:
-    name: dependency review
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
+      # The advisories a pull request introduces, which the weekly scan
+      # cannot see: it looks at what was merged, not at what is proposed.
+      #
+      # glib 0.18 rides in with the gtk 0.18 stack tauri pulls in on Linux
+      # (tao, muda and webkit2gtk all still require gtk ^0.18), and this
+      # advisory is only patched in glib >= 0.20, so there is no version to
+      # move to until upstream tauri migrates. Nothing in this workspace
+      # touches glib::VariantStrIter, the unsound iterator it describes.
+      #
+      # Drop this once ui-desktop/src-tauri/Cargo.lock pins glib >= 0.20.
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0 @ 2026-05-08
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         with:
-          # glib 0.18 rides in with the gtk 0.18 stack tauri pulls in on Linux
-          # (tao, muda and webkit2gtk all still require gtk ^0.18), and this
-          # advisory is only patched in glib >= 0.20, so there is no version to
-          # move to until upstream tauri migrates. Nothing in this workspace
-          # touches glib::VariantStrIter, the unsound iterator it describes.
-          #
-          # Drop this once ui-desktop/src-tauri/Cargo.lock pins glib >= 0.20.
           allow-ghsas: GHSA-wrw7-89jp-8q8g
 
   # ------------------------------------------------------------------
@@ -410,10 +421,15 @@ jobs:
   # ../../crates/nexapipe-client of this same repository).
   # ------------------------------------------------------------------
 
-  desktop-frontend:
-    name: desktop frontend (typecheck + build + linters)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  # The desktop crate on Linux: its lints, its tests and the frontend that
+  # sits on top of it. One job, because they are one checkout, one runner
+  # and one set of system dependencies.
+  desktop:
+    name: "desktop (linux: rust + frontend)"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
 
     defaults:
       run:
@@ -422,116 +438,32 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
 
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7 @ 2026-10-08
+      # Two build-only dependencies of the desktop crate on Linux:
+      #   - libdbus-1-dev, what keyring's persistent backend builds against
+      #     (Secret Service); without it the crate does not compile.
+      #   - libpam0g-dev, what the credential door builds against: Linux has
+      #     no system prompt of its own to borrow, so it asks PAM.
+      # and the GTK stack the window is built on.
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            file \
+            libdbus-1-dev \
+            libpam0g-dev
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7 @ 2026-10-08
         with:
           node-version-file: ui-desktop/.nvmrc
           cache: npm
           cache-dependency-path: ui-desktop/package-lock.json
-
-      # npm ci, not npm install: it fails outright when package-lock.json and package.json disagree.
-      - name: npm ci
-        run: npm ci
-
-      # vue-tsc --noEmit && vite build
-      - name: typecheck + build
-        run: npm run build
-
-      - name: lint i18n
-        run: npm run lint:i18n
-
-      - name: lint design tokens
-        run: npm run lint:tokens
-
-  desktop-check:
-    name: desktop cargo check (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-          - os: macos-15
-          - os: windows-latest
-
-    defaults:
-      run:
-        working-directory: ui-desktop
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
-
-      # Catch cross-platform compile breakage early: development happens on one machine, so anything inside
-      # #[cfg(target_os = "linux"/"macos"/"windows")] is never compiled locally (the `?` on bool / PathBuf
-      # not in scope bug in platform.rs slipped out exactly that way). Architecture variants do not change
-      # which cfg branch runs, so one amd64 runner per OS covers every cfg branch.
-      - name: Install Linux dependencies
-        if: matrix.os == 'ubuntu-22.04'
-        # Two build-only dependencies of the desktop crate on Linux:
-        #   - libdbus-1-dev, what keyring's persistent backend builds against
-        #     (Secret Service); without it the crate does not compile.
-        #   - libpam0g-dev, what the credential door builds against: Linux has
-        #     no system prompt of its own to borrow, so it asks PAM.
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libxdo-dev \
-            libssl-dev \
-            patchelf \
-            file \
-            libdbus-1-dev \
-            libpam0g-dev
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
-        with:
-          toolchain: 1.98.1
-
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
-        with:
-          cache-on-failure: true
-          workspaces: ui-desktop/src-tauri -> target
-
-      # --all-targets matters: daemonize in src/bin/nexa-service.rs (#[cfg(unix)]) lives only in the bin
-      # target and is not checked without it.
-      - name: cargo check --all-targets
-        shell: bash
-        working-directory: ui-desktop/src-tauri
-        run: cargo check --all-targets
-
-  desktop-rust:
-    name: desktop rust (clippy + tests)
-    runs-on: ubuntu-22.04
-    timeout-minutes: 40
-
-    defaults:
-      run:
-        working-directory: ui-desktop
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
-
-      # The same two as the Linux half of desktop-check: this job runs clippy and
-      # the tests, which compile the whole crate and not just type-check it, so
-      # it needs every build-time dependency the desktop crate has on Linux.
-      - name: Install Linux dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libxdo-dev \
-            libssl-dev \
-            patchelf \
-            file \
-            libdbus-1-dev \
-            libpam0g-dev
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
@@ -546,18 +478,61 @@ jobs:
           workspaces: ui-desktop/src-tauri -> target
 
       # clippy already runs with -D warnings: new code may not paper over a lint with #[allow]; warnings must be zero.
+      # --all-targets matters: daemonize in src/bin/nexa-service.rs (#[cfg(unix)]) lives only in the bin
+      # target and is not checked without it. It also covers what a plain
+      # `cargo check` covered on this runner: clippy type-checks everything
+      # cargo check does, and then some.
       - name: cargo clippy --all-targets
+        if: ${{ !cancelled() }}
         working-directory: ui-desktop/src-tauri
         run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo test --lib
+        if: ${{ !cancelled() }}
         working-directory: ui-desktop/src-tauri
         run: cargo test --lib
 
-  desktop-audit:
-    name: desktop dependency audit
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+      # npm ci, not npm install: it fails outright when package-lock.json and package.json disagree.
+      - name: npm ci
+        if: ${{ !cancelled() }}
+        run: npm ci
+
+      # vue-tsc --noEmit && vite build
+      - name: typecheck + build
+        if: ${{ !cancelled() }}
+        run: npm run build
+
+      - name: lint i18n
+        if: ${{ !cancelled() }}
+        run: npm run lint:i18n
+
+      - name: lint design tokens
+        if: ${{ !cancelled() }}
+        run: npm run lint:tokens
+
+  # The desktop crate on the two runners that are not Linux. Catch
+  # cross-platform compile breakage early: development happens on one
+  # machine, so anything inside #[cfg(target_os = "linux"/"macos"/"windows")]
+  # is never compiled locally (the `?` on bool / PathBuf not in scope bug in
+  # platform.rs slipped out exactly that way). Architecture variants do not
+  # change which cfg branch runs, so one amd64 runner per OS covers every cfg
+  # branch.
+  #
+  # The Linux leg is the `desktop` job above, which compiles the same crate
+  # with clippy and runs its tests.
+  desktop-check:
+    name: desktop cargo check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+          - os: windows-latest
 
     defaults:
       run:
@@ -571,16 +546,62 @@ jobs:
         with:
           toolchain: 1.98.1
 
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2 @ 2026-10-16
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
         with:
-          tool: cargo-audit@0.22.2
+          cache-on-failure: true
+          workspaces: ui-desktop/src-tauri -> target
 
-      # src-tauri has its own Cargo.lock (excluded from the root workspace), so the audit job at the repo
-      # root never sees it.
-      - name: cargo audit
+      - name: cargo check --all-targets
+        shell: bash
         working-directory: ui-desktop/src-tauri
-        run: cargo audit
+        run: cargo check --all-targets
+
+  # The release installs the frontend with `npm ci`, so every platform a
+  # release is built on has to be able to install from the committed lockfile.
+  # The lockfile records each platform's native optional package (@tauri-apps/cli
+  # and the rest) with its integrity hash and its os/cpu constraints, and npm
+  # filters optional dependencies by those constraints at install time — but that
+  # is a claim about npm, and the release is where a claim like this is
+  # expensive to be wrong about.
+  #
+  # This job is the claim, checked: one runner per (os, arch) the desktop
+  # release matrix builds, running the same command the release runs and then
+  # the same probe. It installs nothing and builds nothing, so it is cheap.
+  #
+  # It runs when the manifest or the lockfile changes, which is the only time
+  # the answer can be a different one: a lockfile that installs on every
+  # platform keeps installing on every platform until one of them changes.
+  desktop-npm-ci:
+    name: desktop npm ci (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    needs: changes
+    if: needs.changes.outputs.desktop_lockfile == 'true'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x64
+            runner: ubuntu-22.04
+          - label: linux-arm64
+            runner: ubuntu-22.04-arm
+          - label: macos-x64
+            runner: macos-15-intel
+          - label: macos-arm64
+            runner: macos-14
+          - label: windows-x64
+            runner: windows-latest
+          - label: windows-arm64
+            runner: windows-11-arm
+
+    defaults:
+      run:
+        working-directory: ui-desktop
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7 @ 2026-10-08
         with:
@@ -588,24 +609,42 @@ jobs:
           cache: npm
           cache-dependency-path: ui-desktop/package-lock.json
 
-      - name: npm audit
-        working-directory: ui-desktop
-        # Runtime dependencies only (--omit=dev), and only high/critical fail the build: upgrading a moderate
-        # advisory deep in the build chain costs far more than it is worth; dependabot can follow those slowly.
-        run: npm audit --omit=dev --audit-level=high
+      # The same command the release runs, and the same probe: the Tauri CLI
+      # has to be runnable on this platform afterwards, or the release fails
+      # at build time instead.
+      - name: npm ci
+        run: npm ci --no-audit --no-fund
+
+      - name: the tauri CLI runs
+        shell: bash
+        run: npx tauri --version
+
+      # The tree that was installed has to be the tree the manifest asks
+      # for. `npm ci` installs strictly from the lockfile and refuses to run
+      # at all when the lockfile and the manifest disagree, so what is left
+      # to check is the **result**: a platform whose optional native package
+      # is missing shows up here as an invalid dependency, rather than as a
+      # failure at build time.
+      #
+      # A `git diff` on the lockfile would say nothing: `npm ci` never
+      # writes it.
+      - name: the installed tree satisfies the manifest
+        shell: bash
+        run: npm ls --all
 
   # ------------------------------------------------------------------
   # Android app (migrated from open-nexa/nexa-android).
   # ------------------------------------------------------------------
 
-  android-app:
-    name: android app (unit tests + debug build)
+  # The native half and the Kotlin half of the Android app, in one job: they
+  # need the same SDK, the same JDK and the same checkout, and they are two
+  # halves of one thing — the app that the release ships as an APK.
+  android:
+    name: android (ndk + unit tests + lint)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    defaults:
-      run:
-        working-directory: ui-android
+    timeout-minutes: 45
+    needs: changes
+    if: needs.changes.outputs.android == 'true'
 
     env:
       # compileSdk 37 (Compose 1.12 requires it); note the platform package is
@@ -624,26 +663,52 @@ jobs:
           cache: gradle
 
       - name: Set up Android SDK
-        # Not android-actions/setup-android: it installs "tools" by default, a package that has been pulled
-        # from the SDK repository and fails outright on current images.
+        env:
+          WITH_NDK: 'true'
+        run: .github/scripts/setup-android-sdk.sh
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
+        with:
+          toolchain: 1.98.1
+          targets: aarch64-linux-android x86_64-linux-android
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2 @ 2026-10-16
+        with:
+          # Pinned like the other tools this workflow installs: the NDK
+          # version moves with the release, and an unpinned installer is a
+          # calendar dependency in the middle of a build.
+          tool: cargo-ndk@4.1.2
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
+        with:
+          key: android
+
+      # Both shipped ABIs are type-checked, not just the one that used to be the
+      # only one: a change that compiles for aarch64 and not for x86_64 is a
+      # change that breaks the emulator build at release time.
+      #
+      # The repo .cargo/config.toml hardcodes a Windows NDK linker path; --config
+      # takes precedence over both env vars and the config file.
+      - name: cargo ndk check (jni + local-proxy + tun-proxy)
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
-          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          export ANDROID_SDK_ROOT="$SDK" ANDROID_HOME="$SDK"
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-
-          if [ -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
-            SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
-          else
-            SM=$(ls -1 "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n 1)
-          fi
-          [ -x "${SM:-}" ] || { echo "::error::sdkmanager not found under $SDK/cmdline-tools"; exit 1; }
-
-          yes | "$SM" --licenses > /dev/null 2>&1 || true
-          "$SM" --install "platforms;android-${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS}"
+          NDK_BIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          for PAIR in "arm64-v8a:aarch64-linux-android" "x86_64:x86_64-linux-android"; do
+            ABI="${PAIR%%:*}"
+            TRIPLE="${PAIR##*:}"
+            LINKER="${NDK_BIN}/${TRIPLE}26-clang"
+            cargo ndk --target "${ABI}" --platform 26 check \
+              -p nexapipe-client \
+              --features "jni local-proxy tun-proxy" \
+              --config "target.${TRIPLE}.linker='${LINKER}'"
+          done
 
       - name: Unit tests
+        if: ${{ !cancelled() }}
+        working-directory: ui-android
         run: |
           chmod +x ./gradlew
           ./gradlew --no-daemon --stacktrace testDebugUnitTest
@@ -658,55 +723,17 @@ jobs:
           if-no-files-found: ignore
 
       - name: assembleDebug
+        if: ${{ !cancelled() }}
+        working-directory: ui-android
         run: ./gradlew --no-daemon --stacktrace assembleDebug
 
       - name: Upload debug APK
+        if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 @ 2026-10-07
         with:
           name: android-app-debug-apk
           path: ui-android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
-
-  android-lint:
-    name: android lint
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    defaults:
-      run:
-        working-directory: ui-android
-
-    env:
-      # compileSdk 37 (Compose 1.12 requires it); note the platform package is
-      # named android-37.0 — plain "android-37" no longer exists upstream.
-      ANDROID_PLATFORM: '37.0'
-      BUILD_TOOLS: 37.0.0
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6 @ 2026-10-14
-        with:
-          distribution: temurin
-          java-version: '17'
-          cache: gradle
-
-      - name: Set up Android SDK
-        run: |
-          set -euo pipefail
-          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          export ANDROID_SDK_ROOT="$SDK" ANDROID_HOME="$SDK"
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          if [ -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
-            SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
-          else
-            SM=$(ls -1 "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n 1)
-          fi
-          [ -x "${SM:-}" ] || { echo "::error::sdkmanager not found"; exit 1; }
-          yes | "$SM" --licenses > /dev/null 2>&1 || true
-          "$SM" --install "platforms;android-${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS}"
 
       # Gating, not observing: `app/lint-baseline.xml` records what lint reports
       # today, and `warningsAsErrors` in app/build.gradle.kts is what makes the
@@ -718,7 +745,8 @@ jobs:
       # — and doing that periodically is worth it on its own, because an entry
       # whose check no longer fires is a problem the file claims is still there.
       - name: lintDebug
-        id: lint
+        if: ${{ !cancelled() }}
+        working-directory: ui-android
         run: |
           chmod +x ./gradlew
           ./gradlew --no-daemon --stacktrace lintDebug
@@ -744,9 +772,15 @@ jobs:
     # Pull requests only: this is the check that runs before a tag exists. A
     # push to main is already followed by the tag build that publishes the
     # image, so building twice there only spends runner minutes.
-    if: github.event_name == 'pull_request'
+    #
+    # And only when a Dockerfile changed: the point of this job is to catch a
+    # broken Dockerfile before a release depends on it, and a Dockerfile that
+    # did not change cannot have become broken.
+    if: github.event_name == 'pull_request' && needs.changes.outputs.image == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    needs: changes
+
     strategy:
       fail-fast: false
       matrix:

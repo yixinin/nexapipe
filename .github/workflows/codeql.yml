@@ -15,13 +15,22 @@ name: CodeQL
 # Two jobs, because java-kotlin is the only language here that needs a build:
 #   - analyze: rust / javascript-typescript / actions, all build-mode none.
 #   - analyze-android: java-kotlin with manual build steps (the same Android SDK
-#     setup as the android-app CI job, then :app:compileDebugKotlin).
+#     setup as the android CI job, then :app:compileDebugKotlin).
 # compileDebugKotlin is enough for the extractor and avoids the NDK, the Rust
 # .so build and dexing that assembleDebug would pull in.
+#
+# The three languages of the first job share one runner, one checkout and one
+# init: a language analysis is a few minutes of work that does not need a
+# machine of its own, and three jobs that each start their own is three times
+# the setup for the same result.
 on:
   push:
     branches: [main, master]
   pull_request:
+    # A pull request that touches nothing but Markdown changes no code, so
+    # there is nothing here for it to catch.
+    paths-ignore:
+      - "**/*.md"
   schedule:
     # Weekly, Monday 04:17 UTC — off the hour so it does not queue behind other
     # scheduled workflows.
@@ -36,28 +45,49 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # What the change touches. The Rust, the TypeScript and the workflow files
+  # are one analysis, and Kotlin is another, so the two jobs are gated on
+  # different halves of the tree: a change to the server does not have to
+  # compile the Kotlin sources, and a change to the Kotlin sources does not
+  # have to be analysed as Rust.
+  #
+  # The script behind it is .github/scripts/changed-paths.sh, which the CI
+  # workflow runs as well.
+  changes:
+    name: changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    outputs:
+      codeql: ${{ steps.paths.outputs.codeql }}
+      android: ${{ steps.paths.outputs.android }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
+        with:
+          # The whole history: the diff is taken against the merge base of
+          # the pull request, and a shallow clone does not have it.
+          fetch-depth: 0
+      - id: paths
+        env:
+          # Both are empty on a push, which the script reads as "no base":
+          # everything is in scope, because a push to main is the state of
+          # the world.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: .github/scripts/changed-paths.sh
+
   analyze:
-    name: CodeQL (${{ matrix.language }})
+    name: CodeQL
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    needs: changes
+    if: needs.changes.outputs.codeql == 'true'
 
     permissions:
       security-events: write
       contents: read
       actions: read
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Rust, TypeScript and the workflow files all support build-mode none,
-          # so no toolchain is needed beyond what the runner already has.
-          - language: rust
-            build-mode: none
-          - language: javascript-typescript
-            build-mode: none
-          - language: actions
-            build-mode: none
 
     steps:
       - name: Checkout repository
@@ -65,24 +95,40 @@ jobs:
         with:
           persist-credentials: false
 
+      # Rust, TypeScript and the workflow files all support build-mode none,
+      # so no toolchain is needed beyond what the runner already has.
       - name: Initialize CodeQL
         uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4 @ 2026-10-15
         with:
-          languages: ${{ matrix.language }}
-          build-mode: ${{ matrix.build-mode }}
+          languages: rust,javascript-typescript,actions
+          build-mode: none
           config-file: .github/codeql/codeql-config.yml
           # Drop this line to fall back to the default query suite.
           queries: security-extended
 
-      - name: Perform CodeQL Analysis
+      # One analyze step per language, each under its own category, so that
+      # the alerts of the three languages stay apart in the Security tab.
+      - name: Perform CodeQL Analysis (rust)
         uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4 @ 2026-10-15
         with:
-          category: /language:${{ matrix.language }}
+          category: "/language:rust"
+
+      - name: Perform CodeQL Analysis (javascript-typescript)
+        uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4 @ 2026-10-15
+        with:
+          category: "/language:javascript-typescript"
+
+      - name: Perform CodeQL Analysis (actions)
+        uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4 @ 2026-10-15
+        with:
+          category: "/language:actions"
 
   analyze-android:
     name: CodeQL (java-kotlin)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    needs: changes
+    if: needs.changes.outputs.android == 'true'
 
     permissions:
       security-events: write
@@ -90,7 +136,7 @@ jobs:
       actions: read
 
     env:
-      # Keep in sync with the android-app job in ci.yml.
+      # Keep in sync with the android job in ci.yml.
       ANDROID_PLATFORM: '37.0'
       BUILD_TOOLS: 37.0.0
 
@@ -108,24 +154,7 @@ jobs:
           cache: gradle
 
       - name: Set up Android SDK
-        # Not android-actions/setup-android: it installs "tools" by default, a package that has been pulled
-        # from the SDK repository and fails outright on current images.
-        run: |
-          set -euo pipefail
-          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          export ANDROID_SDK_ROOT="$SDK" ANDROID_HOME="$SDK"
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-
-          if [ -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
-            SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
-          else
-            SM=$(ls -1 "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n 1)
-          fi
-          [ -x "${SM:-}" ] || { echo "::error::sdkmanager not found under $SDK/cmdline-tools"; exit 1; }
-
-          yes | "$SM" --licenses > /dev/null 2>&1 || true
-          "$SM" --install "platforms;android-${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS}"
+        run: .github/scripts/setup-android-sdk.sh
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4 @ 2026-10-15
@@ -147,4 +176,4 @@ jobs:
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4 @ 2026-10-15
         with:
-          category: /language:java-kotlin
+          category: "/language:java-kotlin"

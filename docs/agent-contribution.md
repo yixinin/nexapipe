@@ -140,14 +140,14 @@ a behaviour change, and a test that was not run is not a test that passed.
 
 | What changed | Run locally | CI job that confirms it |
 | --- | --- | --- |
-| `crates/nexapipe/`, `crates/nexapipe-proto/` | `cargo test --workspace`; `cargo clippy --workspace --all-targets --locked -- -D warnings`; `rustfmt --edition 2024 <file>` | `test (ubuntu-latest)`, `test (macos-15)`, `cargo test (windows-latest)`, `clippy`, `rustfmt` |
-| `crates/nexapipe-client/`, feature-gated code | `cargo check -p nexapipe-client --features <features>` for each feature set you touched | `client features (local-proxy)`, `(jni,local-proxy)`, `(tun-proxy)`, `(uniffi)`, `(webpki-roots)` |
-| The TUN proxy or the L4 client | `cargo ndk -t arm64-v8a --platform 26 check -p nexapipe-client --features jni,local-proxy,tun-proxy`; `cargo ndk -t x86_64 --platform 26 check -p nexapipe-client --features jni,local-proxy,tun-proxy`; `cargo test -p nexapipe-client --features tun-proxy` | `android ndk (tun-proxy / jni)` |
-| `ui-android/` | `cd ui-android && ./gradlew :app:testDebugUnitTest :app:compileDebugKotlin` | `android app (unit tests + debug build)`, `android lint` |
-| `ui-desktop/` frontend | `cd ui-desktop && npm ci && npm run build && npm run lint:i18n && npm run lint:tokens` | `desktop frontend (typecheck + build + linters)` |
-| `ui-desktop/src-tauri/` | `cd ui-desktop/src-tauri && cargo clippy --all-targets -- -D warnings && cargo test --lib` | `desktop rust (clippy + tests)`, `desktop cargo check (macos-15 / ubuntu-22.04 / windows-latest)` |
-| `Cargo.toml`, `Cargo.lock`, npm lockfiles | `cargo audit`; `cd ui-desktop/src-tauri && cargo audit`; `cd ui-desktop && npm audit --omit=dev --audit-level=high`; `cargo +<declared MSRV> check --workspace --all-targets --locked` when `rust-version` moves | `dependency audit`, `desktop dependency audit`, `dependency review`, `msrv` |
-| Docs only | No build. Every relative link resolves, the text is English, and the claims match the code | `rustfmt` and `clippy` still run; nothing else changes |
+| `crates/nexapipe/`, `crates/nexapipe-proto/` | `cargo test --workspace`; `cargo clippy --workspace --all-targets --locked -- -D warnings`; `rustfmt --edition 2024 <file>` | `test (ubuntu-latest)`, `test (macos-15)`, `test (windows-latest)`, `lint (rustfmt + clippy)` |
+| `crates/nexapipe-client/`, feature-gated code | `cargo check -p nexapipe-client --features <features>` for each feature set you touched | `client features` |
+| The TUN proxy or the L4 client | `cargo ndk -t arm64-v8a --platform 26 check -p nexapipe-client --features jni,local-proxy,tun-proxy`; `cargo ndk -t x86_64 --platform 26 check -p nexapipe-client --features jni,local-proxy,tun-proxy`; `cargo test -p nexapipe-client --features tun-proxy` | `android (ndk + unit tests + lint)` |
+| `ui-android/` | `cd ui-android && ./gradlew :app:testDebugUnitTest :app:compileDebugKotlin` | `android (ndk + unit tests + lint)` |
+| `ui-desktop/` frontend | `cd ui-desktop && npm ci && npm run build && npm run lint:i18n && npm run lint:tokens` | `desktop (linux: rust + frontend)` |
+| `ui-desktop/src-tauri/` | `cd ui-desktop/src-tauri && cargo clippy --all-targets -- -D warnings && cargo test --lib` | `desktop (linux: rust + frontend)`, `desktop cargo check (macos-15 / windows-latest)` |
+| `Cargo.toml`, `Cargo.lock`, npm lockfiles | `cargo audit`; `cd ui-desktop/src-tauri && cargo audit`; `cd ui-desktop && npm audit --omit=dev --audit-level=high`; `cargo +<declared MSRV> check --workspace --all-targets --locked` when `rust-version` moves | `supply chain (audit, deny, secrets)`, `msrv` |
+| Docs only | No build. Every relative link resolves, the text is English, and the claims match the code | Nothing runs: the workflow does not start for a change that touches nothing but Markdown |
 
 `rustfmt --edition 2024 <path>` on the files you touched, not `cargo fmt --all`:
 the latter rewrites files nobody asked about and buries the change under
@@ -172,6 +172,13 @@ exactly that version.
 
 The job names are the ones `.github/workflows/ci.yml` reports on a pull request.
 Rename a job there and this table is stale.
+
+A job only runs when the change touches what it covers: the `changes` job
+works out which parts of the tree a pull request touches, and the jobs that
+cover a part of the tree are gated on that. A pull request that changes the
+server alone does not run the Android build, and one that changes nothing but
+Markdown runs nothing at all. The table above names the job to look at, not
+the only job that will run.
 
 ### 6. Commit one logical change
 
