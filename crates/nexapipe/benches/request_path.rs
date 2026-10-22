@@ -34,9 +34,12 @@
 //! It is the server's **plaintext listener** path, driven through
 //! `http::proxy_request`. The QUIC tunnel path — the one a real client uses —
 //! reaches the same backend through `http::proxy_to_backend_streaming`, and
-//! shares every one of the per-request costs this bench measures. What it
-//! adds is the transport, and the transport is not what the numbers here are
-//! about.
+//! shares the part of the work this bench is about: the route lookup, the
+//! balancer, the origin and the URI. The two paths build the backend request
+//! through different functions, so the header copying and the body handling
+//! are **not** shared — this bench measures the plaintext one. What the
+//! tunnel adds on top is the transport, and the transport is not what the
+//! numbers here are about.
 //!
 //! See `docs/benchmarks.md` for how to run this and what the numbers mean.
 
@@ -207,7 +210,7 @@ fn table(backend: &str) -> Arc<RoutingTable> {
 /// everything that decided it, and nothing the bench allocated around it.
 async fn one(clients: &BackendClients, routes: &Arc<RoutingTable>) -> (Bytes, usize) {
     // The request is built **before** the counter is read. Building it is the
-    // bench's own work — the URI it formats, the headers it writes — and the
+    // bench's own work -- the URI it formats, the headers it writes -- and the
     // metric is the server's: the lookup, the balancer, the URI the backend is
     // reached at, and the request built from them. Counting the bench's own
     // work would make the number a statement about the bench.
@@ -275,8 +278,8 @@ fn request_path(c: &mut Criterion) {
                 COUNTING.store(true, Ordering::Relaxed);
                 // The count is the **sum of the counted windows**, not the
                 // difference of the counter over the whole loop: the loop
-                // also holds the bench's own work — the request it builds and
-                // the response body it drains — and the metric says those are
+                // also holds the bench's own work -- the request it builds and
+                // the response body it drains -- and the metric says those are
                 // not part of it. Criterion divides by the number of
                 // iterations, so the sum is the per-request figure.
                 let mut count = 0usize;

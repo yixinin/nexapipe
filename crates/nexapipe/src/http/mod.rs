@@ -96,6 +96,14 @@ fn create_http_client_with_tls(
         // stays in the pool until something else notices.
         .http2_keep_alive_interval(std::time::Duration::from_secs(30))
         .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+        // The pool's own idle reaper needs a clock as well. The `timer` above
+        // is the h2 half's -- HTTP/2 carries its own timeouts, and without one
+        // the client panics the first time it negotiates h2. The pool is
+        // separate: without a timer of its own, an idle connection to a
+        // backend that stopped answering is only reaped when something else
+        // notices, and the `pool_idle_timeout` above is enforced lazily, at
+        // the next checkout.
+        .pool_timer(hyper_util::rt::TokioTimer::new())
         // The h2 half needs a clock of its own: an HTTP/2 connection
         // carries its own timeouts — a ping that has to be answered, a
         // stream that has to be reset — and without a timer the client
@@ -312,6 +320,14 @@ fn create_h2c_client_with_tls(
         .pool_idle_timeout(Some(std::time::Duration::from_secs(120)))
         .http2_keep_alive_interval(std::time::Duration::from_secs(30))
         .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+        // The pool's own idle reaper needs a clock as well. The `timer` above
+        // is the h2 half's -- HTTP/2 carries its own timeouts, and without one
+        // the client panics the first time it negotiates h2. The pool is
+        // separate: without a timer of its own, an idle connection to a
+        // backend that stopped answering is only reaped when something else
+        // notices, and the `pool_idle_timeout` above is enforced lazily, at
+        // the next checkout.
+        .pool_timer(hyper_util::rt::TokioTimer::new())
         // The clock the h2 half needs, for the same reason the other client
         // has one: an h2 connection times things on its own.
         .timer(hyper_util::rt::TokioTimer::new())
@@ -712,7 +728,7 @@ where
                     failure.error,
                 );
 
-                tried.push(backend_info.url.clone());
+                tried.push(backend_info.url.to_string());
                 match config.get_backend_excluding(&host, &path, &tried).await {
                     BackendLookup::Found(info) => backend_info = info,
                     // Nobody else to ask. The failure is the answer: the pool
@@ -770,6 +786,19 @@ where
     }
 }
 
+/// A message with its first letter capitalised.
+///
+/// The reasons the backend's address can fail with are written in the lower
+/// case, because the tunnel path says them in the lower case. This path says
+/// them with a capital, and the two are the same reason in two wordings.
+fn capitalised(message: &str) -> String {
+    let mut chars = message.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
 /// One attempt at one backend: the answer, or the reason there was none.
 ///
 /// Split out of [`proxy_request`] so that the retry loop above it is about
@@ -793,21 +822,27 @@ async fn attempt_backend(
 
     let rewritten_path = backend_info.rewritten_path(path);
 
-    let backend_url = url::Url::parse(&backend_info.url)
-        .map_err(|e| anyhow::anyhow!("Invalid backend URL: {}", e))?;
+    // The origin was parsed when the pool was built, so this is a borrow of
+    // it rather than a `Url::parse` per request.
+    //
+    // The reason is capitalised for this path: it said "Invalid backend URL"
+    // here and "invalid backend URL" on the tunnel path, and the operator
+    // reads both.
+    let origin: &str = match &backend_info.origin {
+        Ok(origin) => origin,
+        Err(reason) => return Err(anyhow::anyhow!("{}", capitalised(reason)).into()),
+    };
 
-    let backend_scheme = backend_url.scheme();
-    let backend_host = backend_url
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("Backend URL missing host"))?;
-    let backend_port = backend_url.port_or_known_default().unwrap_or(80);
+    // The host and the port on their own, which is how this path named the
+    // backend that did not answer.
+    let host_and_port = match origin.split_once("://") {
+        Some((_, rest)) => rest,
+        None => origin,
+    };
 
-    let new_uri = format!(
-        "{}://{}:{}{}",
-        backend_scheme, backend_host, backend_port, rewritten_path
-    )
-    .parse::<http::Uri>()
-    .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
+    let new_uri = format!("{origin}{rewritten_path}")
+        .parse::<http::Uri>()
+        .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
 
     let mut builder = Request::builder().method(method.clone()).uri(new_uri);
 
@@ -824,12 +859,9 @@ async fn attempt_backend(
     let proxied_req = builder.body(Full::new(body.clone()))?;
 
     tracing::debug!(
-        "Proxying request: {} {} -> {}://{}:{}",
+        "Proxying request: {} {} -> {origin}",
         proxied_req.method(),
         proxied_req.uri(),
-        backend_scheme,
-        backend_host,
-        backend_port
     );
 
     match tokio::time::timeout(response_deadline, client.request(proxied_req)).await {
@@ -851,7 +883,7 @@ async fn attempt_backend(
         }),
         Err(_) => Err(ProxyFailure {
             error: anyhow::anyhow!(
-                "backend {backend_host}:{backend_port} did not respond within {response_deadline:?}"
+                "backend {host_and_port} did not respond within {response_deadline:?}"
             ),
             partial: None,
             // The request was carried: the deadline expired after it went out.
@@ -1354,14 +1386,12 @@ fn build_backend_request(
     backend_info: &BackendInfo,
     body: &RequestBody,
 ) -> Result<Request<Full<bytes::Bytes>>, anyhow::Error> {
-    let url = url::Url::parse(&backend_info.url)
-        .map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
-
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("backend URL missing host"))?
-        .to_string();
-    let port = url.port_or_known_default().unwrap_or(80);
+    // The origin was parsed when the pool was built, so this is a borrow of
+    // it rather than a `Url::parse` per request.
+    let origin: &str = match &backend_info.origin {
+        Ok(origin) => origin,
+        Err(reason) => return Err(anyhow::anyhow!("{}", reason)),
+    };
 
     let path = req
         .uri()
@@ -1371,7 +1401,7 @@ fn build_backend_request(
 
     let rewritten_path = backend_info.rewritten_path(path);
 
-    let new_uri = format!("{}://{}:{}{}", url.scheme(), host, port, rewritten_path)
+    let new_uri = format!("{origin}{rewritten_path}")
         .parse::<http::Uri>()
         .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
 
@@ -1501,11 +1531,15 @@ pub async fn proxy_to_backend_streaming(
     let has_content_length = parts.headers.get("content-length").is_some();
 
     for (name, value) in parts.headers.iter() {
-        let name_lower = name.as_str().to_lowercase();
+        // The name is **already** lower case: HTTP header names are
+        // case-insensitive and the parser folds them, so this is a borrow and
+        // not a copy. It used to be a `to_lowercase` per header, which is an
+        // allocation for every header of every response.
+        let name_lower = name.as_str();
         // A header that belongs to the hop between the backend and this
         // process does not belong on the hop between this process and the
         // client.
-        if !forwards_response_header(&name_lower) {
+        if !forwards_response_header(name_lower) {
             continue;
         }
         // Dropped, not duplicated: the id we write below is the one our own
@@ -2057,6 +2091,31 @@ pub fn parse_http_request_legacy(buf: &[u8]) -> Result<Request<()>, anyhow::Erro
 mod tests {
     use super::*;
     use crate::deadline::Deadlines;
+
+    /// A reason is capitalised for the path that said it that way.
+    ///
+    /// The backend's address can fail in two ways, and the two paths that
+    /// report it word it differently: the plaintext path says "Invalid
+    /// backend URL" and the tunnel path says "invalid backend URL". Both are
+    /// the same reason, and the operator reads both.
+    #[test]
+    fn a_reason_keeps_the_wording_of_the_path_that_says_it() {
+        assert_eq!(
+            capitalised("invalid backend URL: relative URL without a base"),
+            "Invalid backend URL: relative URL without a base"
+        );
+        assert_eq!(
+            capitalised("backend URL missing host"),
+            "Backend URL missing host"
+        );
+        // A message that is already capitalised is left alone.
+        assert_eq!(
+            capitalised("Backend URL missing host"),
+            "Backend URL missing host"
+        );
+        // And an empty one stays empty rather than panicking.
+        assert_eq!(capitalised(""), "");
+    }
 
     /// A request that names more than one host is refused.
     ///

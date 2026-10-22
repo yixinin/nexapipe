@@ -764,6 +764,17 @@ impl IrohConnectionPool {
     /// every connection in flight over a rotation that changes nothing about
     /// who they are.
     pub async fn set_two_factor(&self, auth: Option<TwoFactorAuth>) {
+        self.set_credential(auth).await;
+    }
+
+    /// Writes the pool's credential, and closes the connections of the
+    /// identity that is gone.
+    ///
+    /// Every write of the credential goes through here. A path that wrote it
+    /// directly — the enrollment writes one of its own — would change the
+    /// identity without the comparison, and the connections of the old
+    /// identity would stay in the pool.
+    async fn set_credential(&self, auth: Option<TwoFactorAuth>) {
         let mut slot = self.inner.two_factor.lock().await;
         let changed = identity_changed(slot.as_ref(), auth.as_ref());
         *slot = auth;
@@ -913,7 +924,11 @@ impl IrohConnectionPool {
                         "Enrollment succeeded for client '{}'; the token is spent",
                         issued.client_id()
                     );
-                    *self.inner.two_factor.lock().await = Some(issued.clone());
+                    // The credential changes here, so it goes through the one
+                    // place that writes it: the identity comparison and the
+                    // drop of the connections of the identity that is gone
+                    // have to happen with it.
+                    self.set_credential(Some(issued.clone())).await;
                     *self.inner.enrollment.lock().await = None;
                     *self.inner.issued.lock().await = Some(issued);
                 }
@@ -1653,11 +1668,13 @@ mod tests {
         LinkKind, LinkStatus, MAX_FLOWS_PER_CONNECTION, encode_link_status, identity_changed,
         is_idle_since, is_measured_rtt, may_publish,
     };
-    use crate::auth::{TotpAlgorithm, TwoFactorAuth};
+    use crate::auth::{Enrollment, TotpAlgorithm, TwoFactorAuth};
     #[cfg(feature = "local-proxy")]
     use crate::endpoint_group::EndpointGroup;
     use iroh::Endpoint;
     use iroh::endpoint::presets;
+    use nexapipe_proto::auth::{Algorithm, AuthMessage, Format};
+    use nexapipe_proto::secret::SecretString;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1734,6 +1751,173 @@ mod tests {
         let pool = IrohConnectionPool::new_with_endpoint(client, server_addr);
 
         (pool, accepted)
+    }
+
+    /// A backend that answers the authentication handshake, and issues a
+    /// credential of its own.
+    ///
+    /// A connection is authenticated when it is made, so a test that wants a
+    /// connection of a given identity needs a server that answers the
+    /// handshake. This one checks nothing: it issues a challenge and says the
+    /// credential is good. The credential it enrolls is one of another
+    /// client, so an enrollment changes the identity of the pool.
+    async fn auth_backend() -> Endpoint {
+        let ep = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_NEXAPIPE.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("the far side binds");
+        let server = ep.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = server.accept().await {
+                tokio::spawn(async move {
+                    let Ok(accepting) = incoming.accept() else {
+                        return;
+                    };
+                    let Ok(conn) = accepting.await else {
+                        return;
+                    };
+                    // One stream at a time: the enrollment and the handshake
+                    // that follows it share one stream.
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        while let Some((message, format)) = read_auth_message(&mut recv).await {
+                            match message {
+                                AuthMessage::EnrollStart { client_id, .. } => {
+                                    let issue = AuthMessage::EnrollIssue {
+                                        client_id,
+                                        secret: SecretString::new(
+                                            "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string(),
+                                        ),
+                                        algorithm: Algorithm::Sha1,
+                                        digits: 6,
+                                        period: 30,
+                                        device_id: None,
+                                    };
+                                    write_auth_message(&mut send, &issue, format).await;
+                                }
+                                AuthMessage::Start { .. } => {
+                                    let challenge = AuthMessage::Challenge {
+                                        nonce: vec![1, 2, 3, 4],
+                                    };
+                                    write_auth_message(&mut send, &challenge, format).await;
+                                }
+                                AuthMessage::Response { .. } => {
+                                    write_auth_message(&mut send, &AuthMessage::Ok, format).await;
+                                    break;
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        ep
+    }
+
+    /// Reads one length-prefixed authentication message.
+    async fn read_auth_message(
+        recv: &mut iroh::endpoint::RecvStream,
+    ) -> Option<(AuthMessage, Format)> {
+        let mut len = [0u8; 4];
+        recv.read_exact(&mut len).await.ok()?;
+        let mut buf = vec![0u8; u32::from_le_bytes(len) as usize];
+        recv.read_exact(&mut buf).await.ok()?;
+        AuthMessage::from_payload(&buf).ok()
+    }
+
+    /// Writes one length-prefixed authentication message.
+    async fn write_auth_message(
+        send: &mut iroh::endpoint::SendStream,
+        message: &AuthMessage,
+        format: Format,
+    ) {
+        let bytes = message.to_payload(format).expect("the message serializes");
+        send.write_all(&(bytes.len() as u32).to_le_bytes())
+            .await
+            .expect("the message is written");
+        send.write_all(&bytes)
+            .await
+            .expect("the message is written");
+    }
+
+    /// A pool over a backend that answers the authentication handshake.
+    async fn auth_pool_harness() -> IrohConnectionPool {
+        let server = auth_backend().await;
+        let client = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_NEXAPIPE.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("this side binds");
+        IrohConnectionPool::new_with_endpoint(client, server.addr())
+    }
+
+    /// Waits for a connection to be closed, and says whether it was.
+    async fn wait_for_close(conn: &iroh::endpoint::Connection) -> bool {
+        for _ in 0..50 {
+            if conn.close_reason().is_some() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    /// The credential an enrollment buys goes through the same check.
+    ///
+    /// The enrollment writes the pool's credential itself, and a write that
+    /// skipped the check would change the identity without the pool hearing
+    /// about it: the connections of the old identity would carry on as if
+    /// nothing had happened.
+    #[tokio::test]
+    async fn an_enrollment_of_another_identity_closes_the_old_connections() {
+        let pool = auth_pool_harness().await;
+        pool.set_two_factor(Some(credential(
+            "client-001",
+            "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+            None,
+        )))
+        .await;
+
+        // A connection of client-001.
+        let conn = pool.get_connection().await.expect("the connection is made");
+
+        // The enrollment is only spent on a **new** connection, and the pool
+        // hands out the one it has as long as it has room on it. Filling the
+        // connection is what makes the next request dial — and the connection
+        // it dials is the one that spends the token.
+        {
+            let connections = pool.inner.connections.lock().await;
+            for pooled in connections.iter() {
+                pooled
+                    .state
+                    .borrows
+                    .store(MAX_FLOWS_PER_CONNECTION, Ordering::Release);
+            }
+        }
+
+        // The next dial spends the enrollment token, and the credential it
+        // buys belongs to another client.
+        pool.set_enrollment(Some(Enrollment::new("client-002", "enrollment-token")))
+            .await;
+        let next = pool
+            .get_connection()
+            .await
+            .expect("the enrollment connection is made");
+
+        assert_ne!(
+            next.conn.stable_id(),
+            conn.conn.stable_id(),
+            "the enrollment opened a connection of its own"
+        );
+        assert!(
+            wait_for_close(&conn.conn).await,
+            "the connection of the identity that is gone was not told the identity changed"
+        );
     }
 
     /// The two ends of a tunnel, and the count the far side keeps.
