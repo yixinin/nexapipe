@@ -110,6 +110,14 @@ required-features = ["local-proxy"]
 name = "domain_match"
 harness = false
 
+# How many QUIC connections a hundred concurrent flows open. The number is a
+# property of the flow model rather than of the network, and it is what says
+# whether the client is paying for a handshake per flow.
+[[bench]]
+name = "flow_connections"
+harness = false
+required-features = ["local-proxy"]
+
 # What one TCP flow costs in the TUN stack. It is an example rather than a
 # benchmark because what it measures is memory, not time: see the file itself.
 [[example]]

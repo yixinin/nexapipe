@@ -10,7 +10,7 @@
 //! EXPECTED_RTT        = 100 ms
 //! MAX_STREAM_BANDWIDTH= 12.5 MB/s
 //! stream_receive_window = 12.5 MB/s * 100 ms = 1.25 MB
-//! receive_window        = VarInt::MAX      (effectively unlimited)
+//! receive_window        = VarInt::MAX      (effectively unlimited -- raised here)
 //! send_window           = 8 * 1.25 MB      = 10 MB
 //! initial_mtu/min_mtu   = 1200
 //! congestion controller = Cubic
@@ -24,8 +24,23 @@
 //! ```
 //!
 //! That is the dominant transport-level bottleneck, and it is the one this module raises.
-//! `receive_window` is already `VarInt::MAX` and `send_window` is already 10 MB, so neither
-//! is worth touching beyond a modest bump.
+//! `send_window` is already 10 MB, so it is not worth touching beyond a modest bump.
+//!
+//! `receive_window` is the other end of the same question, and it was **not**
+//! raised: it was `VarInt::MAX`, which is no limit at all. The per-stream
+//! window is what a peer may have in flight *per stream*, and a peer with a
+//! thousand streams could have a thousand windows' worth of data in this
+//! process — 4 GiB, from one peer on one connection. This module gives the
+//! connection a ceiling of its own, which bounds what one connection's peer
+//! can make this process hold. The two are different limits and both are
+//! needed: the per-stream one is a throughput ceiling, the connection one is
+//! a memory ceiling.
+//!
+//! The connection ceiling is per **connection**. A process that holds several
+//! connections to the same peer holds one window for each of them, so the
+//! memory a peer can make the process hold is the window times the number of
+//! connections to it — the bound is not a per-peer one, and it does not
+//! pretend to be.
 //!
 //! # Deliberately left alone
 //!
@@ -44,6 +59,7 @@
 //! |-----------------------------------|---------|----------------------------------------|
 //! | `NEXAPIPE_QUIC_STREAM_WINDOW`     | 4194304 | per-stream receive window, bytes       |
 //! | `NEXAPIPE_QUIC_SEND_WINDOW`       | 16777216| connection send window, bytes          |
+//! | `NEXAPIPE_QUIC_RECV_WINDOW`       | 67108864| connection receive window, bytes        |
 //! | `NEXAPIPE_QUIC_MAX_BIDI_STREAMS`  | 1024    | concurrent bi-streams a peer may open  |
 //! | `NEXAPIPE_QUIC_INITIAL_MTU`       | 0       | 0 = keep iroh's 1200; else 1200..=65535|
 //! | `NEXAPIPE_QUIC_KEEPALIVE_MS`      | 0       | 0 = keep iroh's 5s                     |
@@ -65,6 +81,27 @@ pub const DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 4 * 1024 * 1024;
 /// 4 MiB streams plus headroom for the control streams without letting one stream
 /// monopolise the connection buffer.
 pub const DEFAULT_SEND_WINDOW: u64 = 16 * 1024 * 1024;
+
+/// Connection-wide **receive** window: how much a peer may have in flight towards
+/// this process, across all of its streams.
+///
+/// **iroh leaves this at `VarInt::MAX`,** so without a number here the
+/// connection-level flow control imposes no ceiling at all — the only limit is
+/// the per-stream one. That is 1024 streams of 4 MiB each, which is 4 GiB a
+/// peer may fill on one connection.
+///
+/// 64 MiB is generous enough not to be a limit in practice: it is sixteen
+/// full windows, and at a 200 ms round trip it carries 320 MB/s — more than
+/// any link this runs over. What it buys is a **ceiling**: the memory one
+/// connection's peer can make this process hold is bounded to it, and a peer
+/// that opens streams and sends into them without reading cannot make it
+/// grow without limit. The bound is per connection: a process that holds
+/// several connections to the same peer holds one window for each.
+///
+/// The window is not the same as the memory: quinn allocates as data arrives,
+/// so the 64 MiB is address space and only what a peer actually sends is
+/// resident.
+pub const DEFAULT_RECEIVE_WINDOW: u64 = 64 * 1024 * 1024;
 
 /// How many bi-streams a peer may have open at once.
 ///
@@ -97,6 +134,7 @@ const FALLBACK_STREAM_RECEIVE_WINDOW: u64 = 1_250_000;
 
 const ENV_STREAM_WINDOW: &str = "NEXAPIPE_QUIC_STREAM_WINDOW";
 const ENV_SEND_WINDOW: &str = "NEXAPIPE_QUIC_SEND_WINDOW";
+const ENV_RECV_WINDOW: &str = "NEXAPIPE_QUIC_RECV_WINDOW";
 const ENV_MAX_BIDI_STREAMS: &str = "NEXAPIPE_QUIC_MAX_BIDI_STREAMS";
 const ENV_INITIAL_MTU: &str = "NEXAPIPE_QUIC_INITIAL_MTU";
 const ENV_KEEPALIVE_MS: &str = "NEXAPIPE_QUIC_KEEPALIVE_MS";
@@ -108,6 +146,9 @@ pub struct TransportTuning {
     pub stream_receive_window: u64,
     /// Connection-wide send window in bytes.
     pub send_window: u64,
+    /// Connection-wide receive window: how much a peer may have in flight
+    /// towards this process, across all of its streams.
+    pub receive_window: u64,
     /// Concurrent bi-streams a peer may open. See [`DEFAULT_MAX_BIDI_STREAMS`].
     pub max_concurrent_bidi_streams: u64,
     /// `None` keeps iroh's initial MTU (1200) and its MTU discovery ramp.
@@ -121,6 +162,7 @@ impl Default for TransportTuning {
         Self {
             stream_receive_window: DEFAULT_STREAM_RECEIVE_WINDOW,
             send_window: DEFAULT_SEND_WINDOW,
+            receive_window: DEFAULT_RECEIVE_WINDOW,
             max_concurrent_bidi_streams: DEFAULT_MAX_BIDI_STREAMS,
             initial_mtu: None,
             keep_alive_interval: None,
@@ -149,6 +191,13 @@ impl TransportTuning {
                 tuning.send_window = v;
             } else {
                 warn_ignored(ENV_SEND_WINDOW, v);
+            }
+        }
+        if let Some(v) = env_u64(ENV_RECV_WINDOW) {
+            if v >= 1024 * 1024 {
+                tuning.receive_window = v;
+            } else {
+                warn_ignored(ENV_RECV_WINDOW, v);
             }
         }
         if let Some(v) = env_u64(ENV_MAX_BIDI_STREAMS) {
@@ -195,6 +244,11 @@ impl TransportTuning {
                 FALLBACK_STREAM_RECEIVE_WINDOW,
             ))
             .send_window(self.send_window)
+            .receive_window(varint(
+                self.receive_window,
+                ENV_RECV_WINDOW,
+                DEFAULT_RECEIVE_WINDOW,
+            ))
             .max_concurrent_bidi_streams(varint(
                 self.max_concurrent_bidi_streams,
                 ENV_MAX_BIDI_STREAMS,
@@ -214,10 +268,11 @@ impl TransportTuning {
     /// One-line summary for the startup log, so the numbers in a benchmark run are auditable.
     pub fn describe(&self) -> String {
         format!(
-            "stream_receive_window={}B send_window={}B max_concurrent_bidi_streams={} \
-             initial_mtu={} keep_alive={}",
+            "stream_receive_window={}B send_window={}B receive_window={}B \
+             max_concurrent_bidi_streams={} initial_mtu={} keep_alive={}",
             self.stream_receive_window,
             self.send_window,
+            self.receive_window,
             self.max_concurrent_bidi_streams,
             self.initial_mtu
                 .map(|m| m.to_string())
@@ -294,6 +349,23 @@ mod tests {
         assert!(tuning.max_concurrent_bidi_streams > 100);
         // Not exposed: multipath / NAT traversal must stay on iroh's values.
         assert_eq!(tuning.initial_mtu, None);
+    }
+
+    /// The connection-level receive window is a **ceiling**, and the default is
+    /// one: iroh leaves it at `VarInt::MAX`, so without this number a peer can
+    /// fill as much of this process as it likes.
+    #[test]
+    fn the_connection_receive_window_has_a_ceiling() {
+        let tuning = TransportTuning::default();
+        assert_eq!(tuning.receive_window, 64 * 1024 * 1024);
+        assert!(tuning.receive_window < VarInt::MAX.into_inner());
+
+        // And it is on the config, not only in the struct.
+        let text = format!("{:?}", tuning.transport_config());
+        assert!(
+            text.contains("receive_window: 67108864"),
+            "the transport config should carry the ceiling: {text}"
+        );
     }
 
     #[test]

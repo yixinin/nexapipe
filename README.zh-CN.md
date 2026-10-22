@@ -1618,6 +1618,7 @@ Cargo feature：
 | --- | --- | --- |
 | `NEXAPIPE_QUIC_STREAM_WINDOW` | `4194304` | 每条流的接收窗口，字节。 |
 | `NEXAPIPE_QUIC_SEND_WINDOW` | `16777216` | 连接级发送窗口，字节。 |
+| `NEXAPIPE_QUIC_RECV_WINDOW` | `67108864` | 连接级接收窗口，字节。 |
 | `NEXAPIPE_QUIC_INITIAL_MTU` | `0` | `0` 表示保持 iroh 的 1200；否则取 1200..=65535。 |
 | `NEXAPIPE_QUIC_KEEPALIVE_MS` | `0` | `0` 表示保持 iroh 的 5 秒。 |
 | `NEXAPIPE_QUIC_MAX_BIDI_STREAMS` | `1024` | 一条连接可同时承载的双向流数。库默认值（100）在每条 UDP 流都占用一条流之后就不够用了。 |

@@ -1,9 +1,20 @@
 ﻿use std::fmt;
+use std::sync::Arc;
 
-#[derive(Debug)]
+/// The errors this crate reports.
+///
+/// **`Clone` is load-bearing.** The connection pool shares one dial between
+/// everything that asked for a connection while it was in progress, and a
+/// shared result has to be clonable — so the one variant that could not be
+/// cloned holds its `io::Error` behind an `Arc`.
+///
+/// That is the only reason the variant is boxed. Nothing else about it
+/// changed, and a caller that matches on it sees the same thing it always
+/// did.
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Error))]
-// `flat_error`: only `Display` crosses the boundary. `IoError(std::io::Error)` is
-// not a uniffi type, so the variants cannot be lowered structurally.
+// `flat_error`: only `Display` crosses the boundary. `IoError(Arc<std::io::Error>)`
+// is not a uniffi type, so the variants cannot be lowered structurally.
 #[cfg_attr(feature = "uniffi", uniffi(flat_error))]
 pub enum ClientError {
     ConnectionError(String),
@@ -14,7 +25,7 @@ pub enum ClientError {
     ReceiveError(String),
     TimeoutError,
     InvalidConfig(String),
-    IoError(std::io::Error),
+    IoError(Arc<std::io::Error>),
     Other(String),
 }
 
@@ -39,7 +50,7 @@ impl std::error::Error for ClientError {}
 
 impl From<std::io::Error> for ClientError {
     fn from(e: std::io::Error) -> Self {
-        ClientError::IoError(e)
+        ClientError::IoError(Arc::new(e))
     }
 }
 

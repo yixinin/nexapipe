@@ -50,7 +50,7 @@ static RUNTIME: OnceCell<Runtime> = OnceCell::new();
 fn runtime() -> Result<&'static Runtime, ClientError> {
     RUNTIME
         .get_or_try_init(Runtime::new)
-        .map_err(ClientError::IoError)
+        .map_err(|e| ClientError::IoError(Arc::new(e)))
 }
 
 /// The 2FA credentials of one server.
@@ -540,7 +540,6 @@ impl ProxyClient {
         let host = request.host().to_string();
         let pooled = self.group.get_connection(&host).await?;
         let result = crate::client::exchange_over(pooled.conn(), &request.to_bytes()).await;
-        self.group.return_connection(&host, pooled).await;
         HttpResponse::parse(&result?)
     }
 
@@ -548,7 +547,6 @@ impl ProxyClient {
     async fn send_raw_inner(&self, host: String, data: Vec<u8>) -> Result<Vec<u8>, ClientError> {
         let pooled = self.group.get_connection(&host).await?;
         let result = crate::client::exchange_over(pooled.conn(), &data).await;
-        self.group.return_connection(&host, pooled).await;
         result
     }
 }

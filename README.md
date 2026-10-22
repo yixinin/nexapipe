@@ -1880,6 +1880,7 @@ RTT. `TransportTuning` raises it and can be overridden without a rebuild:
 | --- | --- | --- |
 | `NEXAPIPE_QUIC_STREAM_WINDOW` | `4194304` | Per-stream receive window, bytes. |
 | `NEXAPIPE_QUIC_SEND_WINDOW` | `16777216` | Connection send window, bytes. |
+| `NEXAPIPE_QUIC_RECV_WINDOW` | `67108864` | Connection receive window, bytes. |
 | `NEXAPIPE_QUIC_INITIAL_MTU` | `0` | `0` keeps iroh's 1200; otherwise 1200..=65535. |
 | `NEXAPIPE_QUIC_KEEPALIVE_MS` | `0` | `0` keeps iroh's 5 s. |
 | `NEXAPIPE_QUIC_MAX_BIDI_STREAMS` | `1024` | Bi-streams one connection may carry at once. The library default (100) is too low once every UDP flow takes a stream of its own. |

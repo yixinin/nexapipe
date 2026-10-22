@@ -1348,6 +1348,11 @@ async fn handshake_in(
         panic!("the server answers with a challenge, got {challenge:?}");
     };
 
+    // The nonce is the server's random challenge, read off the wire — not a
+    // value this file makes up. The code-scanning query reads the buffer it
+    // arrived in as a hard-coded one, and the challenge is then "a nonce" that
+    // is hard-coded.
+    // codeql[rust/hard-coded-cryptographic-value]
     let signature = client
         .sign_challenge(&nonce, timestamp)
         .expect("the challenge is signed");
@@ -1387,9 +1392,11 @@ async fn read_message_in(recv: &mut RecvStream) -> (AuthMessage, Format) {
     let mut len = [0u8; 4];
     recv.read_exact(&mut len).await.expect("the length comes");
     let len = u32::from_le_bytes(len) as usize;
-    // Read into an empty buffer rather than a zero-filled one: the bytes come
-    // from the peer, and a pre-filled buffer is indistinguishable from a
-    // hard-coded message when the challenge nonce is traced through it.
+    // Read into an empty buffer rather than a zero-filled one. The bytes come
+    // from the peer, and a buffer of constant bytes is what the code-scanning
+    // query reads as a hard-coded cryptographic value — the challenge nonce
+    // ends up looking like one, because the query cannot see that
+    // `read_exact` overwrites every byte of it.
     let mut buf = Vec::new();
     let mut limited = recv.take(len as u64);
     limited
@@ -1631,6 +1638,32 @@ async fn a_client_that_announces_a_version_is_answered_in_it() {
     );
 }
 
+/// The real client, the real server, and the versioned protocol.
+///
+/// The other tests in this file hand-roll the handshake; this one is the
+/// client's own — the same code the Android app and the desktop app call —
+/// against a server that knows the binary form. The client announces the
+/// version it speaks, the server answers in it, and the handshake completes.
+///
+/// The three links of that chain are pinned by three tests: this one says the
+/// client's own path completes against a real server, the client's unit test
+/// says the first message announces the version, and the server's own test
+/// says a server answers an announced message in the version that was asked
+/// for.
+#[tokio::test]
+async fn the_client_completes_the_handshake_against_a_server_that_knows_the_binary_form() {
+    let backend = spawn_backend("hello").await;
+    let (auth, _dir) = auth_state(auth_config());
+    let proxy = spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let client =
+        TwoFactorAuth::new(CLIENT_ID, SECRET, ClientTotpAlgorithm::SHA1).expect("the client");
+    client
+        .authenticate(&tunnel.conn)
+        .await
+        .expect("the handshake completes");
+}
 /// A guess at a pending enrollment token is counted — against the enrollment,
 /// and not against the client.
 ///

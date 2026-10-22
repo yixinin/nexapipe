@@ -1,6 +1,8 @@
 use crate::ClientError;
 use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
-use crate::connection_pool::{IrohConnectionPool, LinkKind, LinkStatus, PRECONNECT_TIMEOUT};
+use crate::connection_pool::{
+    Borrow, IrohConnectionPool, LinkKind, LinkStatus, PRECONNECT_TIMEOUT,
+};
 use crate::flow::{FlowId, FlowMeta, FlowRegistry, FlowView};
 use crate::lb::{LoadBalancer, LoadBalancingStrategy, RandomBalancer, RoundRobinBalancer};
 use crate::traffic::{self, Flow, NodeTraffic, NodeVolume, TrafficTable};
@@ -31,7 +33,12 @@ macro_rules! jni_log {
     };
 }
 
-#[derive(Debug, Clone)]
+/// A connection the group handed out, and the borrow it was handed out under.
+///
+/// Not `Clone`: a copy would be a second handle on the **same** borrow, and
+/// the pool's count of the flows on the connection would then be wrong —
+/// the connection would look busy after the flow that held it was gone.
+#[derive(Debug)]
 pub struct PooledConnection {
     conn: Connection,
     pool_index: usize,
@@ -56,6 +63,15 @@ pub struct PooledConnection {
     /// a node nobody is tracking, and a flow that is counted but not listed is a
     /// list with a hole in it.
     flows: Option<Arc<FlowRegistry>>,
+    /// The borrow this connection is held under.
+    ///
+    /// The pool owns the connection and the flows **borrow** it, so the pool
+    /// cannot tell from the handle alone whether anyone is still on it — and
+    /// it has to: a connection with a flow on it is not idle, and closing it
+    /// would take that flow down with it.
+    ///
+    /// `None` for a connection that was not borrowed from a pool.
+    borrow: Option<Borrow>,
 }
 
 impl PooledConnection {
@@ -66,6 +82,7 @@ impl PooledConnection {
             node: None,
             traffic: None,
             flows: None,
+            borrow: None,
         }
     }
 
@@ -76,6 +93,7 @@ impl PooledConnection {
         node: EndpointId,
         traffic: TrafficTable,
         flows: Arc<FlowRegistry>,
+        borrow: Borrow,
     ) -> Self {
         Self {
             conn,
@@ -83,6 +101,7 @@ impl PooledConnection {
             node: Some(node),
             traffic: Some(traffic::of(&traffic, node)),
             flows: Some(flows),
+            borrow: Some(borrow),
         }
     }
 
@@ -136,10 +155,6 @@ impl PooledConnection {
         self.node
     }
 
-    pub fn into_inner(self) -> Connection {
-        self.conn
-    }
-
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
@@ -162,6 +177,17 @@ impl PooledConnection {
     /// [`EndpointGroup::record_request_failures`].
     pub fn discard(self, reason: &'static [u8]) {
         self.conn.close(0u32.into(), reason);
+    }
+
+    /// Marks the connection as carrying as many flows as the server allows.
+    ///
+    /// The server refused a flow with `TooManyFlows`, which says something
+    /// about the connection rather than about the flow: the pool must stop
+    /// handing this connection out, or the next flow is refused the same way.
+    pub fn saturate(&self) {
+        if let Some(borrow) = &self.borrow {
+            borrow.saturate();
+        }
     }
 
     pub fn pool_index(&self) -> usize {
@@ -357,30 +383,19 @@ impl DomainPools {
         // about nobody's backend. Calling it "down" would paint the whole node
         // list unreachable each time a tunnel stops.
         match pool.get_connection().await {
-            Ok(conn) => Ok(PooledConnection::tracked(
-                conn,
+            Ok(borrowed) => Ok(PooledConnection::tracked(
+                borrowed.conn,
                 index,
                 backend_id,
                 self.traffic.clone(),
                 self.flows.clone(),
+                borrowed.borrow,
             )),
             Err(e @ ClientError::InvalidConfig(_)) => Err(e),
             Err(e) => {
                 record_outcome(&self.health, backend_id, false);
                 Err(e)
             }
-        }
-    }
-
-    pub async fn return_connection(&self, pooled_conn: PooledConnection) {
-        if self.pools.is_empty() {
-            return;
-        }
-        let index = pooled_conn.pool_index();
-        if index < self.pools.len() {
-            self.pools[index]
-                .return_connection(pooled_conn.into_inner())
-                .await;
         }
     }
 
@@ -999,19 +1014,6 @@ impl EndpointGroup {
             "No endpoint configured for domain: {}",
             domain
         )))
-    }
-
-    pub async fn return_connection(&self, domain: &str, pooled_conn: PooledConnection) {
-        // The same lookup the connection came from, or the connection would be
-        // handed back to a pool it was never taken out of.
-        if let Some(pools) = self.pools_for(domain) {
-            pools.return_connection(pooled_conn).await;
-            return;
-        }
-
-        if let Some(default) = &self.default_pools {
-            default.return_connection(pooled_conn).await;
-        }
     }
 
     /// Test iroh-level connectivity to each unique backend node, in parallel.

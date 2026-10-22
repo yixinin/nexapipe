@@ -270,10 +270,10 @@ pub struct LocalProxy {
     stop_notify: Arc<Notify>,
     /// The per-connection tasks, so stopping the proxy ends them.
     ///
-    /// A handler holds a pooled connection for as long as its peer keeps the
-    /// socket open, which is not this process's decision: without this a
-    /// "stopped" proxy would still be holding connections out of the pool, and
-    /// a `close_all` could not return them.
+    /// A handler holds a **borrow** on a pooled connection for as long as its
+    /// peer keeps the socket open, which is not this process's decision:
+    /// without this a "stopped" proxy would still be holding borrows, and
+    /// the connections they ride would stay open.
     connections: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
     /// How many of [`MAX_CONCURRENT_CONNECTIONS`] are still free.
     ///
@@ -688,6 +688,26 @@ pub(crate) async fn open_stream_with_retry(
     host: &str,
     initial_data: Option<&[u8]>,
 ) -> Result<(PooledConnection, SendStream, RecvStream), ClientError> {
+    open_stream_with_retry_until(
+        endpoint_group,
+        host,
+        initial_data,
+        tokio::time::Instant::now() + STREAM_OPERATION_TIMEOUT * OPEN_ATTEMPTS as u32,
+    )
+    .await
+}
+
+/// [`open_stream_with_retry`], with the caller's deadline.
+///
+/// **One budget for every attempt.** Each attempt used to have a timeout of
+/// its own, and there are three of them, so opening a stream could take a
+/// minute and a half — and the caller had three of those as well.
+pub(crate) async fn open_stream_with_retry_until(
+    endpoint_group: &Arc<EndpointGroup>,
+    host: &str,
+    initial_data: Option<&[u8]>,
+    deadline: tokio::time::Instant,
+) -> Result<(PooledConnection, SendStream, RecvStream), ClientError> {
     let mut last_err: Option<ClientError> = None;
     // Whose health each attempt is spent on, kept so that running out of
     // attempts can name the backend that ran out. Recording the failure as it
@@ -696,6 +716,15 @@ pub(crate) async fn open_stream_with_retry(
     let mut tried: Vec<EndpointId> = Vec::new();
 
     for _attempt in 1..=OPEN_ATTEMPTS {
+        // The budget is gone: another attempt would time out at once, and the
+        // backend it would be spent on is not the one that ran out of time.
+        // Stopping here keeps the health accounting honest — a backend that
+        // was never dialled must not be recorded as having failed.
+        if tokio::time::Instant::now() >= deadline {
+            last_err = Some(ClientError::TimeoutError);
+            break;
+        }
+
         let pooled_conn = match endpoint_group.get_connection(host).await {
             Ok(conn) => conn,
             Err(e) => {
@@ -712,9 +741,7 @@ pub(crate) async fn open_stream_with_retry(
         let tried_node = pooled_conn.node();
         let conn = pooled_conn.conn().clone();
 
-        let (mut send, recv) = match tokio::time::timeout(STREAM_OPERATION_TIMEOUT, conn.open_bi())
-            .await
-        {
+        let (mut send, recv) = match tokio::time::timeout_at(deadline, conn.open_bi()).await {
             Ok(Ok(streams)) => streams,
             Ok(Err(e)) => {
                 jni_log!(
@@ -1067,7 +1094,6 @@ where
         client_task.abort();
         backend_task.abort();
 
-        endpoint_group.return_connection(&host, pooled_conn).await;
         return Ok(());
     }
 
@@ -1322,7 +1348,6 @@ where
                     close_reason
                 );
 
-                endpoint_group.return_connection(&host, pooled_conn).await;
                 return Ok(());
             }
         }
@@ -1487,7 +1512,6 @@ where
     // so a keep-alive client socket can't pin this task.
     client_task.abort();
 
-    endpoint_group.return_connection(&host, pooled_conn).await;
     jni_log!("[DEBUG:local-proxy] Connection closed");
     Ok(())
 }
@@ -1649,7 +1673,6 @@ where
         _ = flow.cancelled() => (),
     }
 
-    endpoint_group.return_connection(&sni, pooled_conn).await;
     jni_log!("[DEBUG:local-proxy] TLS tunnel closed");
     Ok(())
 }

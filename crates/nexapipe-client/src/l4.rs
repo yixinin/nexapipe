@@ -26,26 +26,32 @@
 
 use crate::ClientError;
 use crate::endpoint_group::{EndpointGroup, PooledConnection};
-use crate::local_proxy::open_stream_with_retry;
+use crate::local_proxy::open_stream_with_retry_until;
 use iroh::EndpointId;
 use iroh::endpoint::{RecvStream, SendStream};
 use std::sync::Arc;
-use std::time::Duration;
 
 pub use nexapipe_proto::{L4Proto, Preface, Status};
 
-/// How long the server may take to answer the preface.
+/// How long opening a flow may take, however many attempts it takes.
 ///
-/// Generous on purpose: the server has to resolve and dial the backend before it can
-/// answer, and a cold database connection is slow.
-const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
+/// **One budget, not one per attempt.** The attempts used to have a timeout
+/// each, and there were nine of them — three outer, three inner, and one for
+/// reading the answer — so a flow that could not be opened could take six
+/// minutes to say so.
+///
+/// Ninety seconds is what the three outer attempts were each allowed, so this
+/// is the same budget the attempts were reaching for, spent once.
+const FLOW_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Open a TCP flow to `host:port`.
 ///
-/// Returns the pooled connection together with the stream. The caller owns the pooled
-/// connection for the life of the tunnel and must hand it back with
-/// [`EndpointGroup::return_connection`] — unlike the HTTP paths, an L4 flow can last
-/// minutes, so it cannot be returned as soon as the first response arrives.
+/// Returns the pooled connection together with the stream. The caller holds
+/// the **borrow** on the connection for the life of the tunnel, and gives it
+/// back by dropping the returned value — unlike the HTTP paths, an L4 flow
+/// can last minutes, so it cannot be given back as soon as the first
+/// response arrives. The pool keeps the connection either way: the flow
+/// borrowed it.
 pub async fn open_tcp(
     endpoint_group: &Arc<EndpointGroup>,
     host: &str,
@@ -84,7 +90,14 @@ pub async fn handshake(
 
     send.write_all(&preface).await?;
 
-    let status = read_status(recv, proto, host, port).await?;
+    let status = read_status_until(
+        recv,
+        proto,
+        host,
+        port,
+        tokio::time::Instant::now() + FLOW_OPEN_TIMEOUT,
+    )
+    .await?;
     if status.is_ok() {
         Ok(())
     } else {
@@ -103,6 +116,11 @@ async fn open(
     })?;
 
     let mut last_err: Option<ClientError> = None;
+    // **One budget for the whole flow.** The outer attempts and the inner
+    // ones shared nothing: each of the nine dials had a timeout of its own,
+    // and the answer had another, so a flow that could not be opened could
+    // take six minutes to say so.
+    let deadline = tokio::time::Instant::now() + FLOW_OPEN_TIMEOUT;
     // Whose health each attempt is spent on: see `open_stream_with_retry`, which
     // keeps the same list for the failures it discards on its own. Both lists
     // are writable only once every attempt has failed, so neither can condemn a
@@ -115,27 +133,42 @@ async fn open(
     for _attempt in 1..=crate::local_proxy::OPEN_ATTEMPTS {
         // `send` stays untouched: the caller writes the payload once the server has
         // accepted the flow, so nothing is pipelined behind the preface.
-        let (pooled, send, mut recv) =
-            match open_stream_with_retry(endpoint_group, host, Some(&preface)).await {
-                Ok(streams) => streams,
-                Err(e) => {
-                    // The helper has already said what it knows about the
-                    // attempts it spent. This reports the earlier ones recorded
-                    // above, which would otherwise leave no trace: `tried` is
-                    // dropped the moment this function returns, and a backend
-                    // that never answered the preface has every later request
-                    // dialling it again first.
-                    endpoint_group.record_request_failures(&tried);
-                    return Err(e);
-                }
-            };
+        let (pooled, send, mut recv) = match open_stream_with_retry_until(
+            endpoint_group,
+            host,
+            Some(&preface),
+            deadline,
+        )
+        .await
+        {
+            Ok(streams) => streams,
+            Err(e) => {
+                // The helper has already said what it knows about the
+                // attempts it spent. This reports the earlier ones recorded
+                // above, which would otherwise leave no trace: `tried` is
+                // dropped the moment this function returns, and a backend
+                // that never answered the preface has every later request
+                // dialling it again first.
+                endpoint_group.record_request_failures(&tried);
+                return Err(e);
+            }
+        };
 
-        match read_status(&mut recv, proto, host, port).await {
+        match read_status_until(&mut recv, proto, host, port, deadline).await {
             Ok(status) if status.is_ok() => return Ok((pooled, send, recv)),
+            Ok(status) if status == Status::TooManyFlows => {
+                // The server is carrying as many flows on this connection as
+                // it allows. That is a statement about the **connection**,
+                // not about this flow, and another connection can carry it:
+                // the connection is marked as full so that the pool stops
+                // handing it out, and the flow is tried again on another
+                // one.
+                pooled.saturate();
+                last_err = Some(status_error(status, proto, host, port));
+            }
             Ok(status) => {
                 // The server understood us and said no. Retrying the same request on a
                 // fresh connection cannot change the answer.
-                endpoint_group.return_connection(host, pooled).await;
                 return Err(status_error(status, proto, host, port));
             }
             Err(e) => {
@@ -166,11 +199,18 @@ async fn open(
 /// `read_exact` is documented as *not* being one, and this call sits inside a timeout. A
 /// timeout that fired after `read_exact` had already consumed the byte would leave the
 /// next attempt reading a payload byte as if it were a status.
-async fn read_status(
+/// Read the single status byte, mapping a missing or late one to a readable
+/// error.
+///
+/// The answer has to come inside the flow's budget: a server that never
+/// answers the preface must not hold the flow open for a timeout of its own.
+/// It used to have one of its own, on top of the attempts'.
+async fn read_status_until(
     recv: &mut RecvStream,
     proto: L4Proto,
     host: &str,
     port: u16,
+    deadline: tokio::time::Instant,
 ) -> Result<Status, ClientError> {
     let mut byte = [0u8; 1];
     let unannounced = |detail: String| {
@@ -180,7 +220,7 @@ async fn read_status(
         ))
     };
 
-    match tokio::time::timeout(STATUS_TIMEOUT, recv.read(&mut byte)).await {
+    match tokio::time::timeout_at(deadline, recv.read(&mut byte)).await {
         Ok(Ok(Some(1))) => Ok(Status::from_byte(byte[0])),
         // Zero bytes with a one-byte buffer: the peer finished the stream without
         // saying anything about the flow.
@@ -249,7 +289,107 @@ pub fn parse_connect_target(target: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection_pool::IrohConnectionPool;
     use nexapipe_proto::PREFACE_MAGIC;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The ALPN the tunnel speaks. The same bytes the client uses.
+    const ALPN: &[u8] = b"\x05nexapipe";
+
+    /// The far side of the tunnel: answers the first connection's flows with
+    /// "too many flows" and every later connection's flows with "ok".
+    ///
+    /// The count is the far side's own, so the number a test reads does not
+    /// depend on anything the client says about itself.
+    async fn serve_refusing_the_first_connection(
+        endpoint: iroh::Endpoint,
+        accepted: Arc<AtomicUsize>,
+    ) {
+        while let Some(incoming) = endpoint.accept().await {
+            let accepted = accepted.clone();
+            tokio::spawn(async move {
+                let Ok(accepting) = incoming.accept() else {
+                    return;
+                };
+                let Ok(connection) = accepting.await else {
+                    return;
+                };
+                // The first connection is the one that refuses.
+                let status = if accepted.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Status::TooManyFlows
+                } else {
+                    Status::Ok
+                };
+                loop {
+                    let Ok((mut send, mut recv)) = connection.accept_bi().await else {
+                        return;
+                    };
+                    tokio::spawn(async move {
+                        // The preface: its length is known once the fourth
+                        // byte has been read.
+                        let mut header = [0u8; 4];
+                        if recv.read_exact(&mut header).await.is_err() {
+                            return;
+                        }
+                        let mut rest = vec![0u8; usize::from(header[3]) + 2];
+                        if recv.read_exact(&mut rest).await.is_err() {
+                            return;
+                        }
+                        if send.write_all(&[status.as_byte()]).await.is_err() {
+                            return;
+                        }
+                        let mut sink = [0u8; 1];
+                        let _ = recv.read(&mut sink).await;
+                    });
+                }
+            });
+        }
+    }
+
+    /// A flow the server refuses for carrying too many flows is tried on
+    /// another connection.
+    ///
+    /// "Too many flows" says something about the connection, not about the
+    /// flow: the server counts the flows on one connection and refuses the
+    /// one that does not fit. Another connection can carry it, so the flow is
+    /// not lost to a ceiling the client cannot see.
+    #[tokio::test]
+    async fn a_flow_refused_for_too_many_flows_is_tried_on_another_connection() {
+        let server = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("the far side binds");
+        let server_addr = server.addr();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(serve_refusing_the_first_connection(
+            server,
+            accepted.clone(),
+        ));
+
+        let client = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("this side binds");
+        let pool = IrohConnectionPool::new_with_endpoint(client, server_addr);
+        let group = Arc::new(EndpointGroup::new_with_single_pool(pool).await);
+
+        let flow = open_tcp(&group, "db.test", 5432)
+            .await
+            .expect("the flow opens on another connection");
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            2,
+            "the refused flow was tried on a second connection"
+        );
+        drop(flow);
+    }
 
     #[test]
     fn parses_the_authority_form_a_client_sends() {
