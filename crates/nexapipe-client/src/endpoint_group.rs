@@ -8,7 +8,7 @@ use crate::lb::{LoadBalancer, LoadBalancingStrategy, RandomBalancer, RoundRobinB
 use crate::traffic::{self, Flow, NodeTraffic, NodeVolume, TrafficTable};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
-use nexapipe_proto::{host_matches, normalize_host, normalize_pattern};
+use nexapipe_proto::{normalize_host, normalize_pattern};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -408,6 +408,22 @@ impl DomainPools {
 
 pub struct EndpointGroup {
     domains: HashMap<String, Arc<DomainPools>>,
+    /// The domains that serve a name by **pattern**, keyed by the name the
+    /// pattern covers: `*.example.com` is keyed by `example.com`, and the
+    /// catch-all `*` by the empty string.
+    ///
+    /// An index rather than a scan. The lookup used to walk every configured
+    /// domain and ask whether it covered the name, and for a name the
+    /// configuration does not name exactly — which is every name a TUN device
+    /// asks about — that walk happened on every request and every flow.
+    ///
+    /// A pattern covers a name when the name ends with the pattern's suffix
+    /// **at a label boundary**, so the suffixes worth asking about are the
+    /// name's own label-aligned ones: `a.b.example.com`, `b.example.com`,
+    /// `example.com`, `com`. The walk below asks exactly those, and the
+    /// longest one is the longest pattern that covers the name — the same
+    /// answer the scan gave, without the scan.
+    wildcards: HashMap<String, Arc<DomainPools>>,
     default_pools: Option<Arc<DomainPools>>,
     /// What the background probe last found, per backend.
     ///
@@ -449,6 +465,41 @@ pub struct EndpointGroup {
     /// that then ran would dial them all again. That is the state a stopped
     /// tunnel would be left in: idle, and quietly reconnecting.
     probe_stopped: AtomicBool,
+}
+
+/// The wildcard patterns of a set of domains, keyed by the name they cover.
+///
+/// `*.example.com` is keyed by `example.com`, and the catch-all `*` by the
+/// empty string. A pattern that is not a wildcard is left out: the lookup
+/// finds an exactly-named domain in the map itself, and a pattern that is not
+/// a wildcard cannot cover a name that map did not find.
+///
+/// A pattern that matches nothing is left out too — `*.` is the catch-all in
+/// another spelling, and the rule in `nexapipe-proto` refuses it and matches
+/// it with nothing. It must not be given the catch-all's own key, which is
+/// what it would otherwise be indexed under.
+fn wildcards_of(domains: &HashMap<String, Arc<DomainPools>>) -> HashMap<String, Arc<DomainPools>> {
+    let mut wildcards = HashMap::new();
+    for (pattern, pools) in domains {
+        if let Some(suffix) = pattern.strip_prefix("*.") {
+            // A pattern with an **empty** suffix — `*.` — is the catch-all in
+            // another spelling, and the rule in `nexapipe-proto` refuses it
+            // and matches it with nothing: a configuration that was never
+            // meant to be loaded cannot widen what a client proxies.
+            //
+            // It is not a wildcard here either, so it is not indexed: the
+            // catch-all is keyed by the empty name, and a pattern that
+            // matches nothing must not be given that key — it would answer
+            // for every host, and it would do so by whichever of the two the
+            // map happened to be walked in first.
+            if !suffix.is_empty() {
+                wildcards.insert(suffix.to_string(), pools.clone());
+            }
+        } else if pattern == "*" {
+            wildcards.insert(String::new(), pools.clone());
+        }
+    }
+    wildcards
 }
 
 /// How often each backend is asked whether it still answers.
@@ -696,8 +747,10 @@ impl EndpointGroup {
             None
         };
 
+        let wildcards = wildcards_of(&domains);
         Ok(Self {
             domains,
+            wildcards,
             default_pools,
             health,
             traffic,
@@ -821,8 +874,10 @@ impl EndpointGroup {
             None
         };
 
+        let wildcards = wildcards_of(&domains);
         Ok(Self {
             domains,
+            wildcards,
             default_pools,
             health,
             traffic,
@@ -844,6 +899,7 @@ impl EndpointGroup {
         )));
         Self {
             domains: HashMap::new(),
+            wildcards: HashMap::new(),
             default_pools,
             health,
             traffic,
@@ -977,11 +1033,20 @@ impl EndpointGroup {
             return Some(pools);
         }
 
-        self.domains
-            .iter()
-            .filter(|(pattern, _)| host_matches(pattern, &host))
-            .max_by(|(a, _), (b, _)| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
-            .map(|(_, pools)| pools)
+        // The name's **label-aligned** suffixes, longest first. A pattern
+        // `*.example.com` covers the names that end with `example.com` at a
+        // label boundary, and those are exactly the suffixes below — so the
+        // first one that is in the index is the longest pattern that covers
+        // the name, which is the answer the scan gave.
+        let mut suffix = host.as_ref();
+        while let Some((_, rest)) = suffix.split_once('.') {
+            suffix = rest;
+            if let Some(pools) = self.wildcards.get(suffix) {
+                return Some(pools);
+            }
+        }
+        // The catch-all, `*`, covers everything, and is keyed by nothing.
+        self.wildcards.get("")
     }
 
     pub async fn get_connection(&self, domain: &str) -> Result<PooledConnection, ClientError> {
@@ -1557,6 +1622,18 @@ mod tests {
         }
     }
 
+    /// A set of pools with no backend in it, for a test that only asks what
+    /// the index does with a pattern.
+    fn empty_domain_pools() -> Arc<DomainPools> {
+        Arc::new(DomainPools::new(
+            Vec::new(),
+            LoadBalancingStrategy::RoundRobin,
+            Arc::new(Mutex::new(HashMap::new())),
+            traffic::table(),
+            traffic::flow_registry(),
+        ))
+    }
+
     /// Regression guard: the group must report the *configured* backend IDs.
     ///
     /// When every pool shares one caller-owned endpoint (the Android JNI shape),
@@ -1737,6 +1814,91 @@ mod tests {
 
         assert_eq!(served_by(&group, "a.example.com"), Some(broad_backend));
         assert_eq!(served_by(&group, "a.www.example.com"), Some(narrow_backend));
+    }
+
+    /// A pattern that matches nothing serves nothing.
+    ///
+    /// `*.` is the catch-all in another spelling, and the rule in
+    /// `nexapipe-proto` refuses it and matches it with nothing: a
+    /// configuration that was never meant to be loaded cannot widen what a
+    /// client proxies. The client warns about the spelling rather than
+    /// refusing the configuration, so the pattern does reach the lookup — and
+    /// a lookup that keyed a pattern by the name it covers gave `*.` the
+    /// catch-all's own key, because the name `*.` covers is the empty one.
+    /// A client configured with `*.` alone would have served **every** host.
+    #[tokio::test]
+    async fn a_pattern_that_matches_nothing_serves_nothing() {
+        let ep = Endpoint::builder(presets::N0).bind().await.unwrap();
+        let backend = unused_backend_id();
+
+        let group = EndpointGroup::new_with_nodes_and_endpoint(
+            vec![node(backend, "*.")],
+            None,
+            LoadBalancingStrategy::RoundRobin,
+            ep,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(served_by(&group, "example.com"), None);
+        assert_eq!(served_by(&group, "www.example.com"), None);
+        assert_eq!(served_by(&group, "anything.test"), None);
+    }
+
+    /// The catch-all is the catch-all, whatever else is configured.
+    ///
+    /// The catch-all is filed under the empty name, and `*.` — a pattern that
+    /// matches nothing — would have claimed that same key. Which of the two
+    /// answered a name then depended on the order the map happened to be
+    /// walked in, so the same configuration served different hosts from one
+    /// run to the next.
+    ///
+    /// Each map below is built afresh, and each is walked in its own order,
+    /// so the old answer shows itself in at least one of them.
+    #[test]
+    fn the_catch_alls_key_belongs_to_the_catch_all() {
+        let catch_all = empty_domain_pools();
+        let unusable = empty_domain_pools();
+
+        for _ in 0..32 {
+            let mut domains = HashMap::new();
+            domains.insert("*".to_string(), catch_all.clone());
+            domains.insert("*.".to_string(), unusable.clone());
+
+            let wildcards = wildcards_of(&domains);
+            let filed = wildcards
+                .get("")
+                .expect("the catch-all is filed under the empty name");
+            assert!(
+                Arc::ptr_eq(filed, &catch_all),
+                "the catch-all's own key was given to a pattern that matches nothing"
+            );
+        }
+    }
+
+    /// The empty name is the catch-all's key, and the catch-all's alone.
+    ///
+    /// A pattern that matches nothing covers no name at all, so it is filed
+    /// under no key — it is not the catch-all, whatever its spelling.
+    #[test]
+    fn a_pattern_that_matches_nothing_is_filed_under_no_key_at_all() {
+        let unusable = empty_domain_pools();
+
+        let mut domains = HashMap::new();
+        domains.insert("*.".to_string(), unusable.clone());
+
+        assert!(
+            wildcards_of(&domains).is_empty(),
+            "a pattern that matches nothing must not be indexed"
+        );
+
+        // And the catch-all itself is filed under the empty name.
+        let mut domains = HashMap::new();
+        domains.insert("*".to_string(), unusable.clone());
+        assert!(
+            wildcards_of(&domains).contains_key(""),
+            "the catch-all is filed under the empty name"
+        );
     }
 
     /// A name written the way DNS writes it — with the trailing dot — is the

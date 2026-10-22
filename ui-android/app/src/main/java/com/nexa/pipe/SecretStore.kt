@@ -283,6 +283,24 @@ class SecretStore {
                     // Deliberately not gated on user authentication: this app
                     // has to reopen its endpoints after a reboot without
                     // anyone present to unlock anything.
+                    //
+                    // What that costs is worth stating plainly, because the
+                    // two are easy to confuse: the biometric gate in
+                    // `CredentialGate` is a door on the *display* of a secret,
+                    // not on its storage. The key is in the keystore and the
+                    // app can use it without anyone authenticating, so an
+                    // attacker who has code execution inside this app's
+                    // process — root, a local exploit, `run-as` on a
+                    // debuggable build — can read the ciphertext out of
+                    // `NexaPipeSecrets.xml` and decrypt it with this key
+                    // without ever seeing a fingerprint.
+                    //
+                    // A second key, gated on the user, would close that — and
+                    // would also stop the tunnel from coming back on its own
+                    // after a reboot, which is the thing this key exists for.
+                    // The trade is a deployment's to make, and it is a
+                    // deployment with `autoConnectOnBoot` turned on that
+                    // wants the second key.
                     .build()
             )
             generateKey()
