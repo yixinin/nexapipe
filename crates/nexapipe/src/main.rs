@@ -1894,3 +1894,5 @@ fn write_qr_file(path: &str, link: &str, invert: bool) -> anyhow::Result<()> {
 fn toml_key(key: &str) -> String {
     toml_edit::Key::new(key).to_string()
 }
+
+// path-filter verification: a server-only change.
