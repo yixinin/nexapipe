@@ -316,12 +316,15 @@ for the server's request path:
 | Bench | mean | median | slope | What the number says |
 |---|---|---|---|---|
 | `request_path/request` | 77,970 ns | 41,110 ns | **50,300 ns** | The whole of the server's work for one request, backend round trip included. The spread is wide — the interval runs 37 to 69 µs — because the round trip goes through the scheduler |
-| `request_path/allocations_per_request` | 39.00 | 39.00 | **39.00** | **39 allocations** for one request, from the route lookup to the response head. The count is the stable one: its interval is 0.005% wide where the time's is 85% |
+| `request_path/allocations_per_request` | 33.00 | 33.00 | **33.00** | **33 allocations** for one request, from the route lookup to the response head. The count is the stable one: its interval is 0.005% wide where the time's is 85%. **Was 39** once the balancer stopped taking a lock, and **42** before that |
 
 The allocation count is the instrument the per-request candidates in F2 need.
 Three of them — the route lookup re-normalising the host per route, the
 balancer taking three locks, and the backend URI being rebuilt from scratch —
-are all allocation counts in disguise, and 42 is the number they have to beat.
+are all allocation counts in disguise. Two of them have landed since: the
+balancer takes no lock, and the backend's address is parsed once instead of
+per request. The number the route lookup still has to beat is **33**, down
+from the **42** they started from.
 Two more rows, measured on **2026-10-22** on the same machine and toolchain, for
 the connections a client's flows open:
 

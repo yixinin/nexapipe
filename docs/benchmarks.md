@@ -11,8 +11,8 @@ rather than a result — the reasoning behind that is in
 | `tun_pump` | `crates/nexapipe-client/benches/tun_pump.rs` | the TUN's per-packet cost: the DNS path, the virtual-address bookkeeping, and the whole path with a packet in and an answer out |
 | `forwarding_path` | `crates/nexapipe-client/benches/forwarding_path.rs` | the end-to-end path: an application, the local proxy, the tunnel, and the copy loop |
 | `local_request` | `crates/nexapipe-client/benches/local_request.rs` | the client's local proxy on a plain HTTP request: the head, the domain check, the rewrite, the stream, and the response back |
-| `flow_connections` | `crates/nexapipe-client/benches/flow_connections.rs` | how many QUIC connections a hundred concurrent flows open, and how long they take to open |
 | `request_path` | `crates/nexapipe/benches/request_path.rs` | the server's work for one request: the route lookup, the balancer, the URI, and the round trip — and how many allocations it makes |
+| `flow_connections` | `crates/nexapipe-client/benches/flow_connections.rs` | how many QUIC connections a hundred concurrent flows open, and how long they take to open |
 | `route_lookup` | `crates/nexapipe/benches/route_lookup.rs` | the server's routing table: the walk over the routes, and what taking the one it found costs |
 | `domain_match` | `crates/nexapipe-client/benches/domain_match.rs` | the client asking whether a name is one of its own: the walk over the configured list |
 
@@ -70,7 +70,7 @@ pair of questions from the rest:
 |---|---|---|
 | `local_request/first_byte` | **100 µs** | the time from "the application sends" to "the response head has arrived": what the application waits before it can start rendering |
 | `local_request/request_response` | **138 µs** | the whole request: a connection, the request, the response, and the proxy closing it |
-| `request_path/allocations_per_request` | **39** | **39 allocations** for one request, from the route lookup to the response head: the per-request work is not free, and now it has a number. **Was 42** before the balancer stopped taking a lock and the backend's address stopped being parsed again for every request |
+| `request_path/allocations_per_request` | **33** | **33 allocations** for one request, from the route lookup to the response head: the per-request work is not free, and now it has a number. **Was 39** once the balancer stopped taking a lock, and **42** before that, when the backend's address was parsed again for every request |
 | `request_path/request` | **50 µs** | the whole of the server's work for one request, backend round trip included. The interval is wide — 37 to 69 µs — because the round trip goes through the scheduler; the allocation count beside it is the one that does not move |
 
 The two `flow_connections` rows were measured on **2026-10-22**, on the same
@@ -253,9 +253,12 @@ belongs in the report next to the times.
 
 It is the server's **plaintext listener** path, driven through
 `http::proxy_request`. The QUIC tunnel path reaches the same backend through
-`http::proxy_to_backend_streaming` and shares every per-request cost this
-bench measures; what it adds is the transport, and the transport is not what
-these numbers are about.
+`http::proxy_to_backend_streaming` and shares the part of the work this bench
+is about — the route lookup, the balancer, the origin and the URI. The two
+paths build the backend request through different functions, so the header
+copying and the body handling are not shared, and this bench measures the
+plaintext one. What the tunnel adds on top is the transport, and the
+transport is not what these numbers are about.
 
 **`flow_connections`** is the client asking how many QUIC connections its
 flows open. The client keeps a pool of connections to each backend, and a

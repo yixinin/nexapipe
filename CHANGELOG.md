@@ -57,6 +57,29 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **Three small things on the server's response path.**
+  The **WebSocket's copy loop** moved 8 KiB at a time where the HTTP path
+  coalesces into 64 KiB, and it had **no bound at all** -- only the handshake
+  was bounded, so a WebSocket whose two sides both went quiet kept a backend
+  connection, a task and a stream slot for as long as the process lived. It
+  now moves 64 KiB and is bounded by the same `response_idle` deadline the
+  HTTP path uses. The bound is on the **session**, not on a side of it: a
+  WebSocket that is quiet in one direction is still a WebSocket -- a client
+  that only listens to a feed the backend keeps pushing has nothing to say --
+  and what ends the session is neither side having moved for a whole window.
+  The window is measured with a **monotonic** clock: the wall clock steps with
+  NTP and with a machine waking from sleep, and a step forward would end a
+  session that was still carrying traffic.
+  The copy buffer is 64 KiB of **heap** per direction rather than 8 KiB of
+  stack, so a session costs 128 KiB where it cost 16 KiB.
+  Every **response header's name** was copied to lower case, once per header
+  per response -- for a name that was already lower case, because HTTP header
+  names are case-insensitive and the parser folds them.
+  The **connection pool's idle reaper** had no clock: the timer that was set
+  is the h2 half's, and the pool's own 120-second idle timeout was only
+  enforced lazily, at the next checkout. A connection to a backend that
+  stopped answering now sits in the pool for 120 seconds and no longer.
+
 - **The server answers the handshake in the form it was asked in.** The
   handshake message has two forms — the JSON one every client already speaks,
   and the binary one — and the payload's first byte says which one it is. The
@@ -337,9 +360,11 @@ lookup, which is what a config written before the key existed does.
   scheduler.
   It is the plaintext listener's path, and the difference is written down
   rather than left out: the QUIC tunnel reaches the same backend through
-  another function and shares every per-request cost, and what it adds is
-  the transport. So the server's own work for a request is a measurement
-  now; the transport's share of one is still an expectation.
+  another function and shares the part of the work this bench is about -- the
+  lookup, the balancer, the origin and the URI -- while the header copying
+  and the body handling are its own, and what it adds on top is the
+  transport. So the server's own work for a request is a measurement now; the
+  transport's share of one is still an expectation.
 - **The client's HTTP request path is measured too.** The benchmarks that
   landed with this cycle measured the CONNECT tunnel, the TUN's per-packet
   cost, the server's routing table and the client's own name matching. They
@@ -441,6 +466,22 @@ lookup, which is what a config written before the key existed does.
   where it made **42**.
   The health flag is an atomic now, so the operator's view and the request
   path cannot disagree about it: the flag is written once, and both read it.
+
+- **The backend's address is parsed once, not once per request.** Two places
+  built the backend's URI for every request, and both parsed the address to
+  do it — a `Url::parse`, a copy of the host, and a formatted string. A
+  **backend does not move**: its scheme, host and port are fixed when the
+  route is configured, and they were being parsed again for every request
+  that chose it.
+  The origin is now parsed when the pool is built, and the request path
+  borrows the answer. The address is **shared** rather than copied, so
+  handing it to a request is a reference count.
+  One request makes **33 allocations** where it made **42** — nine fewer
+  across the balancer's choice and the backend's address, both of which were
+  doing per-request work for values that are fixed.
+  The errors are the same ones, in the same words: a backend whose address
+  does not parse, or names no host, is still reported when the request is
+  built, where the operator reads it.
 - **Two of the TUN's per-packet costs are measured, and neither is worth
   changing.** The TUN copies every packet once on its way into the network
   stack, because the stack takes a `Vec<u8>` of its own and the buffer the

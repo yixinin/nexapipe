@@ -338,6 +338,89 @@ async fn spawn_tls_websocket_backend() -> TlsWebSocketBackend {
     }
 }
 
+/// A WebSocket backend that answers the upgrade and then keeps sending a byte
+/// every `interval`.
+///
+/// The proxy's WebSocket tunnel is bounded by how long the session may be
+/// quiet, and the shape that matters is the one where only **one** side is
+/// quiet: a client that only listens to a feed has nothing to say while the
+/// backend keeps pushing.
+async fn spawn_websocket_backend(interval: Duration) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the WebSocket backend");
+    let port = listener.local_addr().expect("backend address").port();
+
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut chunk).await {
+                        Ok(0) => return,
+                        Ok(n) => request.extend_from_slice(&chunk[..n]),
+                        Err(_) => return,
+                    }
+                }
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\n\
+                          Upgrade: websocket\r\n\
+                          Connection: Upgrade\r\n\r\n",
+                    )
+                    .await;
+                let _ = sock.flush().await;
+                loop {
+                    tokio::time::sleep(interval).await;
+                    if sock.write_all(b"x").await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    format!("http://127.0.0.1:{port}")
+}
+
+/// A WebSocket backend that answers the upgrade and then says nothing at all.
+async fn spawn_quiet_websocket_backend() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the quiet WebSocket backend");
+    let port = listener.local_addr().expect("backend address").port();
+
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut chunk).await {
+                        Ok(0) => return,
+                        Ok(n) => request.extend_from_slice(&chunk[..n]),
+                        Err(_) => return,
+                    }
+                }
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\n\
+                          Upgrade: websocket\r\n\
+                          Connection: Upgrade\r\n\r\n",
+                    )
+                    .await;
+                let _ = sock.flush().await;
+                // The session has to end on the proxy's own bound, so the
+                // backend holds the connection open without saying anything.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+        }
+    });
+
+    format!("http://127.0.0.1:{port}")
+}
+
 // ---------------------------------------------------------------------------
 // The proxy under test
 // ---------------------------------------------------------------------------
@@ -609,6 +692,21 @@ impl Tunnel {
             }
         }
         reply
+    }
+
+    /// Opens a WebSocket upgrade and leaves **both** sides of the stream
+    /// open, the way the client does.
+    ///
+    /// A WebSocket keeps talking after the handshake, so the request cannot
+    /// be finished: a finished stream is an end of stream for the server,
+    /// and it ends the session with it.
+    async fn upgrade_and_keep_open(
+        &self,
+        payload: &[u8],
+    ) -> (iroh::endpoint::SendStream, iroh::endpoint::RecvStream) {
+        let (mut send, recv) = self.conn.open_bi().await.expect("open_bi");
+        send.write_all(payload).await.expect("write request");
+        (send, recv)
     }
 }
 
@@ -902,6 +1000,125 @@ async fn a_websocket_reaches_an_https_backend_over_tls() {
         status_of(&reply).starts_with("HTTP/1.1 101"),
         "expected the backend's upgrade, got {:?}",
         String::from_utf8_lossy(&reply)
+    );
+}
+
+/// A WebSocket that is quiet on one side only stays open.
+///
+/// The tunnel is bounded by how long the session may be quiet, but a quiet
+/// *direction* is not a quiet session: a client that only listens to a feed
+/// the backend keeps pushing has nothing to say, and ending that session
+/// would cut exactly the traffic that is still flowing.
+#[tokio::test]
+async fn a_websocket_whose_client_is_quiet_stays_open() {
+    let backend = spawn_websocket_backend(Duration::from_millis(100)).await;
+    let timeouts = Timeouts {
+        deadlines: nexapipe::deadline::Deadlines {
+            response_idle: Duration::from_millis(300),
+            ..Default::default()
+        },
+        ..Timeouts::default()
+    };
+    let proxy = spawn_proxy_with_timeouts(
+        vec![http_route("ws.test", &backend)],
+        Retry::default(),
+        None,
+        timeouts,
+    )
+    .await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let (_send, mut recv) = tunnel
+        .upgrade_and_keep_open(
+            b"GET /ws HTTP/1.1\r\n\
+              Host: ws.test\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await;
+
+    // The upgrade first.
+    let mut buf = [0u8; 4096];
+    let read = tokio::time::timeout(Duration::from_secs(5), recv.read(&mut buf)).await;
+    let Ok(Ok(Some(n))) = read else {
+        panic!("the upgrade never came back");
+    };
+    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "expected the backend's upgrade, got {head:?}"
+    );
+
+    // Then the traffic: the backend keeps pushing for longer than the idle
+    // window while the client says nothing at all. The session has to
+    // survive it — the window bounds a quiet session, not a quiet side.
+    let mut payload = 0usize;
+    let until = tokio::time::Instant::now() + Duration::from_millis(1200);
+    while tokio::time::Instant::now() < until {
+        let Ok(Ok(Some(n))) =
+            tokio::time::timeout(Duration::from_millis(200), recv.read(&mut buf)).await
+        else {
+            break;
+        };
+        payload += n;
+    }
+    assert!(
+        payload >= 5,
+        "the session should have carried the backend's traffic past the idle \
+         window, got {payload} bytes"
+    );
+}
+
+/// A WebSocket whose two sides both went quiet ends.
+///
+/// This is the case the bound exists for: neither side has anything left to
+/// say, and without it the session keeps a backend connection, a task and a
+/// stream slot for as long as the process lives.
+#[tokio::test]
+async fn a_websocket_whose_two_sides_went_quiet_ends() {
+    let backend = spawn_quiet_websocket_backend().await;
+    let timeouts = Timeouts {
+        deadlines: nexapipe::deadline::Deadlines {
+            response_idle: Duration::from_millis(300),
+            ..Default::default()
+        },
+        ..Timeouts::default()
+    };
+    let proxy = spawn_proxy_with_timeouts(
+        vec![http_route("ws.test", &backend)],
+        Retry::default(),
+        None,
+        timeouts,
+    )
+    .await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let (_send, mut recv) = tunnel
+        .upgrade_and_keep_open(
+            b"GET /ws HTTP/1.1\r\n\
+              Host: ws.test\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await;
+
+    let mut buf = [0u8; 4096];
+    let read = tokio::time::timeout(Duration::from_secs(5), recv.read(&mut buf)).await;
+    assert!(
+        matches!(read, Ok(Ok(Some(_)))),
+        "the upgrade never came back: {read:?}"
+    );
+
+    // And then the session ends on its own, without another byte from either
+    // side.
+    let ended = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(1024)).await;
+    assert!(
+        ended.is_ok(),
+        "the session should have ended once both sides went quiet"
     );
 }
 

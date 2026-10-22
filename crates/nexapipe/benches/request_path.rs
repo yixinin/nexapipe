@@ -34,9 +34,12 @@
 //! It is the server's **plaintext listener** path, driven through
 //! `http::proxy_request`. The QUIC tunnel path — the one a real client uses —
 //! reaches the same backend through `http::proxy_to_backend_streaming`, and
-//! shares every one of the per-request costs this bench measures. What it
-//! adds is the transport, and the transport is not what the numbers here are
-//! about.
+//! shares the part of the work this bench is about: the route lookup, the
+//! balancer, the origin and the URI. The two paths build the backend request
+//! through different functions, so the header copying and the body handling
+//! are **not** shared — this bench measures the plaintext one. What the
+//! tunnel adds on top is the transport, and the transport is not what the
+//! numbers here are about.
 //!
 //! See `docs/benchmarks.md` for how to run this and what the numbers mean.
 

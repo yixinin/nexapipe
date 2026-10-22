@@ -418,7 +418,19 @@ impl<T> BackendLookup<T> {
 }
 
 pub struct BackendInfo {
-    pub url: String,
+    /// The backend's address.
+    ///
+    /// Shared, so that a request does not copy it: the address belongs to the
+    /// pool and does not change.
+    pub url: Arc<str>,
+    /// The scheme, the host and the port of the address, ready to be joined
+    /// to a path.
+    ///
+    /// Parsed **once**, when the pool was built — a backend does not move,
+    /// and parsing it per request is a measurable share of what a request
+    /// costs. The error is kept rather than thrown, so that the request path
+    /// is where it is reported.
+    pub origin: Result<Arc<str>, String>,
     /// The wire protocol this backend is to be spoken to.
     ///
     /// Carried with the address because it is the other half of "where this
@@ -762,7 +774,8 @@ impl RoutingTable {
             path,
         );
         BackendLookup::Found(BackendInfo {
-            url: lease.url().to_string(),
+            url: lease.shared_url().clone(),
+            origin: lease.origin().clone(),
             protocol: route.backend_protocol(),
             path_rewrite: route.path_rewrite().clone(),
             path_pattern: route.path_pattern().to_string(),
@@ -1236,7 +1249,8 @@ mod tests {
                 .await
                 .backend()
                 .expect("the http route serves this host")
-                .url,
+                .url
+                .as_ref(),
             "http://10.0.0.5:8080"
         );
         // A host that is only served over plain HTTP has no TLS backend, and
@@ -1276,7 +1290,8 @@ mod tests {
                 .await
                 .backend()
                 .expect("the route serves this host as a request")
-                .url,
+                .url
+                .as_ref(),
             "http://host.docker.internal:15666"
         );
         assert_eq!(
@@ -1328,7 +1343,8 @@ mod tests {
                 .await
                 .backend()
                 .expect("the http route serves this host")
-                .url,
+                .url
+                .as_ref(),
             "http://10.0.0.5:8080"
         );
         // TLS session, routed by SNI.
@@ -1469,7 +1485,8 @@ mod tests {
                 .await
                 .backend()
                 .expect("the http route serves this host")
-                .url,
+                .url
+                .as_ref(),
             "http://10.0.0.5:8080"
         );
     }
@@ -1742,7 +1759,8 @@ mod tests {
                 .await
                 .backend()
                 .expect("the http route serves this host")
-                .url,
+                .url
+                .as_ref(),
             "http://10.0.0.5:8080"
         );
     }
@@ -1765,7 +1783,8 @@ mod tests {
                 .await
                 .backend()
                 .expect("the catch-all serves what no other route names")
-                .url,
+                .url
+                .as_ref(),
             "http://10.0.0.9:9000"
         );
         // An exact host still outranks the catch-all.
@@ -1775,7 +1794,8 @@ mod tests {
                 .await
                 .backend()
                 .expect("the exact route serves this host")
-                .url,
+                .url
+                .as_ref(),
             "http://10.0.0.5:8080"
         );
         // It is an `http` route, not a fallback for the other modes.
@@ -1813,7 +1833,8 @@ mod tests {
                 .await
                 .backend()
                 .expect("an allowed host reaches its route")
-                .url,
+                .url
+                .as_ref(),
             "http://10.0.0.5:8080"
         );
         // A routed host the allowlist never named is refused, not served.
@@ -1858,7 +1879,8 @@ mod tests {
                 .await
                 .backend()
                 .expect("the allowlist names this host")
-                .url,
+                .url
+                .as_ref(),
             "http://10.0.0.9:9000"
         );
 
@@ -1900,7 +1922,8 @@ mod tests {
                     .await
                     .backend()
                     .unwrap_or_else(|| panic!("host {host} must reach its route"))
-                    .url,
+                    .url
+                    .as_ref(),
                 "http://10.0.0.5:8080",
                 "host {host} fell through to the default backend"
             );
@@ -1916,7 +1939,8 @@ mod tests {
                 .await
                 .backend()
                 .expect("the folded pattern matches the lowercase host")
-                .url,
+                .url
+                .as_ref(),
             "http://10.0.0.7:8080"
         );
     }
@@ -2264,7 +2288,8 @@ mod tests {
                 .await
                 .backend()
                 .expect("the wildcard has a route")
-                .url,
+                .url
+                .as_ref(),
             "http://10.0.0.2:8080"
         );
 
@@ -2275,7 +2300,8 @@ mod tests {
                 .await
                 .backend()
                 .expect("the wildcard has a route")
-                .url,
+                .url
+                .as_ref(),
             "http://10.0.0.2:8080"
         );
 
@@ -2286,7 +2312,8 @@ mod tests {
                 .await
                 .backend()
                 .expect("the catch-all has a route")
-                .url,
+                .url
+                .as_ref(),
             "http://10.0.0.1:8080"
         );
     }
@@ -2303,7 +2330,8 @@ mod tests {
                 .await
                 .backend()
                 .expect("the literal host reaches the route")
-                .url,
+                .url
+                .as_ref(),
             "http://10.0.0.5:8080"
         );
     }
@@ -2370,7 +2398,8 @@ mod tests {
                 .await
                 .backend()
                 .expect("the port is on the list")
-                .url,
+                .url
+                .as_ref(),
             "http://10.0.0.5:8080"
         );
         assert!(
@@ -2397,7 +2426,8 @@ mod tests {
                 .await
                 .backend()
                 .expect("no port was named, so none is refused")
-                .url,
+                .url
+                .as_ref(),
             "http://10.0.0.5:8080"
         );
     }

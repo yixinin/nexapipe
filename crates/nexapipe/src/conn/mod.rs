@@ -19,6 +19,7 @@ use nexapipe_proto::secret::SecretString;
 use peers::{PeerGuard, PeerIdentity, PeerRegistry};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::Instrument;
 
@@ -712,7 +713,7 @@ pub async fn handle_bidi_stream(
                     failure.error,
                 );
 
-                tried.push(backend.url.clone());
+                tried.push(backend.url.to_string());
                 let next = match host {
                     Some((h, port)) => {
                         config
@@ -872,6 +873,28 @@ fn forwards_websocket_header(name: &str) -> bool {
     .any(|hop| name.eq_ignore_ascii_case(hop))
 }
 
+/// How much of a WebSocket's stream is moved at a time.
+///
+/// The HTTP path coalesces into 64 KiB before it writes; the WebSocket path
+/// used to move 8 KiB at a time, which is one QUIC frame and one wake-up for
+/// every 8 KiB of the stream.
+const WS_COPY_BUFFER: usize = 64 * 1024;
+
+/// The current time in milliseconds, from a fixed base.
+///
+/// The WebSocket tunnel has to know when the last byte moved, and it has to
+/// know it from two tasks at once, so the answer has to fit in an atomic.
+///
+/// The base is a **monotonic** clock, and it has to be: this measures an
+/// interval, and the wall clock can step. A step backwards would suspend the
+/// bound — the session would never be found quiet — and a step forwards
+/// would end a session that was still carrying traffic.
+fn now_millis() -> u64 {
+    static BASE: OnceLock<std::time::Instant> = OnceLock::new();
+    let base = BASE.get_or_init(std::time::Instant::now);
+    base.elapsed().as_millis() as u64
+}
+
 /// Returns the status the client was answered with: 101 once the tunnel is up,
 /// or whatever the backend answered when it refused the upgrade. Bytes are the
 /// handshake response only — once both directions are piped the session has no
@@ -884,7 +907,7 @@ async fn handle_websocket_stream(
     backend_info: &BackendInfo,
     timeouts: Timeouts,
 ) -> Result<http::ProxySummary, http::ProxyFailure> {
-    let backend_url = backend_info.url.as_str();
+    let backend_url = &*backend_info.url;
     let protocol = backend_info.protocol;
     let url =
         url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
@@ -1009,37 +1032,82 @@ async fn handle_websocket_stream(
 
         let (backend_read, mut backend_write) = tokio::io::split(backend_stream);
 
+        // How long the session may be **quiet** — with both sides quiet at
+        // once. A WebSocket that is idle in one direction is still a
+        // WebSocket: a client that only listens to a feed the backend keeps
+        // pushing has nothing to say, and a gap in one direction must not end
+        // a session the other direction is still using. What ends it is the
+        // case the copy loop used to wait for for ever — neither side has
+        // moved for a whole window.
+        let idle = timeouts.deadlines.response_idle;
+
+        // When the last byte moved on this tunnel, in milliseconds since the
+        // epoch. Both directions write to it, and a direction that has been
+        // quiet for a whole window reads it to find out whether the other one
+        // is still talking.
+        let last_traffic = Arc::new(AtomicU64::new(now_millis()));
+
         let iroh_to_backend = async {
-            let mut buf = [0u8; 8192];
+            // **64 KiB**, like the HTTP path's coalescing buffer: the copy
+            // loop used to move 8 KiB at a time, which is one QUIC frame and
+            // one wake-up for every 8 KiB of a stream.
+            let mut buf = vec![0u8; WS_COPY_BUFFER];
             loop {
-                match recv.read(&mut buf).await {
-                    Ok(None) => return "iroh_finished",
-                    Ok(Some(n)) => {
+                match tokio::time::timeout(idle, recv.read(&mut buf)).await {
+                    Ok(Ok(None)) => return "iroh_finished",
+                    Ok(Ok(Some(n))) => {
+                        last_traffic.store(now_millis(), Ordering::Relaxed);
                         if let Err(e) = backend_write.write_all(&buf[..n]).await {
                             tracing::debug!("WebSocket backend write failed: {}", e);
                             return "backend_write_error";
                         }
                         crate::metrics::METRICS.record_bytes_received(n as u64);
                     }
-                    Err(_) => return "iroh_read_error",
+                    Ok(Err(_)) => return "iroh_read_error",
+                    Err(_) => {
+                        // This direction has been quiet for a whole window. The
+                        // session ends when nothing has moved in either
+                        // direction for that long; until then the other side is
+                        // still using it.
+                        let quiet_for =
+                            now_millis().saturating_sub(last_traffic.load(Ordering::Relaxed));
+                        if quiet_for >= idle.as_millis() as u64 {
+                            return "idle";
+                        }
+                        // The other side is still talking: wait for more, with
+                        // the window measured from now.
+                        continue;
+                    }
                 }
             }
         };
 
         let backend_to_iroh = async {
-            let mut buf = [0u8; 8192];
+            let mut buf = vec![0u8; WS_COPY_BUFFER];
             let mut backend_read = backend_read;
             loop {
-                match backend_read.read(&mut buf).await {
-                    Ok(0) => return "backend_finished",
-                    Ok(n) => {
+                match tokio::time::timeout(idle, backend_read.read(&mut buf)).await {
+                    Ok(Ok(0)) => return "backend_finished",
+                    Ok(Ok(n)) => {
+                        last_traffic.store(now_millis(), Ordering::Relaxed);
                         if let Err(e) = send.write_all(&buf[..n]).await {
                             tracing::debug!("WebSocket iroh write failed: {}", e);
                             return "iroh_write_error";
                         }
                         crate::metrics::METRICS.record_bytes_sent(n as u64);
                     }
-                    Err(_) => return "backend_read_error",
+                    Ok(Err(_)) => return "backend_read_error",
+                    Err(_) => {
+                        // The same bound as the other direction, and the same
+                        // reading of it: a quiet direction does not end a
+                        // session the other one is still using.
+                        let quiet_for =
+                            now_millis().saturating_sub(last_traffic.load(Ordering::Relaxed));
+                        if quiet_for >= idle.as_millis() as u64 {
+                            return "idle";
+                        }
+                        continue;
+                    }
                 }
             }
         };
