@@ -304,6 +304,8 @@ than the cost of one iteration — and its median is the number to read.
 |---|---|---|---|---|
 | `tun_pump/dns_query` | 174 ns | 172 ns | **174 ns** | A DNS query answered from the virtual address pool is **fast**. The cache path is not a problem |
 | `tun_pump/ip_mapping` | 2,217 ns | 2,226 ns | **2,274 ns** | **A hotspot.** The mapping's whole job — an allocation and a reverse lookup — measured against the 7,348 ns per-packet path, for what should be a hash lookup |
+| `tun_pump/ip_mapping_concurrent` | — | — | **97 ns** | The same lookup with eight tasks at once. Measured on 2026-10-22, on the same machine; only the slope was written down for this run, so the mean and median are left empty rather than invented |
+| `tun_pump/packet_copy` | — | — | **18 ns** | The copy the TUN's inbound path makes for every packet. Measured on 2026-10-22, on the same machine; only the slope was written down for this run |
 | `tun_pump/tun_packet` | 7,308 ns | 7,244 ns | **7,348 ns** | The whole TUN path: a packet in, an answer out. The per-packet cost on the platform with the least headroom |
 | `l4_forward/tcp_flow` | 41,990 ns | 41,716 ns | **42,059 ns** | One 64 KiB payload's round trip through the copy loop. **The copy loop itself is not the problem** |
 | `forwarding_path/connect_tunnel` | 811,219 ns | 805,634 ns | **834,955 ns** | The same 64 KiB over an established tunnel, through the local proxy and a real iroh connection. The rate it moves at, not the cost of opening it |

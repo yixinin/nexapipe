@@ -1,12 +1,17 @@
 //! The TUN's per-packet cost — the path a phone pays for every packet.
 //!
-//! Three benches, from the inside out:
+//! Five benches, from the inside out:
 //!
 //! - `dns_query`: the query the system resolver sends, answered from the
 //!   virtual address pool. The path a name resolution takes.
 //! - `ip_mapping`: the bookkeeping behind those answers — one address per
 //!   domain, and the reverse lookup that turns a packet's destination back
 //!   into a name.
+//! - `packet_copy`: the allocation and the copy the answer's frame costs on
+//!   its way to the stack, on its own so that its share of `tun_packet` is
+//!   visible.
+//! - `ip_mapping_concurrent`: the same lookup, looked up by several tasks at
+//!   once, where the lock it takes is what the parallelism contends on.
 //! - `tun_packet`: the whole path, with the query arriving as an IP packet on
 //!   the TUN device and the answer leaving as one. The stack in the middle is
 //!   smoltcp's; what is measured around it is ours.
@@ -39,6 +44,13 @@ const CLIENT_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 16);
 
 /// The domain the queries ask for.
 const DOMAIN: &str = "example.com";
+
+/// How many frames the copy bench keeps alive at once.
+///
+/// The frames are freed outside the clock, so this is what keeps the memory
+/// bounded: criterion runs the loop tens of millions of times, and a frame
+/// per iteration would be gigabytes of it.
+const FRAMES_PER_BATCH: u64 = 1024;
 
 /// A DNS query for [DOMAIN]: 12 bytes of header, then the question.
 fn dns_query() -> Vec<u8> {
@@ -139,6 +151,118 @@ fn tun_pump(c: &mut Criterion) {
                     let address = mapping.allocate(name);
                     let back = mapping.lookup_domain(&address);
                     black_box(back);
+                }
+                start.elapsed()
+            })
+        })
+    });
+
+    // The copy the TUN's inbound path makes for every packet: the bytes are
+    // read into a buffer that is reused, and the stack is handed a **copy**,
+    // because the frame it takes is a `Vec<u8>` of its own.
+    //
+    // It is here on its own so that its share of `tun_packet` is visible:
+    // the whole path is measured above, and this is the part of it that the
+    // allocator pays for. It is 0.24% of that path.
+    group.bench_function("packet_copy", |b| {
+        b.iter_custom(|iters| {
+            let packet = dns_packet(&dns_query());
+            let mut buf = vec![0u8; 1500];
+
+            // The read into the buffer stands in for the fd's read, and it
+            // happens before the copy the production path measures: the frame
+            // is on its way to the stack by then, and the copy is what the
+            // stack is handed. Timing it here would time two copies where the
+            // path pays for one.
+            buf[..packet.len()].copy_from_slice(&packet);
+
+            // The frames are freed outside the clock, in batches: in the
+            // production path the frame is handed to the stack and freed
+            // there, and a free inside the loop would be a cost the path does
+            // not pay at this point. The batch is what keeps the memory
+            // bounded -- criterion runs this loop tens of millions of times,
+            // and a frame per iteration would be gigabytes of it.
+            let mut frames = Vec::with_capacity(FRAMES_PER_BATCH as usize);
+            let mut elapsed = std::time::Duration::ZERO;
+            let mut left = iters;
+            while left > 0 {
+                let batch = left.min(FRAMES_PER_BATCH);
+                let start = std::time::Instant::now();
+                for _ in 0..batch {
+                    let frame = buf[..packet.len()].to_vec();
+                    frames.push(frame);
+                }
+                elapsed += start.elapsed();
+                // The frees are here, where the clock is not.
+                black_box(&frames);
+                frames.clear();
+                left -= batch;
+            }
+            elapsed
+        })
+    });
+
+    // The same mapping, looked up by several tasks at once.
+    //
+    // The lookup takes the mapping's lock, and it takes the **write** lock --
+    // so two lookups cannot happen at the same time. That does not show up in
+    // the single-task case above; it shows up here, where the work is the
+    // same and the only difference is that it is concurrent.
+    //
+    // **A read lock was tried here, and it is worse.** Making the clock and
+    // the "last used" atomic, so that the lookup needs no write lock, moves
+    // two updates out of the (serialising) lock and into eight cores
+    // contending for the same two cache lines: the measurement went from
+    // 97 ns per lookup to 357 ns. The critical section is far too short for
+    // the parallelism to pay for the contention, so the mapping keeps its
+    // exclusive lock.
+    //
+    // The variant that number came from was a branch, and it is not a branch
+    // any more: the figure is here because the decision is, and nobody can
+    // re-run the other half of it.
+    group.bench_function("ip_mapping_concurrent", |b| {
+        b.iter_custom(|iters| {
+            runtime.block_on(async move {
+                let mapping = Arc::new(IpMapping::new());
+                let names: Vec<String> = (0..512).map(|i| format!("host{i}.test")).collect();
+                // The addresses are shared rather than copied into each task,
+                // so that the copy is not part of what the clock measures.
+                let addresses: Arc<Vec<std::net::Ipv4Addr>> =
+                    Arc::new(names.iter().map(|name| mapping.allocate(name)).collect());
+
+                // How many lookups run at once.
+                const TASKS: usize = 8;
+
+                // The lookups are **split** between the tasks, so that the
+                // number criterion reports is the time of one lookup -- the
+                // same thing the single-task case above reports, and the two
+                // can be compared.
+                //
+                // The split has to add up to `iters`: criterion divides the
+                // elapsed time by the iteration count, so a divisor that did
+                // not match the work would report a number that is not the
+                // time of one lookup. The remainder goes to the first tasks,
+                // because `iters` is not always a multiple of the task count
+                // -- criterion's warm-up starts at one iteration.
+                let per_task = iters / TASKS as u64;
+                let remainder = iters % TASKS as u64;
+
+                let start = std::time::Instant::now();
+                let mut handles = Vec::with_capacity(TASKS);
+                for task in 0..TASKS as u64 {
+                    let mapping = mapping.clone();
+                    let addresses = addresses.clone();
+                    let count = per_task + u64::from(task < remainder);
+                    handles.push(tokio::spawn(async move {
+                        for i in 0..count {
+                            let index = ((i + task) % addresses.len() as u64) as usize;
+                            let back = mapping.lookup_domain(&addresses[index]);
+                            black_box(back);
+                        }
+                    }));
+                }
+                for handle in handles {
+                    let _ = handle.await;
                 }
                 start.elapsed()
             })

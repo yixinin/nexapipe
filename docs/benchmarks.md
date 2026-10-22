@@ -43,6 +43,21 @@ routing table now does moved the numbers they report:
 | `route_lookup/a_matching_host` | **134 ns** | the routing table's walk over 51 routes, **and** what taking the route it found costs. **Was 732 ns** when the routing table folded the host once per route rather than once per walk, and **999 ns** before the bench's path pattern was fixed — and that number was a lookup that found *nothing*, so the half it claims to measure was never measured |
 | `route_lookup/a_host_nothing_serves` | **76 ns** | the same walk over the same 51 routes for a host no route serves: what the walk costs on its own. The difference between the two rows is what taking the route costs |
 
+The two `tun_pump` rows measured on **2026-10-22**, on the same machine and
+the same toolchain, are listed separately because they were measured on a
+later day than the table above:
+
+| Bench | slope | The one-line reading |
+|---|---|---|
+| `tun_pump/ip_mapping_concurrent` | **97 ns** | the same lookup, eight tasks at once. The mapping's lock is an **exclusive** one, so the lookups serialise — and that is cheaper than the alternative: a read lock, tried and measured, came out at 357 ns, because making the clock atomic moves two updates out of the lock and into eight cores contending for the same cache lines |
+| `tun_pump/packet_copy` | **18 ns** | the copy the TUN's inbound path makes for every packet — the bytes are read into a buffer that is reused, and the stack is handed a copy, because the frame it takes is a `Vec<u8>` of its own. **It is 0.24% of `tun_packet`**, so the allocation it costs is not worth a buffer pool |
+
+The `packet_copy` figure was measured with an earlier version of that bench,
+which also timed the read into the buffer and the free of the frame at the
+end of each iteration — neither of which the production path pays at that
+point. The bench now times the allocation and the copy alone, so the figure
+above is an upper bound for what the path pays.
+
 The two `local_request` rows were measured on **2026-10-22**, on the same
 machine and the same toolchain, and are listed separately because they are a
 different pair of questions from the rest:
@@ -132,13 +147,23 @@ payload does, so what it measures is the copy loop and not the price of
 opening a flow. The handshake is a fixed cost per flow rather than a rate,
 and the tests cover what it does.
 
-**`tun_pump`** has three parts, from the inside out:
+**`tun_pump`** has five parts, from the inside out:
 
 - `dns_query` — the query the system resolver sends, answered from the
   virtual address pool.
 - `ip_mapping` — the bookkeeping behind those answers: one address per
   domain, and the reverse lookup that turns a packet's destination back into
   a name.
+- `ip_mapping_concurrent` — the reverse lookup with several tasks doing it at
+  once. The mapping's lock is exclusive, so the lookups serialise; the case
+  is here because the alternative (a read lock) was measured and is **worse**,
+  and the next person to look at the lock should find that rather than
+  guess it.
+- `packet_copy` — the copy that path makes for every packet on its way in: the
+  bytes are read into a buffer that is reused, and the stack is handed a
+  **copy**, because the frame it takes is a `Vec<u8>` of its own. It is here
+  on its own so that its share of the path is visible, because it is the one
+  per-packet cost a reader would think was worth removing.
 - `tun_packet` — the whole path, with the query arriving as an IP packet on
   the TUN device and the answer leaving as one. The stack in the middle is
   smoltcp's; what is measured around it is ours.
