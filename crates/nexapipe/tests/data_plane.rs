@@ -12,13 +12,18 @@
 //! request that is forwarded wrongly — to the wrong backend, or not at all —
 //! shows up as a backend that saw nothing.
 
+use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, RelayMode, endpoint::presets};
+use nexapipe::auth::{AuthConfig, ClientAuth, DeviceAuth};
 use nexapipe::config::{Retry, RouteMode, Timeouts};
 use nexapipe::conn;
 use nexapipe::http;
 use nexapipe::l4::FlowLimiter;
 use nexapipe::lb::LoadBalancingStrategy;
 use nexapipe::routes::{Route, RoutingTable};
+use nexapipe_client::auth::{TotpAlgorithm as ClientTotpAlgorithm, TwoFactorAuth};
+use nexapipe_proto::auth::AuthMessage;
+use nexapipe_proto::secret::SecretString;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -364,14 +369,23 @@ async fn spawn_proxy_with(
     retry: Retry,
     ca_file: Option<&std::path::Path>,
 ) -> Proxy {
+    spawn_proxy_with_timeouts(routes, retry, ca_file, Timeouts::default()).await
+}
+
+/// The same proxy, with the deadlines the caller asks for.
+///
+/// The head deadline is 30 s by default, and a test that waits for it is a test
+/// that never runs in a normal suite.
+async fn spawn_proxy_with_timeouts(
+    routes: Vec<Route>,
+    retry: Retry,
+    ca_file: Option<&std::path::Path>,
+    timeouts: Timeouts,
+) -> Proxy {
     let ep = bind().await;
     let addr = dial_address(&ep);
 
-    let config = Arc::new(RoutingTable::with_settings(
-        routes,
-        Timeouts::default(),
-        retry,
-    ));
+    let config = Arc::new(RoutingTable::with_settings(routes, timeouts, retry));
     let clients = Arc::new(
         http::BackendClients::new(Timeouts::default().connect, ca_file)
             .expect("the trust store is always usable"),
@@ -414,6 +428,57 @@ async fn spawn_proxy_with(
                     )
                     .await;
                 }
+            });
+        }
+    });
+
+    Proxy { addr }
+}
+
+/// The same proxy, with 2FA in front of it.
+///
+/// The connection is handed to `handle_connection` rather than to
+/// `handle_bidi_stream`, because the handshake lives in the first: the stream
+/// that carries AUTH_START is not a request, and a client that does not
+/// perform the handshake never gets to the data path at all.
+async fn spawn_proxy_with_auth(routes: Vec<Route>, auth: conn::AuthState) -> Proxy {
+    let ep = bind().await;
+    let addr = dial_address(&ep);
+
+    let config = Arc::new(RoutingTable::with_settings(
+        routes,
+        Timeouts::default(),
+        Retry::default(),
+    ));
+    let clients = Arc::new(
+        http::BackendClients::new(Timeouts::default().connect, None)
+            .expect("the trust store is always usable"),
+    );
+    let peers = Arc::new(conn::peers::PeerRegistry::new());
+    let limits = conn::limits::Limits::resolve(
+        &conn::limits::LimitsConfig::default(),
+        &conn::limits::EnvCaps::from_environment(),
+    )
+    .expect("the default limits resolve");
+    let limiters = conn::limits::Limiters::from_limits(&limits);
+
+    tokio::spawn(async move {
+        while let Some(incoming) = ep.accept().await {
+            let Ok(accepting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = accepting.await else {
+                continue;
+            };
+
+            let config = config.clone();
+            let clients = clients.clone();
+            let auth = auth.clone();
+            let peers = peers.clone();
+            let limiters = limiters.clone();
+
+            tokio::spawn(async move {
+                conn::handle_connection(conn, config, clients, Some(auth), peers, limiters).await;
             });
         }
     });
@@ -1085,13 +1150,27 @@ async fn a_request_with_more_than_one_host_is_refused() {
     );
 }
 
-/// The head deadline is 30 s, so this one waits that long before it can assert
-/// anything. Run it explicitly: `cargo test -p nexapipe --test data_plane -- --ignored`.
+/// A head that never finishes is dropped when its deadline passes.
+///
+/// The head deadline is 30 s by default, so the proxy is given a short one
+/// rather than the test waiting half a minute for it.
 #[tokio::test]
-#[ignore = "waits out the 30s head deadline"]
 async fn a_head_that_never_arrives_is_dropped() {
     let backend = spawn_backend("never").await;
-    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let timeouts = Timeouts {
+        deadlines: nexapipe::deadline::Deadlines {
+            header: Duration::from_millis(200),
+            ..Default::default()
+        },
+        ..Timeouts::default()
+    };
+    let proxy = spawn_proxy_with_timeouts(
+        vec![http_route("app.test", &backend.url)],
+        Retry::default(),
+        None,
+        timeouts,
+    )
+    .await;
     let tunnel = Tunnel::dial(proxy.addr).await;
 
     // A request line and a `Host`, never finished, and the stream is left open
@@ -1147,4 +1226,252 @@ fn client_hello_with_sni(sni: &str) -> Vec<u8> {
     record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
     record.extend_from_slice(&handshake);
     record
+}
+
+// ---------------------------------------------------------------------------
+// The 2FA handshake
+// ---------------------------------------------------------------------------
+
+/// The client the handshake authenticates.
+const CLIENT_ID: &str = "client-001";
+
+/// The secret it shares with the server.
+const SECRET: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+
+/// A 2FA configuration with one client and one secret.
+fn auth_config() -> AuthConfig {
+    let mut config = AuthConfig {
+        enabled: true,
+        max_attempts: 3,
+        lockout_duration: 60,
+        ..AuthConfig::default()
+    };
+    config.clients.insert(
+        CLIENT_ID.to_string(),
+        ClientAuth {
+            secret: SecretString::new(SECRET.to_string()),
+            created_at: "0".to_string(),
+            allow_hosts: None,
+            allow_ports: None,
+            allow_ports_strict: false,
+            pending_enrollment: None,
+            devices: std::collections::HashMap::new(),
+            unnamed_device_allowed: true,
+            last_used: None,
+            failed_attempts: 0,
+            locked_until: None,
+        },
+    );
+    config
+}
+
+/// 2FA state whose files live in a directory the test owns.
+///
+/// The counters are written beside the configuration, and a relative path
+/// would leave a `state.toml` and its lock file in the crate directory every
+/// time the suite runs. The directory is returned so it outlives the proxy.
+fn auth_state(config: AuthConfig) -> (conn::AuthState, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("config.toml");
+    (
+        conn::AuthState::new(config, path.to_string_lossy().into_owned()),
+        dir,
+    )
+}
+
+/// Writes one length-prefixed message.
+async fn write_message(send: &mut SendStream, message: &AuthMessage) {
+    let bytes = message.to_bytes().expect("the message serializes");
+    send.write_all(&(bytes.len() as u32).to_le_bytes())
+        .await
+        .expect("the length goes out");
+    send.write_all(&bytes).await.expect("the message goes out");
+}
+
+/// Reads one length-prefixed message.
+async fn read_message(recv: &mut RecvStream) -> AuthMessage {
+    let mut len = [0u8; 4];
+    recv.read_exact(&mut len).await.expect("the length comes");
+    let mut buf = vec![0u8; u32::from_le_bytes(len) as usize];
+    recv.read_exact(&mut buf).await.expect("the message comes");
+    AuthMessage::from_bytes(&buf).expect("the message parses")
+}
+
+/// Performs the handshake on a fresh stream: AUTH_START, the challenge, and
+/// the response signed over it.
+///
+/// `code` is the TOTP code that goes out; `None` means the current one, and
+/// an empty one is what a key-based device sends.
+async fn handshake(
+    tunnel: &Tunnel,
+    client: &TwoFactorAuth,
+    code: Option<String>,
+    device: Option<&str>,
+) -> AuthMessage {
+    let (mut send, mut recv) = tunnel.conn.open_bi().await.expect("open_bi");
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    write_message(
+        &mut send,
+        &AuthMessage::Start {
+            client_id: CLIENT_ID.to_string(),
+            timestamp,
+            device_id: None,
+        },
+    )
+    .await;
+
+    let challenge = read_message(&mut recv).await;
+    let AuthMessage::Challenge { nonce } = challenge else {
+        panic!("the server answers with a challenge, got {challenge:?}");
+    };
+
+    let signature = client
+        .sign_challenge(&nonce, timestamp)
+        .expect("the challenge is signed");
+    let code = match code {
+        Some(code) => code,
+        None => client.generate_code().expect("the code is generated"),
+    };
+
+    write_message(
+        &mut send,
+        &AuthMessage::Response {
+            client_id: CLIENT_ID.to_string(),
+            timestamp,
+            totp_code: code,
+            signature,
+            device_id: device.map(str::to_string),
+        },
+    )
+    .await;
+
+    read_message(&mut recv).await
+}
+
+/// The close code the server ended the connection with, if it has.
+async fn close_code(tunnel: &Tunnel) -> Option<u32> {
+    for _ in 0..100 {
+        match tunnel.conn.close_reason() {
+            Some(iroh::endpoint::ConnectionError::ApplicationClosed(close)) => {
+                return Some(close.error_code.into_inner() as u32);
+            }
+            Some(other) => panic!("the connection was closed another way: {other}"),
+            None => {}
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    None
+}
+
+/// A correct code gets in.
+///
+/// The whole handshake, over a real connection: the stream that carries
+/// AUTH_START, the challenge, the response signed over it, and the answer.
+#[tokio::test]
+async fn a_correct_code_gets_in() {
+    let backend = spawn_backend("hello").await;
+    let (auth, _dir) = auth_state(auth_config());
+    let proxy = spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let client =
+        TwoFactorAuth::new(CLIENT_ID, SECRET, ClientTotpAlgorithm::SHA1).expect("the client");
+    let answer = handshake(&tunnel, &client, None, None).await;
+
+    assert!(
+        matches!(answer, AuthMessage::Ok),
+        "the handshake succeeded, got {answer:?}"
+    );
+}
+
+/// A wrong code is refused, and the connection is closed with the code that
+/// says the credentials were refused.
+#[tokio::test]
+async fn a_wrong_code_is_refused() {
+    let backend = spawn_backend("hello").await;
+    let (auth, _dir) = auth_state(auth_config());
+    let proxy = spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let client =
+        TwoFactorAuth::new(CLIENT_ID, SECRET, ClientTotpAlgorithm::SHA1).expect("the client");
+    // Signed correctly, so the refusal is about the code and nothing else.
+    let answer = handshake(&tunnel, &client, Some("000000".to_string()), None).await;
+
+    assert!(
+        matches!(answer, AuthMessage::Failed { .. }),
+        "the credentials were refused, got {answer:?}"
+    );
+    assert_eq!(
+        close_code(&tunnel).await,
+        Some(3),
+        "the connection is closed with the code that says the credentials were refused"
+    );
+}
+
+/// A client that does not perform the handshake is closed with the code that
+/// says the handshake was required.
+#[tokio::test]
+async fn a_client_that_does_not_handshake_is_closed() {
+    let backend = spawn_backend("hello").await;
+    let (auth, _dir) = auth_state(auth_config());
+    let proxy = spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    // A request, where AUTH_START was expected.
+    let (mut send, _recv) = tunnel.conn.open_bi().await.expect("open_bi");
+    send.write_all(b"GET / HTTP/1.1\r\nHost: app.test\r\n\r\n")
+        .await
+        .expect("the request goes out");
+
+    assert_eq!(
+        close_code(&tunnel).await,
+        Some(2),
+        "the connection is closed with the code that says the handshake was required"
+    );
+    assert!(
+        backend.seen().is_empty(),
+        "a request that never handshook must not reach a backend"
+    );
+}
+
+/// A device that proves itself with a key gets in without a code.
+///
+/// The device is issued its credential at enrollment, and the answer to the
+/// challenge is a signature over it — the TOTP code is empty, because there is
+/// no secret to compute one from.
+#[tokio::test]
+async fn a_device_key_gets_in() {
+    let key = iroh::SecretKey::generate();
+    let public_key = nexapipe::auth::public_key_hex(&key.public());
+
+    let mut config = auth_config();
+    let client = config.clients.get_mut(CLIENT_ID).expect("the client");
+    client.secret = SecretString::new(String::new());
+    client.devices.insert(
+        "laptop".to_string(),
+        DeviceAuth {
+            secret: SecretString::new(String::new()),
+            public_key: Some(public_key),
+            created_at: "0".to_string(),
+            last_used: None,
+        },
+    );
+
+    let backend = spawn_backend("hello").await;
+    let (auth, _dir) = auth_state(config);
+    let proxy = spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let client = TwoFactorAuth::with_key(CLIENT_ID, key, "laptop");
+    let answer = handshake(&tunnel, &client, Some(String::new()), Some("laptop")).await;
+
+    assert!(
+        matches!(answer, AuthMessage::Ok),
+        "the handshake succeeded, got {answer:?}"
+    );
 }

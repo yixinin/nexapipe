@@ -1289,17 +1289,21 @@ where
     let backend_to_client = async move {
         let mut buf = vec![0u8; STREAM_BUF_SIZE];
         let mut total_bytes = 0;
-        let mut debug_preview = Vec::with_capacity(1500);
+        // The preview is only ever read when the debug log is on, so it is only
+        // built then: a 1.5 KiB buffer filled for every response, for a log
+        // line nobody asked for.
+        let mut debug_preview = debug_log_enabled().then(|| Vec::with_capacity(1500));
         let mut response_sent = false;
         loop {
             match recv.read(&mut buf).await {
                 Ok(None) => break,
                 Ok(Some(n)) => {
                     total_bytes += n;
-                    if !response_sent && debug_preview.len() < 1500 {
-                        debug_preview.extend_from_slice(
-                            &buf[..std::cmp::min(n, 1500 - debug_preview.len())],
-                        );
+                    if let Some(preview) = debug_preview.as_mut()
+                        && !response_sent
+                        && preview.len() < 1500
+                    {
+                        preview.extend_from_slice(&buf[..std::cmp::min(n, 1500 - preview.len())]);
                     }
                     if let Err(e) = client_write.write_all(&buf[..n]).await {
                         #[cfg(feature = "tracing")]
@@ -1315,10 +1319,12 @@ where
                     if !response_sent {
                         response_sent = true;
                         jni_log!("[DEBUG:local-proxy] Response sent: {} bytes", total_bytes);
-                        if !debug_preview.is_empty() && debug_log_enabled() {
+                        if let Some(preview) = debug_preview.as_ref()
+                            && !preview.is_empty()
+                        {
                             jni_log!(
                                 "[DEBUG:local-proxy] Response preview: {}",
-                                String::from_utf8_lossy(&debug_preview)
+                                String::from_utf8_lossy(preview)
                             );
                         }
                     }
@@ -1335,10 +1341,12 @@ where
                 "[DEBUG:local-proxy] Response sent (late): {} bytes",
                 total_bytes
             );
-            if !debug_preview.is_empty() && debug_log_enabled() {
+            if let Some(preview) = debug_preview.as_ref()
+                && !preview.is_empty()
+            {
                 jni_log!(
                     "[DEBUG:local-proxy] Response preview: {}",
-                    String::from_utf8_lossy(&debug_preview)
+                    String::from_utf8_lossy(preview)
                 );
             }
         }

@@ -370,7 +370,11 @@ fn pinned_relay_url() -> RelayUrl {
 }
 
 /// Whether `url` points at a relay n0 operates.
-fn is_n0_relay(url: &RelayUrl) -> bool {
+///
+/// Shared with the invite's relay hint, which refuses one for the same reason
+/// this does: a configuration that names an n0 relay as a custom one is
+/// saying something the configuration model does not allow.
+pub(crate) fn is_n0_relay(url: &RelayUrl) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };

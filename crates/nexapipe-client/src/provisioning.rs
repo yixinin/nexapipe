@@ -80,6 +80,38 @@ pub const TICKET_HOST: &str = "ticket";
 /// comfortable to scan off a screen; the CLI calls it out, nothing is rejected.
 pub const RECOMMENDED_URI_LIMIT: usize = 400;
 
+/// The hard limit on an invite code.
+///
+/// [`RECOMMENDED_URI_LIMIT`] is what a person can read off a screen; this is
+/// what a parser will look at. A code past it is not a code anybody will
+/// read, and parsing it is work an attacker gets for free.
+pub const MAX_URI_LEN: usize = 4 * 1024;
+
+/// Whether a relay hint names a relay this client could reach.
+///
+/// The hint is only a hint — the URL is applied later, and a hint that names
+/// nothing usable is dropped rather than obeyed. But "usable" is a question
+/// with an answer, and the answer is not "the URL parser accepted it":
+///
+/// - the scheme has to be one the relay code can dial — `https` and `http`,
+///   because a self-hosted relay over plain HTTP is a supported deployment,
+///   and `wss` and `ws` for the same reason;
+/// - it has to name a host;
+/// - it must not name an n0-operated relay, for the reason
+///   [`crate::relay::RelayModeSpec`] refuses one.
+fn is_usable_relay_hint(relay: &str) -> bool {
+    let Ok(url) = relay.parse::<iroh::RelayUrl>() else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https" | "ws" | "wss") {
+        return false;
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return false;
+    }
+    !crate::relay::is_n0_relay(&url)
+}
+
 /// Where [`EndpointInvite::target`] points: either a stable Node ID, which needs
 /// discovery to become an address, or a ticket that already carries addresses.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,10 +378,11 @@ impl EndpointInvite {
         self
     }
 
-    /// Adds a relay hint. An empty or malformed value is ignored, not trusted.
+    /// Adds a relay hint. A hint that names no usable relay is ignored, not
+    /// trusted.
     pub fn with_relay(mut self, relay: Option<&str>) -> Self {
         match relay.map(str::trim) {
-            Some(relay) if !relay.is_empty() && url::Url::parse(relay).is_ok() => {
+            Some(relay) if !relay.is_empty() && is_usable_relay_hint(relay) => {
                 self.relay = Some(relay.to_string());
             }
             _ => self.relay = None,
@@ -427,6 +460,14 @@ impl EndpointInvite {
     /// Reads back a link produced by [`Self::to_uri`].
     pub fn from_uri(raw: &str) -> Result<Self> {
         let raw = raw.trim();
+        // A code past the hard limit is not a code anybody will read, and
+        // parsing it is work an attacker gets for free.
+        if raw.len() > MAX_URI_LEN {
+            anyhow::bail!(
+                "the invite code is {} bytes, past the {MAX_URI_LEN} byte limit",
+                raw.len()
+            );
+        }
         let prefix = format!("{INVITE_SCHEME}://");
         if !raw
             .get(..prefix.len())
@@ -481,8 +522,12 @@ impl EndpointInvite {
             domains: normalize_domains(&domains)?,
             relay: match params.first("relay").map(str::trim) {
                 Some(relay) if !relay.is_empty() => {
-                    url::Url::parse(relay)
-                        .map_err(|e| anyhow::anyhow!("the relay URL {relay:?} is invalid ({e})"))?;
+                    if !is_usable_relay_hint(relay) {
+                        anyhow::bail!(
+                            "the relay hint {relay:?} is invalid: it does not name a relay this \
+                             client can reach"
+                        );
+                    }
                     Some(relay.to_string())
                 }
                 _ => None,
@@ -845,6 +890,78 @@ fn percent_decode(value: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A relay hint that names no relay this client can reach is refused.
+    ///
+    /// The URL parser accepting it is not the question: the hint is applied
+    /// later, as a relay URL, and a hint that names nothing usable is not a
+    /// hint.
+    #[test]
+    fn a_relay_hint_that_names_no_relay_is_refused() {
+        for hint in [
+            "ftp://relay.example.com",
+            "file:///etc/passwd",
+            "foo://relay.example.com",
+            "https://",
+            "https://aps1-1.relay.n0.iroh.link",
+        ] {
+            assert!(
+                !is_usable_relay_hint(hint),
+                "{hint:?} is not a relay this client can reach"
+            );
+
+            let uri = format!(
+                "nexapipe://endpoint/{}?v=1&relay={}",
+                node_id(),
+                percent_encode(hint)
+            );
+            assert!(
+                EndpointInvite::from_uri(&uri).is_err(),
+                "a code carrying {hint:?} is refused"
+            );
+        }
+    }
+
+    /// A hint that names a relay this client can reach is kept.
+    ///
+    /// A self-hosted relay over plain HTTP is a supported deployment, so
+    /// `http://` is as good as `https://` here.
+    #[test]
+    fn a_relay_hint_that_names_a_relay_is_kept() {
+        for hint in [
+            "https://relay.example.com",
+            "http://relay.example.com",
+            "wss://relay.example.com",
+        ] {
+            assert!(is_usable_relay_hint(hint), "{hint:?} is usable");
+        }
+
+        let invite = EndpointInvite::new(EndpointTarget::NodeId(node_id().to_string()), &[])
+            .unwrap()
+            .with_relay(Some("https://relay.example.com"));
+        assert_eq!(invite.relay.as_deref(), Some("https://relay.example.com"));
+    }
+
+    /// A hint that names no relay is dropped rather than obeyed.
+    #[test]
+    fn a_hint_that_names_no_relay_is_dropped_rather_than_obeyed() {
+        let invite = EndpointInvite::new(EndpointTarget::NodeId(node_id().to_string()), &[])
+            .unwrap()
+            .with_relay(Some("ftp://relay.example.com"));
+        assert!(
+            invite.relay.is_none(),
+            "a hint that names no relay is not kept"
+        );
+    }
+
+    /// A code past the hard limit is refused rather than parsed.
+    #[test]
+    fn a_code_past_the_hard_limit_is_refused() {
+        let long = "x".repeat(MAX_URI_LEN + 1);
+        let uri = format!("nexapipe://endpoint/{long}");
+        let error = EndpointInvite::from_uri(&uri).expect_err("the code is past the limit");
+        assert!(error.to_string().contains("past the"), "{error}");
+    }
+
     /// The invite path and the configuration path read a name the same way.
     ///
     /// They used to be two parsers: the invite one was strict and the
