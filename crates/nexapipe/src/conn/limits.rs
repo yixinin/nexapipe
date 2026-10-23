@@ -45,6 +45,12 @@ pub struct LimitsConfig {
     /// Concurrent streams the whole process may have in flight.
     pub max_streams_global: Option<usize>,
     /// Bytes of request bodies the whole process may hold at once.
+    ///
+    /// The same ceiling covers the per-stream copy buffers: the budget is the
+    /// process's ceiling on the bytes it holds, and a copy buffer is one of
+    /// them. A peer that opens many streams pays for those buffers out of
+    /// this budget, which is what makes the ceiling the process's memory
+    /// ceiling rather than only a ceiling on request bodies.
     pub max_body_bytes: Option<usize>,
 }
 
@@ -522,6 +528,13 @@ const ENV_MAX_BODY_BYTES_GLOBAL: &str = "NEXAPIPE_MAX_BODY_BYTES";
 /// two are there — each one bounds a resource that the per-connection and per-peer
 /// numbers cannot bound on their own.
 ///
+/// **The per-stream copy buffers are charged here too.** They are the one
+/// per-stream allocation the budget did not see: every direction of every
+/// copied stream holds a buffer, and a peer that opened many streams paid for
+/// them in memory the operator's ceiling never knew about — so the ceiling
+/// they configured was not the ceiling they got. A copy buffer is taken with
+/// the same reservation a body is, and given back when its direction ends.
+///
 /// **Both body paths reserve here**, which took two changes to arrange. The
 /// plaintext listener buffers through `read_body_limited`, which grows a
 /// reservation per frame. The iroh path has two readers of its own: the one
@@ -652,7 +665,8 @@ static BUDGET: LazyLock<Arc<ByteBudget>> =
 
 /// The process-wide body budget.
 ///
-/// The one every request is charged against. A caller with a budget of its own
+/// The one every request is charged against, and the one every copied stream's
+/// buffers are charged against as well. A caller with a budget of its own
 /// names it where the budget is taken rather than reaching for this one.
 pub fn body_budget() -> &'static Arc<ByteBudget> {
     &BUDGET
@@ -711,6 +725,29 @@ impl ByteReservation {
             Err(held) => Err(anyhow::anyhow!(
                 "the server is holding {held} of {} bytes of request bodies, so this {} byte \
                  body does not fit",
+                budget.max(),
+                bytes
+            )),
+        }
+    }
+
+    /// Reserves `bytes` from a named budget for a copy buffer.
+    ///
+    /// The same reservation a body gets — the budget does not care what the
+    /// bytes are for, only how many of them there are — with the words the
+    /// reader of the log needs: this is a buffer the process holds for one
+    /// stream, not a request body.
+    ///
+    /// Taken when the buffer is taken and given back when it is dropped, which
+    /// is when the direction that owns it ends.
+    pub(crate) fn take_buffers(budget: &Arc<ByteBudget>, bytes: usize) -> anyhow::Result<Self> {
+        match budget.try_reserve(bytes) {
+            Ok(()) => Ok(Self {
+                budget: budget.clone(),
+                bytes,
+            }),
+            Err(held) => Err(anyhow::anyhow!(
+                "the server is holding {held} of {} bytes, so this {} byte copy buffer does not fit",
                 budget.max(),
                 bytes
             )),
@@ -1121,6 +1158,38 @@ mod tests {
             ByteReservation::take(1).is_ok(),
             "a released budget admits the next body"
         );
+    }
+
+    /// A copy buffer is charged to the budget like a body is, and given back
+    /// when it is dropped.
+    ///
+    /// The copy buffers are the one per-stream allocation the budget did not
+    /// see, so they are taken with the same reservation a body is taken with.
+    #[test]
+    fn a_copy_buffer_is_charged_to_the_budget() {
+        let budget = Arc::new(ByteBudget::new(1000));
+
+        {
+            let _held =
+                ByteReservation::take_buffers(&budget, 100).expect("the buffer fits the budget");
+            assert_eq!(budget.held(), 100);
+        }
+        assert_eq!(
+            budget.held(),
+            0,
+            "the bytes come back with the reservation that held them"
+        );
+
+        // And a buffer that does not fit is refused, with the words that say
+        // what did not fit: this is a buffer, not a request body.
+        budget.try_reserve(950).expect("the budget fills up");
+        let refused =
+            ByteReservation::take_buffers(&budget, 100).expect_err("the buffer does not fit");
+        assert!(
+            refused.to_string().contains("copy buffer"),
+            "the error says what did not fit: {refused}"
+        );
+        assert_eq!(budget.held(), 950, "a refused buffer charges nothing");
     }
 
     #[test]

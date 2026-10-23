@@ -70,6 +70,18 @@ pub fn alpns(protocol: Protocol) -> Vec<Vec<u8>> {
 /// borrows, and the pool has to be able to say so.
 type DialOutcome = Result<(Connection, Arc<BorrowState>), ClientError>;
 
+/// A connection, and the credential generation it was authenticated under.
+///
+/// The generation is what says whether the connection still stands for the
+/// pool's identity: a credential change moves it, and a connection of an
+/// older generation was authenticated as an identity that is gone.
+struct Authenticated {
+    /// The connection itself.
+    conn: Connection,
+    /// The generation of the credential the handshake ran for.
+    generation: u64,
+}
+
 /// How many connections the pool keeps **per protocol**.
 ///
 /// A connection carries one protocol — the one it was opened with — so the
@@ -177,14 +189,21 @@ fn may_pool(protocol: Protocol, held: impl Iterator<Item = Protocol>) -> bool {
 
 /// Why a connection could not be put in the pool.
 ///
-/// The two are different failures and they read differently: one is a
-/// connection that was gone before it could be used, the other is a pool
-/// with no room left in it.
+/// The three are different failures and they read differently: one is a
+/// connection that was gone before it could be used, one is a pool with no
+/// room left in it, and one is a connection that belongs to an identity the
+/// operator has replaced.
 enum PoolRefusal {
     /// The connection was already closed.
     Closed,
     /// The pool holds as many connections of this protocol as it may.
     Full,
+    /// The credential was replaced while the connection was being made.
+    ///
+    /// The connection is authenticated as an identity that is gone, so it
+    /// is closed rather than pooled — and the caller is told, because
+    /// handing it out would hand out the old identity with it.
+    Replaced,
 }
 
 struct PooledConnection {
@@ -328,6 +347,21 @@ struct IrohConnectionPoolInner {
     /// notices the generation moved stops publishing, and closes the
     /// connection on its way out.
     epoch: AtomicU64,
+    /// Which generation of the credential the pool is on.
+    ///
+    /// Moved by [`IrohConnectionPool::set_credential`], and only when the
+    /// **identity** changed: a rotated secret is the same account, and the
+    /// connections that stand for it still stand for it.
+    ///
+    /// It is the answer to "which identity is this pool on?", and a dial
+    /// takes it with the credential it authenticates: a connection whose
+    /// generation has moved on was authenticated as an identity that is
+    /// gone, and it is closed rather than pooled.
+    ///
+    /// It is not the network generation above, and it is not the same
+    /// thing: a network change closes the connections of a path that is
+    /// gone, while this says whose name is on the connection.
+    credential_generation: AtomicU64,
 }
 
 /// A recorded [`LinkStatus`] and the connection it was recorded for.
@@ -366,6 +400,7 @@ impl IrohConnectionPool {
             owns_endpoint: true,
             link_status: Mutex::new(CachedLinkStatus::default()),
             epoch: AtomicU64::new(0),
+            credential_generation: AtomicU64::new(0),
         });
         spawn_cleanup_task(Arc::downgrade(&inner));
         Ok(Self { inner })
@@ -384,6 +419,7 @@ impl IrohConnectionPool {
             owns_endpoint: false,
             link_status: Mutex::new(CachedLinkStatus::default()),
             epoch: AtomicU64::new(0),
+            credential_generation: AtomicU64::new(0),
         });
         spawn_cleanup_task(Arc::downgrade(&inner));
         Self { inner }
@@ -444,13 +480,30 @@ impl IrohConnectionPool {
     /// Writes the pool's credential, and closes the connections of the
     /// identity that is gone.
     ///
-    /// Every write of the credential goes through here. A path that wrote it
-    /// directly — the enrollment writes one of its own — would change the
-    /// identity without the comparison, and the connections of the old
-    /// identity would stay in the pool.
+    /// Every write of the credential goes through here. The enrollment
+    /// writes a credential of its own — and it writes it **here**, so that
+    /// the identity comparison, the move of the generation and the drop of
+    /// the connections of the identity that is gone happen with it.
     async fn set_credential(&self, auth: Option<TwoFactorAuth>) {
         let mut slot = self.inner.two_factor.lock().await;
         let changed = identity_changed(slot.as_ref(), auth.as_ref());
+        if changed {
+            // **The identity moves with the credential.**
+            //
+            // A dial reads the generation when it takes the credential and
+            // compares it before it pools the connection: a generation that
+            // moved in between means the handshake ran for an identity that
+            // is gone.
+            //
+            // The move happens here — under the lock the credential is
+            // written under, and before the connections are dropped — so a
+            // dial that reads the credential afterwards reads the new
+            // generation with it, and a dial that read it before reads the
+            // old one.
+            self.inner
+                .credential_generation
+                .fetch_add(1, Ordering::AcqRel);
+        }
         *slot = auth;
         // Released before the connections are touched: the lock order is
         // `connections` first, and nesting the two is what makes a pool that
@@ -540,12 +593,16 @@ impl IrohConnectionPool {
     /// `timeout` is the budget for the QUIC handshake itself; see
     /// [`PRECONNECT_CONNECT_TIMEOUT`] for why a warm-up uses a tighter one than
     /// [`CONNECTION_TIMEOUT`].
+    ///
+    /// The connection comes back with the generation of the credential it
+    /// was authenticated under: the handshake takes as long as the server
+    /// takes, and the credential may be replaced while it runs.
     async fn connect_and_auth(
         &self,
         ep: &Endpoint,
         timeout: tokio::time::Duration,
         protocol: Protocol,
-    ) -> Result<Connection, ClientError> {
+    ) -> Result<Authenticated, ClientError> {
         let started = tokio::time::Instant::now();
         // **The protocol this connection is for, first**, and the two generic
         // names beside it: a server that does not know the per-protocol names
@@ -657,7 +714,20 @@ impl IrohConnectionPool {
             }
         }
 
-        let two_factor = self.inner.two_factor.lock().await.clone();
+        // **The credential, and the generation it belongs to, together.**
+        //
+        // The generation is read under the lock the credential is read
+        // under, so the two cannot be from different moments: a connection
+        // is authenticated as the identity whose generation it carries, and
+        // the pool can tell later whether that identity is still the one it
+        // is on.
+        let (two_factor, generation) = {
+            let slot = self.inner.two_factor.lock().await;
+            (
+                slot.clone(),
+                self.inner.credential_generation.load(Ordering::Acquire),
+            )
+        };
         if let Some(auth) = two_factor {
             #[cfg(feature = "tracing")]
             tracing::info!(
@@ -677,7 +747,7 @@ impl IrohConnectionPool {
             );
         }
 
-        Ok(conn)
+        Ok(Authenticated { conn, generation })
     }
 
     /// A connection to carry a flow on.
@@ -865,14 +935,20 @@ impl IrohConnectionPool {
             crate::error::ClientError::InvalidConfig("Endpoint has been closed".to_string())
         })?;
 
-        let conn = self
+        let authenticated = self
             .connect_and_auth(&ep, CONNECTION_TIMEOUT, protocol)
             .await?;
+        let conn = authenticated.conn.clone();
         spawn_path_watcher(Arc::downgrade(&self.inner), conn.clone());
 
         let state = Arc::new(BorrowState::new());
         match self
-            .pool_connection(conn.clone(), state.clone(), protocol)
+            .pool_connection(
+                conn.clone(),
+                state.clone(),
+                protocol,
+                authenticated.generation,
+            )
             .await
         {
             Ok(()) => Ok((conn, state)),
@@ -884,6 +960,12 @@ impl IrohConnectionPool {
             )),
             Err(PoolRefusal::Closed) => Err(ClientError::ConnectionFailed(
                 "the connection was closed as soon as it was established".to_string(),
+            )),
+            // The credential was replaced while the handshake was running:
+            // the connection is authenticated as an identity that is gone,
+            // and it was closed rather than pooled.
+            Err(PoolRefusal::Replaced) => Err(ClientError::ConnectionFailed(
+                "the credential was replaced while the connection was being made".to_string(),
             )),
         }
     }
@@ -945,7 +1027,7 @@ impl IrohConnectionPool {
         let started = tokio::time::Instant::now();
         let deadline = started + PRECONNECT_TIMEOUT;
 
-        let conn = {
+        let authenticated = {
             let Some(ep) = self.endpoint().await else {
                 return false;
             };
@@ -955,7 +1037,7 @@ impl IrohConnectionPool {
             )
             .await
             {
-                Ok(Ok(conn)) => conn,
+                Ok(Ok(authenticated)) => authenticated,
                 Ok(Err(e)) => {
                     #[cfg(feature = "tracing")]
                     tracing::warn!("preconnect to {} failed: {}", self.backend_id(), e);
@@ -970,6 +1052,7 @@ impl IrohConnectionPool {
                 }
             }
         };
+        let Authenticated { conn, generation } = authenticated;
 
         // A client without credentials never opens the auth stream, so a
         // completed QUIC handshake tells it nothing: whether the connection can
@@ -994,9 +1077,14 @@ impl IrohConnectionPool {
         }
 
         spawn_path_watcher(Arc::downgrade(&self.inner), conn.clone());
-        self.pool_connection(conn, Arc::new(BorrowState::new()), Protocol::Http)
-            .await
-            .is_ok()
+        self.pool_connection(
+            conn,
+            Arc::new(BorrowState::new()),
+            Protocol::Http,
+            generation,
+        )
+        .await
+        .is_ok()
     }
 
     /// Puts a connection in the pool.
@@ -1005,14 +1093,20 @@ impl IrohConnectionPool {
     /// pool keeps the connection and the flows borrow it, so there is nothing
     /// to give back at the end of a flow.
     ///
+    /// `generation` is the generation of the credential the connection was
+    /// authenticated under, and it is what says whether the connection still
+    /// stands for the pool's identity.
+    ///
     /// Returns why the connection could not be pooled — it was already
-    /// closed, or the pool is full. The caller has to know: handing out a
+    /// closed, the pool is full, or the credential it was authenticated
+    /// under has been replaced. The caller has to know: handing out a
     /// connection that was closed on the spot is handing out a failure.
     async fn pool_connection(
         &self,
         conn: Connection,
         state: Arc<BorrowState>,
         protocol: Protocol,
+        generation: u64,
     ) -> Result<(), PoolRefusal> {
         // Never pool a connection that has already been closed: handing it out
         // again would just fail on the next request. The background watcher also
@@ -1022,6 +1116,27 @@ impl IrohConnectionPool {
         }
 
         let mut connections = self.inner.connections.lock().await;
+        // **Whose identity is this connection?**
+        //
+        // The generation is compared under the lock that holds the pool, so
+        // the comparison and the pooling are one step: a credential that is
+        // replaced while the connection is on its way in cannot slip
+        // between them.
+        //
+        // A connection of an older generation was authenticated as an
+        // identity that is gone — the credential was replaced while its
+        // handshake was running. It is closed rather than pooled: it would
+        // carry traffic under an identity the operator has replaced, and
+        // handing it out would hand that identity out with it.
+        if self.inner.credential_generation.load(Ordering::Acquire) != generation {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                "the credential to {} was replaced while the connection was being made; closing it",
+                self.backend_id()
+            );
+            conn.close(0u32.into(), b"the credential was replaced");
+            return Err(PoolRefusal::Replaced);
+        }
         if may_pool(protocol, connections.iter().map(|pooled| pooled.protocol)) {
             connections.push(PooledConnection {
                 conn,

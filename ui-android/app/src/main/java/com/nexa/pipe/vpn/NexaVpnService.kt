@@ -184,6 +184,13 @@ class NexaVpnService : VpnService() {
         wasRevoked = false
         lastRevokeReason = null
 
+        // The tunnel of this session is not up yet, whatever an earlier
+        // session left behind: the flag says a tunnel is there, and it has
+        // to mean *this* one — a UI that reads it while this session is
+        // still being built would call a tunnel that is not there a
+        // connected one.
+        isServiceActive = false
+
         // A new session clears the teardown marker: the same service instance
         // is reused when the user stops and starts again without the process
         // being recreated, and an establish must be allowed to run then.
@@ -205,6 +212,9 @@ class NexaVpnService : VpnService() {
             // still running leaves a live connection to the relay behind
             // nothing that the user can see or stop.
             releaseNativeResources()
+            // The start is over and there is no tunnel: whoever asked for
+            // it is waiting for exactly this answer.
+            notifyStartOutcome(false)
             shutdownService()
             return
         }
@@ -243,7 +253,7 @@ class NexaVpnService : VpnService() {
             // boot path, and that path ends the service when it cannot bring
             // a tunnel up — so nothing is left running over a tunnel that is
             // not there.
-            startForegroundForBoot()
+            startForegroundConnecting()
             bootConnectJob = serviceScope.launch {
                 bootConnect()
             }
@@ -257,6 +267,15 @@ class NexaVpnService : VpnService() {
                 // another VPN app. Absent means no: a start that carries no
                 // such answer must not revoke anything.
                 val takeover = intent.getBooleanExtra(EXTRA_ALLOW_TAKEOVER, false)
+                // The same obligation the boot path meets, and for the same
+                // reason: a service started with startForegroundService() has
+                // five seconds to call startForeground(), and the system takes
+                // the app down when it does not. Everything startVPN() does
+                // before its own startForeground() — the consent check, the
+                // establish, and the wait for Android to register the VPN
+                // network — can take longer than that, so the obligation is
+                // met here, before any of it.
+                startForegroundConnecting()
                 startVPN(domains.toSet(), takeover)
             }
             ACTION_STOP -> {
@@ -272,7 +291,7 @@ class NexaVpnService : VpnService() {
                 // with the text that says what is happening rather than
                 // the one that says the tunnel is up, because it is not
                 // yet.
-                startForegroundForBoot()
+                startForegroundConnecting()
                 bootConnectJob = serviceScope.launch {
                     bootConnect()
                 }
@@ -286,11 +305,16 @@ class NexaVpnService : VpnService() {
      * has: it has five seconds to call `startForeground()`, and the system
      * takes the app down when it does not.
      *
+     * Every path that starts the service meets it here, before anything that
+     * can take longer than five seconds: the boot path waits for a network,
+     * and the start path waits for the consent check, for `establish()` and
+     * for Android to register the VPN network.
+     *
      * The text says what is true: the tunnel is not up yet. A refusal is not
      * swallowed — the service never enters the foreground state that way, and
      * the log is what says why.
      */
-    private fun startForegroundForBoot() {
+    private fun startForegroundConnecting() {
         runCatching {
             createNotificationChannel()
             startForeground(
@@ -298,7 +322,7 @@ class NexaVpnService : VpnService() {
                 createNotification(getString(R.string.notification_text_connecting))
             )
         }.onFailure { error ->
-            Log.w(TAG, "boot: the foreground was refused: ${error.message}")
+            Log.w(TAG, "the foreground was refused: ${error.message}")
         }
     }
 
@@ -422,6 +446,9 @@ class NexaVpnService : VpnService() {
         isRunning = false
         tunProxyStarted = false
         isServiceActive = false
+        // The session is over, and no tunnel is coming up for it: whoever is
+        // waiting for one is told now rather than at the end of its wait.
+        notifyStartOutcome(false)
         ownVpnNetworks = emptySet()
         ownVpnUnidentified = false
         wasRevoked = true
@@ -514,6 +541,10 @@ class NexaVpnService : VpnService() {
             if (!establishVpnInternal(allowTakeover)) {
                 Log.d(TAG, "VPN establishment failed")
                 isRunning = false
+                // The start is over and there is no tunnel: whoever asked for
+                // it is waiting for exactly this answer, and the attempt has
+                // to be retried rather than announced as a success.
+                notifyStartOutcome(false)
                 // Nothing left to shut down when the service is already going
                 // away: startForeground() after stopSelf() is what throws
                 // ForegroundServiceDidNotStartInTimeException, and the service
@@ -751,6 +782,11 @@ class NexaVpnService : VpnService() {
 
             tunProxyStarted = true
             isServiceActive = true
+            // The tunnel is up, and whoever asked for it is waiting for
+            // exactly this answer. The flag above is already true, so a
+            // reader that looks at it now and one that is woken by this
+            // call see the same thing.
+            notifyStartOutcome(true)
             Log.d(
                 TAG,
                 "VPN + TUN proxy established successfully (routing ${block.network} and " +
@@ -1415,6 +1451,43 @@ class NexaVpnService : VpnService() {
          */
         private fun notifyBroken(reason: String) {
             brokenListener?.invoke(reason)
+        }
+
+        /**
+         * Push channel for the outcome of a start.
+         *
+         * The service is the only side that knows it: the request to start
+         * says nothing about the tunnel — `startForegroundService()` returns
+         * as soon as the request is delivered — and only the establish says
+         * whether the tunnel is up. The listener is told so once per start:
+         * true when the tunnel is up, false when the start failed.
+         *
+         * Registered for the duration of one start, so a start nobody is
+         * waiting for is reported to nobody.
+         */
+        @Volatile
+        @JvmStatic
+        private var startOutcomeListener: ((Boolean) -> Unit)? = null
+
+        fun setStartOutcomeListener(listener: ((Boolean) -> Unit)?) {
+            startOutcomeListener = listener
+        }
+
+        /**
+         * Removes the listener, unless it is already another one.
+         *
+         * The check is what keeps a caller that has given up from removing
+         * the listener of a start that came after it.
+         */
+        fun clearStartOutcomeListener(listener: (Boolean) -> Unit) {
+            if (startOutcomeListener === listener) startOutcomeListener = null
+        }
+
+        /**
+         * Reports the outcome of the start that is running.
+         */
+        private fun notifyStartOutcome(up: Boolean) {
+            startOutcomeListener?.invoke(up)
         }
     }
 }

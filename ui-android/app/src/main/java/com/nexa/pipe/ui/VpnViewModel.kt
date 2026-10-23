@@ -22,6 +22,7 @@ import com.nexa.pipe.vpn.VpnSlot
 import com.nexa.pipe.vpn.VpnTakeoverChoice
 import com.nexa.pipe.vpn.VpnTakeoverDecision
 import com.nexa.pipe.vpn.VpnTakeoverPolicy
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
@@ -203,6 +204,51 @@ internal fun relayTokenAfter(
  */
 internal fun relayTokenToSend(stored: RelayToken, url: String): String =
     if (stored.relayUrl.trim() == url.trim()) stored.token else ""
+
+/**
+ * Whether the tunnel of a start is up.
+ *
+ * The two things that say so, and only them: the service reported the
+ * establish as done, and the service's own flag says a tunnel is there.
+ *
+ * The request being delivered says nothing — `startForegroundService()`
+ * returns as soon as the request is delivered — and treating it as a tunnel
+ * is what made the UI say "connected" over a tunnel that was never
+ * established, and keep saying it when the establish failed.
+ *
+ * @param reportedUp what the service reported about the establish.
+ * @param serviceActive whether the service says a tunnel is there.
+ */
+internal fun tunnelIsUp(reportedUp: Boolean, serviceActive: Boolean): Boolean =
+    reportedUp && serviceActive
+
+/**
+ * Waits for the service to report whether the tunnel it was asked to build
+ * came up.
+ *
+ * Bounded, because a service that says nothing at all must not leave the UI
+ * saying "connecting" forever — and because a start nobody answered is not a
+ * tunnel: the attempt is a failure and is retried like any other.
+ *
+ * @param outcome what the service will report about the start.
+ * @param timeoutMs how long to wait for that report.
+ * @param log where the line about a wait that ran out goes.
+ * @return what the service reported: true when the tunnel is up.
+ */
+internal suspend fun awaitTunnelUp(
+    outcome: CompletableDeferred<Boolean>,
+    timeoutMs: Long,
+    log: (String) -> Unit
+): Boolean {
+    return try {
+        withTimeout(timeoutMs) { outcome.await() }
+    } catch (e: TimeoutCancellationException) {
+        // The service was asked and never answered. Not a cancellation of
+        // the caller: the wait is over, and the attempt failed.
+        log("The tunnel did not come up within ${timeoutMs}ms")
+        false
+    }
+}
 
 class VpnViewModel : ViewModel() {
     private val TAG = "VpnViewModel"
@@ -590,6 +636,14 @@ class VpnViewModel : ViewModel() {
         private const val ATTEMPT_TIMEOUT_MS = 60_000L
         private const val DISCONNECT_MUTEX_TIMEOUT_MS = 70_000L
         private val BACKOFF_MS = longArrayOf(0, 1_000, 2_000)
+
+        // How long the UI waits for the service to report that the tunnel it
+        // asked for is up. Generous, because the establish waits for Android
+        // to register the VPN network and for the native side to take the
+        // descriptor — and because this budget is only reached when the
+        // service says nothing at all: a start that fails is reported, not
+        // waited out.
+        private const val TUNNEL_UP_TIMEOUT_MS = 60_000L
 
         // `error_vpn_taken_over` is what is shown when another proxy app (e.g.
         // Clash) owns the single tunnel slot Android allows per user.
@@ -1400,9 +1454,10 @@ class VpnViewModel : ViewModel() {
 
                 var lastError: Exception? = null
 
-                // Retry loop: every attempt has an overall timeout of
-                // ATTEMPT_TIMEOUT_MS; on timeout or failure all resources are
-                // released before the next attempt.
+                // Retry loop: the proxy preparation of an attempt is bounded
+                // by ATTEMPT_TIMEOUT_MS and the wait for the tunnel by
+                // TUNNEL_UP_TIMEOUT_MS; on timeout or failure all resources
+                // are released before the next attempt.
                 for (attempt in 1..MAX_CONNECT_ATTEMPTS) {
                     try {
                         withTimeout(ATTEMPT_TIMEOUT_MS) {
@@ -1466,7 +1521,32 @@ class VpnViewModel : ViewModel() {
                             // thing that lets establish() past its own guard.
                             putExtra(NexaVpnService.EXTRA_ALLOW_TAKEOVER, allowTakeover)
                         }
-                        context.startForegroundService(intent)
+                        // The tunnel is up only when the service says so:
+                        // startForegroundService() delivers the request and
+                        // returns, so nothing is known about the tunnel until
+                        // the establish has finished. The listener is
+                        // registered before the request is sent, because the
+                        // service may finish the establish before this
+                        // coroutine gets to wait for the answer.
+                        val outcome = CompletableDeferred<Boolean>()
+                        val listener: (Boolean) -> Unit = { up -> outcome.complete(up) }
+                        NexaVpnService.setStartOutcomeListener(listener)
+                        try {
+                            context.startForegroundService(intent)
+                            val reportedUp = awaitTunnelUp(
+                                outcome,
+                                TUNNEL_UP_TIMEOUT_MS
+                            ) { Log.w(TAG, it) }
+                            if (!tunnelIsUp(reportedUp, NexaVpnService.isServiceActive)) {
+                                // The attempt is over and there is no tunnel:
+                                // the same thing a failed proxy preparation
+                                // is, and retried the same way.
+                                throw Exception(tunnelUpFailedMessage())
+                            }
+                        } finally {
+                            NexaVpnService.clearStartOutcomeListener(listener)
+                        }
+
                         isVpnRunning.value = true
                         addLog("Connected successfully (attempt $attempt/$MAX_CONNECT_ATTEMPTS)")
                         // The tunnel is up: start reporting how each backend is reached, and
@@ -1512,6 +1592,17 @@ class VpnViewModel : ViewModel() {
             }
         }
     }
+
+    /**
+     * What to tell the user when a start did not bring the tunnel up.
+     *
+     * The reason the service refused with, when there is one: another VPN
+     * app owning the slot is something the user can act on, and a generic
+     * "connection failed" would hide it.
+     */
+    private fun tunnelUpFailedMessage(): String =
+        NexaVpnService.lastRevokeReason
+            ?: AppStrings.get(R.string.error_connection_failed)
 
     fun disconnect(context: Context) {
         viewModelScope.launch(Dispatchers.IO) {

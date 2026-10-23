@@ -7,15 +7,24 @@
 
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+use crate::conn::limits::{ByteBudget, ByteReservation};
 use crate::metrics::CopyLeg;
 
 /// Read size for the copy loops. Large enough that a 1400-byte inner segment never
 /// needs two syscalls, small enough to stay off the allocator's slow path.
 pub const COPY_BUF_SIZE: usize = 16 * 1024;
+
+/// What one copied stream costs the byte budget: one buffer per direction.
+///
+/// The two directions are two buffers, so a stream costs twice this. It is
+/// charged to the budget when the copy starts and given back as each direction
+/// ends — see [`copy_both_ways_until_with_budget`].
+pub const COPY_BUFFER_BYTES: usize = 2 * COPY_BUF_SIZE;
 
 /// How long the copy waits for the other direction after one of them ends.
 ///
@@ -89,6 +98,39 @@ impl AsyncWrite for DuplexIroh {
     }
 }
 
+/// The reservations one copied stream holds.
+///
+/// One per direction, because the two directions are two buffers. Each is
+/// given back as soon as its own direction ends rather than when the whole
+/// copy does: a direction that ends early does not keep its buffer's bytes
+/// charged against the process.
+struct CopyBuffers {
+    client_to_backend: ByteReservation,
+    backend_to_client: ByteReservation,
+}
+
+impl CopyBuffers {
+    /// Takes the reservations for both directions, or refuses the stream.
+    ///
+    /// **Refused rather than waited for**, and the reason is the one the
+    /// stream ceiling gives: a copy that waits for room is a task held open on
+    /// a stream slot, which is exactly what the process-wide ceilings exist to
+    /// prevent. A stream that cannot pay for its buffers does not run.
+    ///
+    /// Both are taken before either direction starts, so a stream that cannot
+    /// pay for both is refused before a single byte is read.
+    fn take(budget: &Arc<ByteBudget>) -> anyhow::Result<Self> {
+        // The first reservation is given back if the second does not fit: it
+        // is dropped on the way out, which is what the guard is for.
+        let client_to_backend = ByteReservation::take_buffers(budget, COPY_BUF_SIZE)?;
+        let backend_to_client = ByteReservation::take_buffers(budget, COPY_BUF_SIZE)?;
+        Ok(Self {
+            client_to_backend,
+            backend_to_client,
+        })
+    }
+}
+
 /// Copies bytes in both directions until **both** of them have ended.
 ///
 /// A half-close is a request, not an ending: a peer that shut its write side
@@ -136,8 +178,67 @@ where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
+    copy_both_ways_until_with_budget(
+        crate::conn::limits::body_budget(),
+        client,
+        backend,
+        label,
+        deadline,
+    )
+    .await
+}
+
+/// [`copy_both_ways_until`], charging the copy buffers to a named budget.
+///
+/// **The buffers are charged to the byte budget**, because they are the one
+/// per-stream allocation the budget did not see. Every direction of every
+/// copied stream holds a buffer, and a peer that opened many streams paid for
+/// them in memory the operator's ceiling never knew about: the ceiling they
+/// configured was not the ceiling they got. So the reservation is taken when
+/// the buffers are taken and given back as each direction ends.
+///
+/// **A stream that cannot pay for its buffers is refused**, before a byte is
+/// read and before the backend sees anything. The budget exists to refuse,
+/// not to warn. The stream closes cleanly rather than being left half-read:
+/// both write halves are shut down, so the peer sees an end of stream rather
+/// than a reset, and nothing is left holding a connection.
+///
+/// The budget is a parameter so a test can have one of its own: the shared
+/// one is the process's, and a test that disturbs it disturbs every other
+/// test in the process.
+pub async fn copy_both_ways_until_with_budget<A, B>(
+    budget: &Arc<ByteBudget>,
+    client: A,
+    backend: B,
+    label: &str,
+    deadline: Option<std::time::Duration>,
+) -> io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
     let (mut client_read, mut client_write) = tokio::io::split(client);
     let (mut backend_read, mut backend_write) = tokio::io::split(backend);
+
+    // The buffers are paid for before a byte moves. A stream that cannot
+    // afford them does not run at all: there is no half-read stream to
+    // clean up, and the peer is told by a clean end of stream.
+    let buffers = match CopyBuffers::take(budget) {
+        Ok(buffers) => buffers,
+        Err(e) => {
+            tracing::warn!("{label}: {e}");
+            // Both write halves, whatever happened: the peer sees a clean end
+            // of stream rather than a reset, and the backend is not left
+            // holding a connection nobody will write to.
+            let _ = backend_write.shutdown().await;
+            let _ = client_write.shutdown().await;
+            return Err(io::Error::other(e.to_string()));
+        }
+    };
+    let CopyBuffers {
+        client_to_backend: to_backend,
+        backend_to_client: to_client,
+    } = buffers;
 
     // Each direction, and the half-close that goes with it.
     //
@@ -157,8 +258,14 @@ where
     // out here instead would mean waiting for the other direction first,
     // which is the deadlock this arrangement exists to avoid.
     let client_to_backend = async {
-        let result =
-            copy_one_way(&mut client_read, &mut backend_write, label, CopyLeg::Client).await;
+        let result = copy_one_way(
+            &mut client_read,
+            &mut backend_write,
+            label,
+            CopyLeg::Client,
+            to_backend,
+        )
+        .await;
         // The client is done sending. The backend has to hear that.
         let _ = backend_write.shutdown().await;
         result
@@ -169,6 +276,7 @@ where
             &mut client_write,
             label,
             CopyLeg::Backend,
+            to_client,
         )
         .await;
         // The backend is done sending. The client has to hear that.
@@ -280,16 +388,24 @@ where
 /// belong in. It replaces the direction string this used to take: the label in
 /// the debug lines below and the answer "was this accepted or served" are one
 /// fact, and two parameters carrying it could disagree.
+///
+/// `reservation` pays for the buffer below, and is given back when this
+/// direction ends — the same moment the buffer is freed. It is taken once,
+/// outside the loop, so the copy itself does not touch the budget.
 async fn copy_one_way<R, W>(
     reader: &mut R,
     writer: &mut W,
     label: &str,
     leg: CopyLeg,
+    reservation: ByteReservation,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    // Held in a named binding rather than dropped at once: a `_` would give
+    // the bytes back before the buffer they pay for existed.
+    let _reservation = reservation;
     let direction = leg.label();
     let mut buf = vec![0u8; COPY_BUF_SIZE];
     loop {
@@ -669,5 +785,108 @@ mod tests {
             .unwrap();
         assert!(!more);
         assert!(buf.is_empty());
+    }
+
+    /// Waits for `condition` to hold, or gives up.
+    ///
+    /// The copy takes its buffers as it starts, so a test that wants to see
+    /// the charge has to wait for the copy to have run rather than assume it
+    /// already has.
+    async fn wait_for(mut condition: impl FnMut() -> bool) {
+        for _ in 0..100 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the condition never held");
+    }
+
+    /// The copy buffers are charged to the budget while the stream is open, and
+    /// given back when it ends.
+    ///
+    /// The copy buffers are the one per-stream allocation the byte budget did
+    /// not see: every direction of every copied stream holds one, and a peer
+    /// that opened many streams paid for them in memory the operator's ceiling
+    /// never knew about.
+    #[tokio::test]
+    async fn the_copy_buffers_are_charged_to_the_budget() {
+        let budget = Arc::new(ByteBudget::new(1024 * 1024));
+        let (client_end, backend_end, client_side, backend_side) = pair();
+
+        let charged = budget.clone();
+        let copy = tokio::spawn(async move {
+            copy_both_ways_until_with_budget(&charged, client_side, backend_side, "test", None)
+                .await
+        });
+
+        wait_for(|| budget.held() == COPY_BUFFER_BYTES).await;
+        assert_eq!(
+            budget.held(),
+            COPY_BUFFER_BYTES,
+            "both directions' buffers are charged while the stream is open"
+        );
+
+        // The stream ends.
+        drop(client_end);
+        drop(backend_end);
+        copy.await.unwrap().expect("the copy ends cleanly");
+
+        assert_eq!(
+            budget.held(),
+            0,
+            "the buffers are given back when the stream ends"
+        );
+    }
+
+    /// A peer that has spent the budget does not get another stream's buffers.
+    ///
+    /// The budget exists to refuse, not to warn. The stream is refused before
+    /// a byte is read, so there is no half-read stream to clean up, and it
+    /// closes cleanly rather than being reset under the peer.
+    #[tokio::test]
+    async fn a_stream_that_cannot_pay_for_its_buffers_is_refused() {
+        let budget = Arc::new(ByteBudget::new(1024));
+        // The budget is spent: one buffer does not fit into what is left.
+        budget
+            .try_reserve(1024)
+            .expect("the peer has spent the budget");
+
+        let (mut client_end, mut backend_end, client_side, backend_side) = pair();
+        client_end.write_all(b"the request").await.unwrap();
+
+        let refused =
+            copy_both_ways_until_with_budget(&budget, client_side, backend_side, "test", None)
+                .await;
+        let error = refused.expect_err("a stream that cannot pay for its buffers is refused");
+        assert!(
+            error.to_string().contains("copy buffer"),
+            "the error says what did not fit: {error}"
+        );
+        assert_eq!(
+            budget.held(),
+            1024,
+            "a refused stream takes nothing and gives back nothing"
+        );
+
+        // The backend saw a clean end of stream and not one byte of the
+        // request: the refusal came before anything was read.
+        let mut seen = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), backend_end.read_to_end(&mut seen))
+            .await
+            .expect("the backend's stream ends instead of hanging")
+            .expect("the backend's stream ends cleanly");
+        assert!(seen.is_empty(), "a refused stream reads nothing: {seen:?}");
+
+        // And the peer saw the same clean end, rather than a reset.
+        let mut seen = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client_end.read_to_end(&mut seen))
+            .await
+            .expect("the peer's stream ends instead of hanging")
+            .expect("the peer's stream ends cleanly");
+        assert!(
+            seen.is_empty(),
+            "the peer is told the stream is over, and nothing else: {seen:?}"
+        );
     }
 }

@@ -23,7 +23,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{Notify, mpsc, watch};
 
 /// The far side of a tunnel: answers the preface, and counts the
 /// connections it is given.
@@ -450,6 +450,199 @@ async fn an_enrollment_of_another_identity_closes_the_old_connections() {
         wait_for_close(&conn.conn).await,
         "the connection of the identity that is gone was not told the identity changed"
     );
+}
+
+/// A backend that holds the authentication handshake open until the test
+/// lets it finish.
+///
+/// The client takes its credential **before** the handshake and runs the
+/// handshake afterwards — so a handshake that is held open runs under the
+/// credential of the moment it started. That is the window the tests here
+/// need: the credential can be replaced while the handshake is still
+/// running, and the connection that comes out of it belongs to the
+/// identity that is gone.
+///
+/// The connection is handed to the test when the far side reads the
+/// `AUTH_START` — which the client writes *after* it has taken the
+/// credential, so the test knows which credential the handshake is running
+/// under before it does anything.
+async fn stalling_auth_backend() -> (
+    Endpoint,
+    mpsc::UnboundedReceiver<iroh::endpoint::Connection>,
+    Arc<Notify>,
+) {
+    let ep = Endpoint::builder(presets::N0)
+        .alpns(vec![ALPN_NEXAPIPE.to_vec()])
+        .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .unwrap()
+        .bind()
+        .await
+        .expect("the far side binds");
+    let server = ep.clone();
+    let (accepted_tx, accepted_rx) = mpsc::unbounded_channel();
+    let release = Arc::new(Notify::new());
+    let release_task = release.clone();
+    tokio::spawn(async move {
+        while let Some(incoming) = server.accept().await {
+            let Ok(accepting) = incoming.accept() else {
+                return;
+            };
+            let Ok(conn) = accepting.await else {
+                return;
+            };
+            let accepted_tx = accepted_tx.clone();
+            let release = release_task.clone();
+            tokio::spawn(async move {
+                // One stream at a time: the enrollment and the handshake
+                // that follows it share one stream.
+                while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                    while let Some((message, format)) = read_auth_message(&mut recv).await {
+                        match message {
+                            AuthMessage::Start { .. } => {
+                                // The client has presented its credential
+                                // by now, so the test may act on it.
+                                let _ = accepted_tx.send(conn.clone());
+                                // The handshake waits here, until the test
+                                // lets it finish.
+                                release.notified().await;
+                                let challenge = AuthMessage::Challenge {
+                                    nonce: vec![1, 2, 3, 4],
+                                };
+                                write_auth_message(&mut send, &challenge, format).await;
+                            }
+                            AuthMessage::Response { .. } => {
+                                write_auth_message(&mut send, &AuthMessage::Ok, format).await;
+                                break;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    (ep, accepted_rx, release)
+}
+
+/// A pool over a backend that holds the authentication handshake open.
+///
+/// The pool is given the credential of client-001, so that the handshake
+/// has something to authenticate.
+async fn stalling_auth_pool_harness() -> (
+    IrohConnectionPool,
+    mpsc::UnboundedReceiver<iroh::endpoint::Connection>,
+    Arc<Notify>,
+) {
+    let (server, accepted, release) = stalling_auth_backend().await;
+    let client = Endpoint::builder(presets::N0)
+        .alpns(vec![ALPN_NEXAPIPE.to_vec()])
+        .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .unwrap()
+        .bind()
+        .await
+        .expect("this side binds");
+    let pool = IrohConnectionPool::new_with_endpoint(client, server.addr());
+    pool.set_two_factor(Some(credential(
+        "client-001",
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+        None,
+    )))
+    .await;
+
+    (pool, accepted, release)
+}
+
+/// **A connection of a credential that has been replaced does not come
+/// back to the pool.**
+///
+/// The credential is replaced while the handshake is still running: the
+/// connection that comes out of that handshake was authenticated as the
+/// identity that is gone. Pooling it would keep serving traffic under an
+/// identity the operator has replaced — so it is closed instead, and the
+/// dial that made it is told so.
+#[tokio::test]
+async fn a_connection_of_a_replaced_credential_does_not_come_back_to_the_pool() {
+    let (pool, mut accepted, release) = stalling_auth_pool_harness().await;
+
+    // The dial runs while the credential is still the one of client-001.
+    let dialing = {
+        let pool = pool.clone();
+        tokio::spawn(async move { pool.get_connection(Protocol::Http).await })
+    };
+
+    // The far side has the credential: it read the AUTH_START, which the
+    // client writes after it has taken the credential.
+    let server_conn = accepted
+        .recv()
+        .await
+        .expect("the far side has the connection");
+
+    // The credential is replaced while the handshake is still running.
+    pool.set_two_factor(Some(credential(
+        "client-002",
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+        None,
+    )))
+    .await;
+
+    // Let the handshake finish. The connection comes out of it
+    // authenticated as client-001.
+    release.notify_one();
+
+    // The dial does not get a connection: the one it made belongs to an
+    // identity that is gone.
+    let outcome = dialing.await.expect("the dial is not cancelled");
+    assert!(
+        outcome.is_err(),
+        "the connection of the identity that is gone was handed out"
+    );
+
+    // And the pool does not keep it.
+    assert!(
+        pool.inner.connections.lock().await.is_empty(),
+        "the connection of the identity that is gone came back to the pool"
+    );
+
+    // And it was closed rather than left open on the network.
+    assert!(
+        wait_for_close(&server_conn).await,
+        "the connection of the identity that is gone was left open"
+    );
+}
+
+/// A dial that finishes with the credential unchanged is pooled as
+/// before.
+///
+/// The fix above compares a generation, and a comparison that moved on
+/// every dial would empty the pool. A dial whose credential did not change
+/// has nothing to be refused for.
+#[tokio::test]
+async fn a_dial_that_finishes_with_the_credential_unchanged_is_pooled() {
+    let (pool, mut accepted, release) = stalling_auth_pool_harness().await;
+
+    // The same handshake, held open and released — but the credential is
+    // not replaced.
+    let dialing = {
+        let pool = pool.clone();
+        tokio::spawn(async move { pool.get_connection(Protocol::Http).await })
+    };
+    let _server_conn = accepted
+        .recv()
+        .await
+        .expect("the far side has the connection");
+    release.notify_one();
+
+    let borrowed = dialing
+        .await
+        .expect("the dial is not cancelled")
+        .expect("the connection is made");
+    assert_eq!(
+        pool.inner.connections.lock().await.len(),
+        1,
+        "the connection is pooled"
+    );
+    drop(borrowed);
 }
 
 /// The two ends of a tunnel, and the count the far side keeps.
@@ -905,9 +1098,14 @@ async fn the_ceiling_is_refused_for_that_protocol_alone() {
             .await
             .expect("the connection opens");
         assert!(
-            pool.pool_connection(conn, Arc::new(BorrowState::new()), Protocol::Http)
-                .await
-                .is_ok(),
+            pool.pool_connection(
+                conn,
+                Arc::new(BorrowState::new()),
+                Protocol::Http,
+                generation(&pool),
+            )
+            .await
+            .is_ok(),
             "the connection is pooled"
         );
     }
@@ -921,8 +1119,13 @@ async fn the_ceiling_is_refused_for_that_protocol_alone() {
         .expect("the connection opens");
     assert!(
         matches!(
-            pool.pool_connection(conn, Arc::new(BorrowState::new()), Protocol::Http)
-                .await,
+            pool.pool_connection(
+                conn,
+                Arc::new(BorrowState::new()),
+                Protocol::Http,
+                generation(&pool),
+            )
+            .await,
             Err(PoolRefusal::Full)
         ),
         "the protocol's own ceiling is reached"
@@ -934,11 +1137,24 @@ async fn the_ceiling_is_refused_for_that_protocol_alone() {
         .await
         .expect("the connection opens");
     assert!(
-        pool.pool_connection(conn, Arc::new(BorrowState::new()), Protocol::L4)
-            .await
-            .is_ok(),
+        pool.pool_connection(
+            conn,
+            Arc::new(BorrowState::new()),
+            Protocol::L4,
+            generation(&pool),
+        )
+        .await
+        .is_ok(),
         "another protocol's ceiling is its own"
     );
+}
+
+/// The pool's current credential generation.
+///
+/// A connection that is pooled by hand has to say which generation it
+/// belongs to, or it is refused for being of an identity that is gone.
+fn generation(pool: &IrohConnectionPool) -> u64 {
+    pool.inner.credential_generation.load(Ordering::Acquire)
 }
 
 /// The count is of the connections of **that** protocol, and of no other.
