@@ -133,7 +133,7 @@ pub fn ensure_token_at(path: &Path) -> Result<String, AppError> {
 /// All of them, not just the first: on Windows the service scans every profile on the machine
 /// because a loopback socket says nothing about which account dialled it, so which candidate
 /// happens to come first tells it nothing about which token the caller holds. A caller is
-/// legitimate when it presents any one of them — see [`token_matches_any`].
+/// legitimate when it presents any one of them — see [`token_for_auth`].
 pub fn read_tokens() -> Result<Vec<String>, AppError> {
     let mut tokens = Vec::new();
     for candidate in service_token_paths() {
@@ -295,7 +295,8 @@ fn profile_roots_from(
     roots
 }
 
-/// [`read_token`] against an explicit path.
+/// The token at `path`, read without creating one — the looking half of
+/// [`ensure_token_at`], which creates one when there is none.
 pub fn read_token_at(path: &Path) -> Result<Option<String>, AppError> {
     match std::fs::read_to_string(path) {
         Ok(contents) => {

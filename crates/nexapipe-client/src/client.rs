@@ -144,6 +144,7 @@ pub async fn create_client(
 mod tests {
     use super::*;
     use iroh::Endpoint;
+    use iroh::endpoint::VarInt;
     use iroh::endpoint::presets;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -215,6 +216,146 @@ mod tests {
             accepted.load(Ordering::SeqCst),
             1,
             "the three streams shared one connection"
+        );
+    }
+
+    /// **A stream that carries a tunnel is not read as a request.**
+    ///
+    /// `with_stream` lends a stream to a closure that is not told what it may
+    /// write, so the connection it borrows may not promise either. On a
+    /// connection that named the HTTP protocol the server reads the stream as
+    /// a request, and a preface is not one — the flow would never open.
+    ///
+    /// The generic connection is the one that keeps the promise: the first
+    /// byte of each stream decides, and the first byte of a preface says
+    /// tunnel. The far side here is the server's own rule — the accept list
+    /// it uses, and the dispatch it does on what was negotiated.
+    #[tokio::test]
+    async fn a_stream_may_carry_a_tunnel() {
+        use nexapipe_proto::protocol::Protocol;
+        use nexapipe_proto::{L4Proto, Preface, Status};
+
+        // The far side: the server's own accept list, in the server's own
+        // order — the per-protocol names first, because the accept side's
+        // order is the preference order.
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![
+                Protocol::Http.alpn().to_vec(),
+                Protocol::L4.alpn().to_vec(),
+                Protocol::Tls.alpn().to_vec(),
+                ALPN.to_vec(),
+            ])
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("the far side binds");
+        let server_addr = server.addr();
+        // The endpoint outlives the task below: a dropped endpoint takes every
+        // connection on it down without saying so, and the client would then
+        // wait for the idle timeout to hear that the connection is gone.
+        let _server = server.clone();
+        // The far side holds on to the connection until the client says it has
+        // the answer: the answer is written, but it is still on its way, and a
+        // connection that closes now takes it with it.
+        let (answered, waiting) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let incoming = server.accept().await.expect("a connection");
+            let accepting = incoming.accept().expect("the connection is accepted");
+            let connection = accepting.await.expect("the handshake finishes");
+
+            let (mut send, mut recv) = connection.accept_bi().await.expect("a bi-stream");
+
+            // **What was negotiated is what the connection is served as.** A
+            // connection that named the HTTP protocol is served as a request,
+            // and a preface is not a request — so the flow is refused, and
+            // the client never gets an answer.
+            //
+            // The refusal is loud rather than silent: the stream is dropped
+            // without being finished, and the connection is closed, so the
+            // client hears at once instead of waiting for the connection to
+            // time out.
+            if connection.alpn() == Protocol::Http.alpn() {
+                drop((send, recv));
+                connection.close(VarInt::from_u32(0), b"a preface is not a request");
+                return;
+            }
+
+            // The head of the stream: enough to decode the preface.
+            //
+            // Read in a loop rather than once, because one read is not a
+            // promise that the whole preface arrived. A preface may be split
+            // across segments — the protocol says so, and the server's own
+            // reader loops for the same reason — and `Preface::decode` says
+            // "not enough bytes yet" rather than failing. A far side that
+            // read once would fail on a split for a reason that has nothing
+            // to do with the thing this test is about.
+            let mut head = Vec::new();
+            let preface = loop {
+                let mut chunk = [0u8; 64];
+                let read = recv
+                    .read(&mut chunk)
+                    .await
+                    .expect("the head is read")
+                    .expect("the stream is not finished");
+                head.extend_from_slice(&chunk[..read]);
+                match Preface::decode(&head) {
+                    Ok(Some((preface, _))) => break preface,
+                    // Not enough yet: the rest of it is on its way.
+                    Ok(None) => continue,
+                    Err(e) => panic!("the preface decodes: {e}"),
+                }
+            };
+            assert_eq!(preface.host, "db.test", "the far side was told the host");
+            assert_eq!(preface.port, 5432, "the far side was told the port");
+
+            send.write_all(&[Status::Ok.as_byte()])
+                .await
+                .expect("the status goes out");
+            // And the stream is finished, so the byte is on its way rather
+            // than discarded with the stream.
+            send.finish().expect("the stream is finished");
+
+            let _ = waiting.await;
+        });
+
+        // This side: an endpoint, a pool over it, and the client.
+        let client = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("this side binds");
+        let pool = crate::IrohConnectionPool::new_with_endpoint(client, server_addr);
+        let client = IrohProxyClient::new_with_pool(pool).await;
+
+        let preface = Preface::new(L4Proto::Tcp, "db.test", 5432)
+            .to_bytes()
+            .expect("the preface encodes");
+
+        let status = client
+            .with_stream(
+                async |send: &mut iroh::endpoint::SendStream,
+                       recv: &mut iroh::endpoint::RecvStream| {
+                    send.write_all(&preface).await?;
+                    let mut status = [0u8; 1];
+                    recv.read_exact(&mut status)
+                        .await
+                        .map_err(|e| ClientError::ReceiveError(e.to_string()))?;
+                    Ok::<u8, ClientError>(status[0])
+                },
+            )
+            .await
+            .expect("the tunnel opens");
+
+        // The answer is here, so the far side may let go of the connection.
+        let _ = answered.send(());
+
+        assert_eq!(
+            status,
+            Status::Ok.as_byte(),
+            "the far side opened the tunnel"
         );
     }
 }

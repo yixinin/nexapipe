@@ -371,7 +371,7 @@ impl<T> BackendLookup<T> {
     ///
     /// Both refusals map to `None`, so this is the first choice for anything
     /// about the request. A caller that needs to answer them differently asks
-    /// [`Self::kind`].
+    /// [`Self::reason`].
     pub fn backend(self) -> Option<T> {
         match self {
             BackendLookup::Found(value) => Some(value),
@@ -679,7 +679,7 @@ impl RoutingTable {
     /// 403, so a client cannot use the difference to probe which hosts exist
     /// behind the proxy.
     ///
-    /// [port] is the port the client named, if it named one. `None` means it
+    /// `port` is the port the client named, if it named one. `None` means it
     /// named none, and there is then no port to hold against it.
     pub async fn get_backend_with_acl(
         &self,

@@ -34,7 +34,8 @@
 //! can do later and nothing else. Each entry therefore carries the sending half
 //! of a [`tokio::sync::watch`] channel the connection task owns the other half
 //! of: [`PeerRegistry::close_where`] flips it, and the task, which is the only
-//! holder of the [`Connection`], is what actually closes.
+//! holder of the [`Connection`](iroh::endpoint::Connection), is what actually
+//! closes.
 //!
 //! A signal rather than a connection handle, because owning the socket from two
 //! places means either can close it and neither learns about it — and because a

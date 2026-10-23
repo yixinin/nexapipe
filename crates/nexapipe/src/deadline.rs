@@ -35,12 +35,18 @@
 
 use std::time::Duration;
 
+// The three budgets the client and the server both use are named in
+// `nexapipe-proto`, which both sides link: they used to be written down twice
+// and kept in step by hand, which is the same failure mode as a protocol
+// written down twice, one size smaller. The three that are only this side's
+// business — the body budget and the two idle timeouts — stay here.
+
 /// Seconds a client may take to send its request head.
 ///
 /// Covers the whole head, not each read of it: a peer that opens a connection
 /// and then trickles a byte of `Host:` every few seconds is holding a slot, a
 /// task and a connection slot, and a per-read timeout is exactly what it wants.
-pub const DEFAULT_HEADER_SECS: u64 = 30;
+pub const DEFAULT_HEADER_SECS: u64 = nexapipe_proto::HEADER_SECS;
 
 /// Seconds a client may take to send a request body once the head is in.
 ///
@@ -68,7 +74,7 @@ pub const DEFAULT_RESPONSE_IDLE_SECS: u64 = 120;
 /// Bounding the whole flow is what stops a peer from renewing it indefinitely
 /// by making the tunnel technically active. Raise it for long-lived SSH or a
 /// database session over the tunnel.
-pub const DEFAULT_L4_FLOW_SECS: u64 = 3600;
+pub const DEFAULT_L4_FLOW_SECS: u64 = nexapipe_proto::STREAM_SECS;
 
 /// Seconds between two UDP datagrams in either direction before the flow is
 /// considered idle.
@@ -83,7 +89,7 @@ pub const DEFAULT_L4_IDLE_SECS: u64 = 60;
 /// The client sends the record header and then the body of it, and a peer that
 /// sends the five header bytes and nothing else would otherwise hold the
 /// connection open indefinitely with no read deadline at all.
-pub const DEFAULT_TLS_HELLO_SECS: u64 = 10;
+pub const DEFAULT_TLS_HELLO_SECS: u64 = nexapipe_proto::TLS_HELLO_SECS;
 
 /// The per-phase budgets, resolved.
 ///

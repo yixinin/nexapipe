@@ -7,7 +7,7 @@
 //!
 //! It used to be `b"\x05nexapipe"`: the L4 preface's first byte in front of the
 //! name. That byte was never part of a length encoding. The preface's magic
-//! byte is [`PREFACE_MAGIC`], and it is read off the **stream**, long after
+//! byte is [`crate::PREFACE_MAGIC`], and it is read off the **stream**, long after
 //! the ALPN has been agreed; the ALPN is a name, not a header. Putting the
 //! byte in front of the name made the protocol a nine-byte string that began
 //! with a control byte, and it bought nothing.

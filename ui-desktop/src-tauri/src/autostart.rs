@@ -22,9 +22,11 @@
 //! second copy of the app in the middle of the session, which is what a
 //! `launchctl bootstrap` here would do.
 //!
-//! The entry carries [`BACKGROUND_FLAG`], so the app that comes up at login
-//! starts without a window: it lives in the tray and the tunnel is one click
-//! away, rather than a window appearing over whatever the user was doing.
+//! The entry carries [`BACKGROUND_FLAG`], so the app that comes up at login knows the
+//! machine started it rather than the user. What that launch does with its window is
+//! the user's preference and lives with the theme and the language; the flag says
+//! *who* started the app, and the two are separate so that a user who wants the
+//! window at login can have it without the entry being rewritten.
 
 use std::path::PathBuf;
 
@@ -41,10 +43,16 @@ use crate::error::{codes, AppError};
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 const ENTRY_NAME: &str = "nexa";
 
-/// The argument that says "start without a window".
+/// The argument that says "the machine started this app".
 ///
-/// Carried by the entry, so the app that comes up at login lives in the tray
-/// instead of opening a window over whatever the user was doing.
+/// Carried by the entry, so the app that comes up at login knows it was the
+/// machine's doing rather than the user's, and can decide what that means:
+/// whether a window appears is the user's preference (`autoConnect` and
+/// `silentStart` in the frontend), not something the entry decides.
+///
+/// The name is historical. It used to mean "start without a window", and it
+/// still does by default — but the meaning moved to the preference, so that a
+/// user who wants the window at login can have it without rewriting the entry.
 pub const BACKGROUND_FLAG: &str = "--background";
 
 /// Whether this app is started when the machine starts.
@@ -101,8 +109,15 @@ pub fn set_enabled(enabled: bool) -> Result<(), AppError> {
 
 /// Whether this launch was asked for by the machine rather than by a person.
 ///
-/// True when the entry started the app: the window stays hidden and the app
-/// waits in the tray.
+/// True when the entry started the app. The app came up because the machine
+/// said so, and what that means for the window is the user's preference rather
+/// than this flag's: the flag says *who* started the app, and the frontend
+/// decides whether that launch is a quiet one.
+///
+/// Kept separate from the window on purpose. A flag that said "no window" would
+/// make "the machine started this app" and "the user does not want to be
+/// interrupted" the same statement, and a user who wants the window at login
+/// could not have it without rewriting the entry.
 pub fn is_background_launch() -> bool {
     // `args_os` rather than `args`: the latter panics on a non-UTF-8 argument, and the launcher
     // that starts the app at login is not ours to control. A panic here would take the whole

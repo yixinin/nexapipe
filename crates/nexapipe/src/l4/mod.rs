@@ -33,7 +33,7 @@
 //! A flow carries bytes, so the line for one used to say only what the tunnel
 //! did with them. The first bytes of a flow usually say more than that — a TLS
 //! handshake names the host it wants, a plaintext HTTP exchange says what was
-//! asked for and what came back — and [`sniff`] reads them as they go past, so
+//! asked for and what came back — and `sniff` reads them as they go past, so
 //! the line can say it. It reads and does not act: the route was chosen by the
 //! preface before a single payload byte arrived.
 

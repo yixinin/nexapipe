@@ -8,9 +8,10 @@ export type TwoFactorAlgorithm = 'sha1' | 'sha256' | 'sha512';
 
 /**
  * How the proxy is forwarding traffic. Mirrors `ProxyModeKind` in `src-tauri/src/status.rs`,
- * serialized in snake_case; `starting` and `stopped` describe the absence of a live mode.
+ * serialized in snake_case; `starting` and `stopped` describe the absence of a live mode, and
+ * `unknown` is the absence of an answer — the state could not be read, so it is not known.
  */
-export type ProxyMode = 'tun' | 'local_proxy' | 'starting' | 'stopped';
+export type ProxyMode = 'tun' | 'local_proxy' | 'starting' | 'stopped' | 'unknown';
 
 /**
  * What the service manager reports about the system service. Mirrors `ServiceState` in

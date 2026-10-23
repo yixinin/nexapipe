@@ -23,6 +23,22 @@ pub fn should_proxy_domain(host: &str, proxy_domains: &[String]) -> bool {
     host_matches_any(proxy_domains, host)
 }
 
+/// The key a domain is stored and looked up under.
+///
+/// A name and the same name with a trailing dot are the same name, and DNS
+/// names are case-insensitive, so both are folded away on the way in and on
+/// the way out.
+///
+/// This is the client's own fold, and it is not the route rule in
+/// `nexapipe-proto`: that one compares names the way DNS does — ASCII case
+/// only, and the surrounding whitespace left alone — while this one also takes
+/// the whitespace off. The difference is deliberate: a name that arrives with
+/// whitespace around it is a name a configuration written by hand will not
+/// match, and forgiving it here is what makes the two agree.
+pub fn fold_domain(domain: &str) -> String {
+    domain.trim().trim_end_matches('.').to_lowercase()
+}
+
 /// What a list of patterns is worth saying, when a client starts with one.
 #[derive(Debug, Default, Clone)]
 pub struct DomainNotes {

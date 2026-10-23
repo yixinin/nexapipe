@@ -663,6 +663,29 @@ impl BackendPool {
         }
         result
     }
+
+    /// How many times in a row the backend named `url` has been marked
+    /// unhealthy.
+    ///
+    /// This counts **transitions**, not probes: the count goes up when the
+    /// pool is told the backend is down, and a round that marks the same
+    /// backend twice in a row counts twice — which is the mistake a test that
+    /// only looks at the end state cannot see.
+    ///
+    /// Only the tests read this. The pool is what a health check marks, so a
+    /// test that wants to know how often it was marked has to ask the pool.
+    #[cfg(test)]
+    pub(crate) async fn backend_failures(&self, url: &str) -> Option<usize> {
+        let mut failures = None;
+        for backend in &self.backends {
+            if &*backend.url != url {
+                continue;
+            }
+            let count = backend.status.read().await.consecutive_failures();
+            failures = Some(failures.map_or(count, |seen: usize| seen.max(count)));
+        }
+        failures
+    }
 }
 
 #[cfg(test)]

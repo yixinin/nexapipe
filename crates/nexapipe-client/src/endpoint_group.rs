@@ -1098,9 +1098,9 @@ impl EndpointGroup {
     ///   caller-owned endpoint, and would collapse all backends into a single
     ///   probe
     /// - Runs all connectivity tests in parallel via `JoinSet`
-    /// - Applies a per-pool budget of [`PRECONNECT_TIMEOUT`], which covers the
+    /// - Applies a per-pool budget of `PRECONNECT_TIMEOUT`, which covers the
     ///   connect and the wait for a 2FA refusal together
-    /// - Caps the whole phase at [`PRECONNECT_PHASE_CAP`]
+    /// - Caps the whole phase at `PRECONNECT_PHASE_CAP`
     ///
     /// This ensures that a single unreachable backend node does not block the
     /// entire connection flow.
@@ -1242,10 +1242,11 @@ impl EndpointGroup {
 
     /// Starts the periodic health probe.
     ///
-    /// One task per group, holding only a [`Weak`] reference, so it ends when
-    /// the group does — a stopped proxy is not kept alive by the thing that is
-    /// watching it. Nothing else stops it; a group that outlives the probe
-    /// simply stops being probed, which is the same state as before it started.
+    /// One task per group, holding only a [`std::sync::Weak`] reference, so it
+    /// ends when the group does — a stopped proxy is not kept alive by the
+    /// thing that is watching it. Nothing else stops it; a group that outlives
+    /// the probe simply stops being probed, which is the same state as before
+    /// it started.
     ///
     /// Not started by the constructors: those return a bare `Self`, and the
     /// probe needs the `Arc` the caller is about to wrap it in. Every long-lived
@@ -1350,7 +1351,7 @@ impl EndpointGroup {
     /// Every backend's health as the last probe left it.
     ///
     /// Empty until the first probe has run, which is up to
-    /// [`PROBE_INTERVAL`] plus [`PROBE_JITTER`] after [`Self::start_health_probe`].
+    /// `PROBE_INTERVAL` plus `PROBE_JITTER` after [`Self::start_health_probe`].
     /// A caller that needs an answer before then wants
     /// [`Self::preconnect_report`], which probes on the spot.
     ///

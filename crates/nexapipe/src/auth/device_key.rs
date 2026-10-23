@@ -10,35 +10,23 @@
 //! the device can produce.
 //!
 //! What is signed is the same byte string the HMAC path signs, defined once in
-//! [`sign_message`] and called from both — so whichever credential answers, the
-//! handshake proves the same thing: this client saw this connection's nonce at
-//! this time.
+//! [`nexapipe_proto::auth::challenge_message`] and called from both — so
+//! whichever credential answers, the handshake proves the same thing: this
+//! client saw this connection's nonce at this time.
 //!
 //! The client half — generating a key and signing with it — lives in
-//! `crates/nexapipe-client/src/auth.rs`. The two definitions of the message are
-//! hand-synced, as every other duplicated definition of this wire protocol is.
+//! `crates/nexapipe-client/src/auth.rs`. The message it signs is the same one
+//! this module verifies against, because both sides link the definition in
+//! `nexapipe-proto` rather than each keeping a copy of it.
 
 use iroh::PublicKey;
+use nexapipe_proto::auth::challenge_message;
 
 /// The length of a device public key, in bytes.
 pub const PUBLIC_KEY_LEN: usize = PublicKey::LENGTH;
 
 /// The length of a device public key's stored spelling: lowercase hex.
 pub const PUBLIC_KEY_HEX_LEN: usize = PUBLIC_KEY_LEN * 2;
-
-/// The message a proof covers: the connection's nonce, then the client's
-/// timestamp as little-endian bytes.
-///
-/// [`super::totp::hmac_signature`] builds its HMAC over the same bytes this
-/// returns, so the key path and the secret path cannot drift into proving
-/// different things. Keep in sync with `TwoFactorAuth::sign_challenge` in
-/// `crates/nexapipe-client/src/auth.rs`.
-pub(crate) fn sign_message(nonce: &[u8], timestamp: i64) -> Vec<u8> {
-    let mut message = Vec::with_capacity(nonce.len() + 8);
-    message.extend_from_slice(nonce);
-    message.extend_from_slice(&timestamp.to_le_bytes());
-    message
-}
 
 /// The stored spelling of a public key: lowercase hex.
 pub fn public_key_hex(key: &PublicKey) -> String {
@@ -88,7 +76,7 @@ pub(crate) fn ed25519_verify(
     let Ok(signature) = iroh::Signature::try_from(signature) else {
         return false;
     };
-    key.verify(&sign_message(nonce, timestamp), &signature)
+    key.verify(&challenge_message(nonce, timestamp), &signature)
         .is_ok()
 }
 
@@ -169,7 +157,7 @@ mod tests {
         let nonce = test_nonce(0x5a);
         let timestamp = 0x0102030405060708i64;
 
-        let signed = sign_message(&nonce, timestamp);
+        let signed = challenge_message(&nonce, timestamp);
 
         assert_eq!(
             &signed[..nonce.len()],
@@ -181,7 +169,7 @@ mod tests {
             &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01],
             "then that timestamp as little-endian bytes"
         );
-        assert_eq!(sign_message(&[], 0), vec![0; 8]);
+        assert_eq!(challenge_message(&[], 0), vec![0; 8]);
     }
 
     /// The round trip the key path rests on: what the private half signs over
@@ -192,7 +180,7 @@ mod tests {
         let nonce = test_nonce(0x11);
         let timestamp = 1_700_000_000i64;
 
-        let signature = key.sign(&sign_message(&nonce, timestamp));
+        let signature = key.sign(&challenge_message(&nonce, timestamp));
 
         assert!(ed25519_verify(
             &key.public(),
@@ -212,7 +200,7 @@ mod tests {
         let nonce = test_nonce(0x11);
         let timestamp = 1_700_000_000i64;
 
-        let signature = device.sign(&sign_message(&nonce, timestamp));
+        let signature = device.sign(&challenge_message(&nonce, timestamp));
 
         assert!(!ed25519_verify(
             &stranger.public(),
@@ -231,7 +219,7 @@ mod tests {
         let key = SecretKey::generate();
         let nonce = test_nonce(0x11);
         let timestamp = 1_700_000_000i64;
-        let signature = key.sign(&sign_message(&nonce, timestamp));
+        let signature = key.sign(&challenge_message(&nonce, timestamp));
         let mut flipped = signature.to_bytes();
         flipped[0] ^= 0x01;
 

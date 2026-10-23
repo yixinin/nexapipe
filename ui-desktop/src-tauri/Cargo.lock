@@ -3591,7 +3591,6 @@ dependencies = [
  "fastrand",
  "futures-util",
  "hex",
- "hmac",
  "http",
  "http-body-util",
  "hyper",
@@ -3607,22 +3606,22 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "tokio",
  "tokio-stream",
  "totp-rs",
  "tracing",
  "url",
  "webpki-roots",
- "zeroize",
 ]
 
 [[package]]
 name = "nexapipe-proto"
 version = "1.0.0"
 dependencies = [
+ "hmac",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "zeroize",
 ]
 

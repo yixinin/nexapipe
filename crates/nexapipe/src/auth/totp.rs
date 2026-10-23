@@ -1,13 +1,8 @@
 //! TOTP validation logic.
 
 use super::config::{AuthConfig, TotpAlgorithm};
-use hmac::{Hmac, KeyInit, Mac};
 use nexapipe_proto::secret::SecretBytes;
-use sha2::Sha256;
 use totp_rs::{Algorithm, Builder, Secret};
-
-/// HMAC-SHA256 keyed by the client's TOTP secret.
-type HmacSha256 = Hmac<Sha256>;
 
 /// How far an AUTH_RESPONSE timestamp may sit from the server clock, in
 /// seconds. The signature already pins the response to one challenge; the
@@ -258,25 +253,22 @@ impl<'a> TotpValidator<'a> {
 /// The signature a client attaches to AUTH_RESPONSE:
 /// HMAC-SHA256(secret, nonce || timestamp.to_le_bytes()).
 ///
-/// The message is built by [`super::device_key::sign_message`], the one
-/// definition both proof paths use — a key-based device signs these same bytes
-/// with Ed25519, so what a response proves does not depend on which credential
-/// answered it.
+/// The message and the HMAC over it live in
+/// [`nexapipe_proto::auth::hmac_challenge`], the one definition both sides
+/// link — a key-based device signs the same bytes with Ed25519, so what a
+/// response proves does not depend on which credential answered it, and
+/// neither half can drift from the other.
 ///
-/// Keep in sync with `TwoFactorAuth::sign_challenge` in
-/// `crates/nexapipe-client/src/auth.rs`.
+/// The error is this crate's own rather than the protocol crate's, because
+/// this is where the refusal is worded: a secret the HMAC will not take is
+/// `InvalidSecret` here.
 pub(crate) fn hmac_signature(
     secret: &[u8],
     nonce: &[u8],
     timestamp: i64,
 ) -> Result<Vec<u8>, AuthError> {
-    // Fallible in the type only: HMAC takes a key of any length — a long one is
-    // hashed, a short one is zero-padded — so this has never failed. It is
-    // returned rather than `expect`ed because it runs inside a handshake, where
-    // a panic would drop the connection with nothing to report.
-    let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| AuthError::InvalidSecret)?;
-    mac.update(&super::device_key::sign_message(nonce, timestamp));
-    Ok(mac.finalize().into_bytes().to_vec())
+    nexapipe_proto::auth::hmac_challenge(secret, nonce, timestamp)
+        .map_err(|_| AuthError::InvalidSecret)
 }
 
 /// Length-safe constant-time comparison: an HMAC-SHA256 tag is never secret
@@ -779,7 +771,7 @@ mod tests {
         let nonce = fresh_nonce();
         let timestamp = current_timestamp();
 
-        let signature = key.sign(&crate::auth::device_key::sign_message(&nonce, timestamp));
+        let signature = key.sign(&nexapipe_proto::auth::challenge_message(&nonce, timestamp));
 
         let outcome = validator.verify_response(
             "alice",
@@ -808,7 +800,7 @@ mod tests {
         let timestamp = current_timestamp();
 
         let stranger = iroh::SecretKey::generate();
-        let signature = stranger.sign(&crate::auth::device_key::sign_message(&nonce, timestamp));
+        let signature = stranger.sign(&nexapipe_proto::auth::challenge_message(&nonce, timestamp));
 
         let outcome = validator.verify_response(
             "alice",
@@ -864,7 +856,7 @@ mod tests {
         let timestamp = current_timestamp();
 
         let stranger = iroh::SecretKey::generate();
-        let signature = stranger.sign(&crate::auth::device_key::sign_message(&nonce, timestamp));
+        let signature = stranger.sign(&nexapipe_proto::auth::challenge_message(&nonce, timestamp));
 
         let outcome = validator.verify_response(
             "alice",
@@ -890,7 +882,7 @@ mod tests {
         let nonce = fresh_nonce();
         let timestamp = current_timestamp() - 3600;
 
-        let signature = key.sign(&crate::auth::device_key::sign_message(&nonce, timestamp));
+        let signature = key.sign(&nexapipe_proto::auth::challenge_message(&nonce, timestamp));
 
         let outcome = validator.verify_response(
             "alice",

@@ -119,6 +119,51 @@ pub fn set_labels(app: &AppHandle, show_label: &str, quit_label: &str) -> tauri:
     Ok(())
 }
 
+/// Longest status the tray will show.
+///
+/// A tooltip is a line, and a Linux title sits next to an icon in a panel
+/// narrower than most of the strings this app could produce. Long enough for
+/// every wording, short enough that it cannot fill the panel.
+const MAX_STATUS_LEN: usize = 64;
+
+/// Whether a status may be written to the tray.
+///
+/// The text goes straight to a native tooltip and a native title, so it has to
+/// be a single line of ordinary characters: a newline would make the tray show
+/// two lines, and a control character could reach the platform's own drawing
+/// code. A status that is refused is dropped rather than trimmed, because a
+/// trimmed status says something the caller did not.
+pub fn is_writable_status(status: &str) -> bool {
+    status.chars().count() <= MAX_STATUS_LEN && !status.chars().any(|c| c.is_control())
+}
+
+/// Writes the connection state onto the tray icon.
+///
+/// The state is a word rather than a colour: the icon is the app's only always-on
+/// surface, and "Connected" beside it says what a coloured dot would, without
+/// asking the user to learn what the colour means.
+///
+/// Two surfaces, because the platforms do not offer the same one. A tooltip is
+/// unsupported on Linux — the appindicator backend has no tooltip — and the title
+/// is unsupported on Windows. Each platform uses the one it has, so the state is
+/// visible everywhere rather than on some desktops and not others.
+///
+/// Best effort: a tray that cannot be written to is still a working tray, and the
+/// failure is logged rather than raised.
+pub fn set_status(app: &AppHandle, status: &str) -> tauri::Result<()> {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return Ok(());
+    };
+
+    #[cfg(target_os = "linux")]
+    let result = tray.set_title(Some(status));
+
+    #[cfg(not(target_os = "linux"))]
+    let result = tray.set_tooltip(Some(status));
+
+    result
+}
+
 /// The menu itself.
 ///
 /// Rebuilt rather than patched: a menu's items are what it is, and swapping one
@@ -157,4 +202,46 @@ pub(crate) fn show_window(app: &AppHandle) {
 /// over, exactly as the macOS menu item does.
 fn ask_to_quit(app: &AppHandle) {
     crate::quit::ask(app);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_writable_status, MAX_STATUS_LEN};
+
+    #[test]
+    fn an_ordinary_status_is_writable() {
+        // Every wording the renderer sends: a name and a state, in two languages.
+        for status in [
+            "Nexa — Connected",
+            "Nexa — Not connected",
+            "Nexa — Connection failed",
+            "Nexa — 已连接",
+        ] {
+            assert!(is_writable_status(status), "{status}");
+        }
+    }
+
+    #[test]
+    fn a_status_with_a_newline_is_refused() {
+        // The text goes into a native tooltip, and a newline there is a second
+        // line in the tray rather than the state the caller wrote.
+        assert!(!is_writable_status("Nexa — Connected\nspoofed"));
+        assert!(!is_writable_status("\n"));
+    }
+
+    #[test]
+    fn a_status_with_a_control_character_is_refused() {
+        // A control character reaches the platform's own drawing code, which is
+        // not where a status belongs.
+        assert!(!is_writable_status("Nexa — Connected\u{7}"));
+        assert!(!is_writable_status("Nexa — Connected\t"));
+    }
+
+    #[test]
+    fn a_status_that_is_too_long_is_refused() {
+        // A Linux title sits next to an icon in a narrow panel.
+        let too_long = "x".repeat(MAX_STATUS_LEN + 1);
+        assert!(!is_writable_status(&too_long));
+        assert!(is_writable_status(&"x".repeat(MAX_STATUS_LEN)));
+    }
 }

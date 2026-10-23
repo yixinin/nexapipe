@@ -151,11 +151,34 @@ function toggleAutoStart(): void {
  * A preference rather than a proxy setting, so it lives with the theme and the
  * language.
  */
-const { prefs, setMinimizeOnClose } = usePrefsStore();
+const { prefs, setMinimizeOnClose, setSilentStart, setAutoConnect } = usePrefsStore();
 
 const minimizeOnClose = computed({
   get: () => prefs.minimizeOnClose,
   set: (value: boolean) => setMinimizeOnClose(value),
+});
+
+/**
+ * Whether a launch the machine asked for shows a window.
+ *
+ * A preference rather than a proxy setting, so it lives with the theme and the
+ * language: it is a statement about how the app should appear, not about how it
+ * was started.
+ */
+const silentStart = computed({
+  get: () => prefs.silentStart,
+  set: (value: boolean) => setSilentStart(value),
+});
+
+/**
+ * Whether the tunnel comes up by itself after a restart.
+ *
+ * Off until the user says otherwise: a proxy that reconnects on its own
+ * forwards traffic on its own.
+ */
+const autoConnect = computed({
+  get: () => prefs.autoConnect,
+  set: (value: boolean) => setAutoConnect(value),
 });
 
 /**
@@ -356,7 +379,40 @@ loadAppVersion();
             </button>
           </div>
         </div>
-        
+
+        <div class="setting-item">
+          <div class="setting-left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M4 12a8 8 0 0 1 16 0"/>
+              <path d="M12 12l4-4"/>
+              <circle cx="12" cy="12" r="2"/>
+            </svg>
+            <div class="setting-info">
+              <span class="setting-label">{{ t('settings.autoConnect') }}</span>
+              <span class="setting-hint">{{ t('settings.autoConnectHint') }}</span>
+            </div>
+          </div>
+          <div class="setting-right">
+            <AppToggle v-model="autoConnect" :label="t('settings.autoConnect')" />
+          </div>
+        </div>
+
+        <div class="setting-item">
+          <div class="setting-left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+              <circle cx="12" cy="12" r="3"/>
+            </svg>
+            <div class="setting-info">
+              <span class="setting-label">{{ t('settings.silentStart') }}</span>
+              <span class="setting-hint">{{ t('settings.silentStartHint') }}</span>
+            </div>
+          </div>
+          <div class="setting-right">
+            <AppToggle v-model="silentStart" :label="t('settings.silentStart')" />
+          </div>
+        </div>
+
         <div class="setting-item">
           <div class="setting-left">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

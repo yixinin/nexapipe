@@ -54,8 +54,8 @@
 //! The preface carries a host name, and both sides have to agree on what a
 //! name means: the client decides whether a name is one it proxies, the
 //! server decides whether a name is one a route serves. That agreement is one
-//! rule, and it lives here — see [`host`] for the rule itself and for why it
-//! used to be three.
+//! rule, and it lives here — see [`host_matches`] for the rule itself and for
+//! why it used to be three.
 //!
 //! # First byte back
 //!
@@ -72,6 +72,7 @@
 
 pub mod alpn;
 pub mod auth;
+pub mod deadline;
 mod host;
 mod preface;
 pub mod protocol;
@@ -83,6 +84,7 @@ pub use auth::{
     Algorithm, AuthMessage, CodecError, Format, MAX_CLIENT_ID_LEN, MAX_DEVICE_ID_LEN,
     VERSION_BINARY, VERSION_JSON, is_presentable_client_id, is_presentable_device_id,
 };
+pub use deadline::{HEADER_SECS, STREAM_SECS, TLS_HELLO_SECS};
 pub use host::{
     host_and_port, host_matches, host_matches_any, normalize_host, normalize_pattern, pattern_error,
 };

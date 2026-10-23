@@ -13,7 +13,7 @@ repos with their git history preserved):
 | --- | --- |
 | `crates/nexapipe/` | The server: iroh endpoint, L7 router, TLS passthrough, L4 tunnel, 2FA |
 | `crates/nexapipe-client/` | The client library (`rlib` + `cdylib` + UniFFI) |
-| `crates/nexapipe-proto/` | The L4 wire format, dependency-free and shared by both sides |
+| `crates/nexapipe-proto/` | The wire format and the rules both sides share, linked by both |
 | `ui-android/` | Android app (Kotlin + Compose), formerly `open-nexa/nexa-android` |
 | `ui-desktop/` | Tauri 2 desktop app (Vue 3), formerly `open-nexa/nexa-desktop` |
 

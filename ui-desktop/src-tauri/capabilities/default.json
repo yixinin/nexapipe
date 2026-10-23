@@ -55,6 +55,7 @@
     "allow-reveal-node-id",
     "allow-set-auto-start",
     "allow-set-tray-labels",
+    "allow-set-tray-status",
     "allow-start-proxy",
     "allow-start-service",
     "allow-stop-proxy",

@@ -149,6 +149,9 @@ const connectionLabel = computed(() => {
 
 /** The mode the proxy is *actually* running in, which is not always the one that was asked for. */
 const modeLabel = computed(() => {
+  // The state could not be read, which is not the same as not running: the service owns the
+  // tunnel and this process cannot see it. Saying "not running" would be a guess.
+  if (status.value.mode === 'unknown') return t('status.unknown');
   if (!status.value.running) return t('mode.not_running');
   return status.value.mode === 'tun' ? t('mode.tun') : t('mode.local_proxy');
 });

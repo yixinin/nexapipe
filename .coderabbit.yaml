@@ -81,7 +81,8 @@ reviews:
 
     - path: "crates/nexapipe-proto/**"
       instructions: |
-        This is the dependency-free L4 wire format shared by the server and the client.
+        This is the wire format and the rules both sides share, linked by the server and the
+        client so that a rule is written down once.
         Flag any magic, version, status-byte or framing change that is not mirrored on
         BOTH sides: the server half in `crates/nexapipe/src/l4/` and the client half in
         `crates/nexapipe-client/src/l4.rs`. New fields need explicit byte widths and
@@ -148,8 +149,10 @@ reviews:
     - path: "**/*.toml"
       instructions: |
         Workspace manifests. Flag feature combinations that would break the client's
-        platform matrix, dependencies added to `crates/nexapipe-proto` (it must stay
-        dependency-free), and version fields that the release workflow reads.
+        platform matrix, dependencies added to `crates/nexapipe-proto` (it must stay cheap to
+        build for the Android target, so a dependency both link crates already pull in costs
+        nothing and one they do not is a cost), and version fields that the release workflow
+        reads.
 
     - path: ".github/workflows/**"
       instructions: |

@@ -80,23 +80,15 @@ const MAX_CONCURRENT_STREAMS_PER_CONNECTION: usize = 256;
 /// These travel in the CONNECTION_CLOSE frame, so a client can read them from
 /// its `close_reason()` and tell "you never authenticated" apart from "your code
 /// was rejected" — the difference between a misconfigured client and a wrong
-/// TOTP code. Keep in sync with `AUTH_REQUIRED_CLOSE_CODE` in
-/// `crates/nexapipe-client/src/connection_pool.rs`.
-pub(crate) mod auth_close_code {
-    /// No AUTH_START arrived within the handshake deadline: the server requires
-    /// 2FA the client did not perform.
-    pub const REQUIRED: u32 = 2;
-    /// The handshake ran, but the client is unknown or its code was rejected.
-    pub const REJECTED: u32 = 3;
-    /// The peer already holds as many connections as it is allowed, so this one
-    /// is closed without any traffic being served on it.
-    pub const TOO_MANY: u32 = 4;
-    /// The credential this connection authenticated with is gone: `nexapipe
-    /// client revoke` struck the client, or the device, out of `[auth]` while
-    /// this connection was open. Five belongs to `[peers]` in
-    /// [`crate::conn::allow_list`], which is why the numbers are not adjacent.
-    pub const REVOKED: u32 = 6;
-}
+/// TOTP code.
+///
+/// The numbers themselves live in [`nexapipe_proto::auth::close_code`], which
+/// the client links too. They used to be written down here and kept in step
+/// with the client's copy by a comment in each, which is the whole failure
+/// mode of a protocol written down twice: a code changed on one side and not
+/// the other is a client that reports a mysterious connection loss instead of
+/// the reason it was given one.
+pub(crate) use nexapipe_proto::auth::close_code as auth_close_code;
 
 /// The live 2FA state a connection authenticates against.
 ///

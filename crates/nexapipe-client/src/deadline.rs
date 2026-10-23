@@ -6,11 +6,10 @@
 //! local process can open. Two of the five timeout gaps in the 2026-10-10 audit
 //! were here.
 //!
-//! It is a separate module rather than a shared one because `nexapipe-client`
-//! does not depend on `nexapipe` — the dependency runs the other way, and the
-//! wire format crate in between carries the L4 framing rather than anything to do
-//! with time. The constants are therefore restated rather than imported, and a
-//! change to one side has to be made on the other by hand.
+//! The three constants both sides use live in `nexapipe-proto`, which they both
+//! link — so they are imported rather than restated, and a change to one is a
+//! change to both. What is left here is this side's own budget, and the
+//! distinction below.
 //!
 //! The distinction the server's module draws is drawn here too:
 //!
@@ -29,7 +28,7 @@ use std::time::Duration;
 /// sends one byte of `Host:` every twenty seconds wants: the read that arrives
 /// resets the clock, so the connection, its task and its slot stay pinned to a
 /// client that is never going to finish.
-pub const HEADER_SECS: u64 = 30;
+pub const HEADER_SECS: u64 = nexapipe_proto::HEADER_SECS;
 
 /// Seconds a TLS ClientHello may take to arrive.
 ///
@@ -37,7 +36,7 @@ pub const HEADER_SECS: u64 = 30;
 /// the header tells us how long the body is, and the read that fetches it had no
 /// bound at all — so a client that sent the five bytes and nothing else held the
 /// connection open indefinitely.
-pub const TLS_HELLO_SECS: u64 = 10;
+pub const TLS_HELLO_SECS: u64 = nexapipe_proto::TLS_HELLO_SECS;
 
 /// Seconds a proxied byte copy may run before it is abandoned.
 ///
@@ -45,7 +44,7 @@ pub const TLS_HELLO_SECS: u64 = 10;
 /// where silence is normal and the session is meant to last. It exists so that a
 /// copy loop cannot hold its resources for the life of the process, not to shape
 /// traffic.
-pub const STREAM_SECS: u64 = 3600;
+pub const STREAM_SECS: u64 = nexapipe_proto::STREAM_SECS;
 
 /// The phase budgets, as durations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

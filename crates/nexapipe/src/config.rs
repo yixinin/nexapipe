@@ -151,7 +151,7 @@ pub struct IrohConfig {
     /// [`Self::secret_key_file`] for the relay bearer token.
     pub relay_auth_token_file: Option<String>,
     /// Where `secret_key` was resolved from. Filled by
-    /// [`ProxyConfig::resolve_external_credentials`] during the load; not
+    /// `ProxyConfig::resolve_external_credentials` during the load; not
     /// spelled in the file, so `serde` skips it.
     #[serde(skip)]
     pub secret_key_source: CredentialSource,
@@ -2415,7 +2415,7 @@ impl ProxyConfig {
     /// device to trade the same link for the same credential.
     ///
     /// The entry lands where [`Self::write_device_credential`] puts one: both
-    /// writers go through [`device_table`] and [`device_entry`], so a device
+    /// writers go through `device_table` and `device_entry`, so a device
     /// that spent a token and one an operator wrote by hand are the same shape
     /// on disk.
     pub fn complete_device_enrollment(

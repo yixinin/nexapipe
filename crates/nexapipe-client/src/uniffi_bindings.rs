@@ -436,13 +436,12 @@ impl LocalProxy {
 impl ProxyClient {
     /// The work behind the constructor.
     async fn create(config: ClientConfig) -> Result<Self, ClientError> {
-        let strategy = match config.load_balancing.as_deref().map(str::trim) {
-            None | Some("") | Some("round_robin") => LoadBalancingStrategy::RoundRobin,
-            Some("random") => LoadBalancingStrategy::Random,
-            Some(other) => {
-                return Err(ClientError::InvalidConfig(format!(
-                    "Unknown load balancing strategy: {other}"
-                )));
+        // The rule is the enum's own, in `crate::lb`: the binding layer says
+        // what the caller asked for and nothing about which names mean what.
+        let strategy = match config.load_balancing.as_deref() {
+            None | Some("") => LoadBalancingStrategy::RoundRobin,
+            Some(name) => {
+                LoadBalancingStrategy::from_name(name).map_err(ClientError::InvalidConfig)?
             }
         };
 

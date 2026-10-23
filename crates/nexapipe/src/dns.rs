@@ -11,8 +11,8 @@
 //!
 //! # What is cached, and for how long
 //!
-//! A name that resolved is remembered for [`POSITIVE_TTL`], and a name that
-//! does **not** exist is remembered for [`NEGATIVE_TTL`] — much shorter,
+//! A name that resolved is remembered for `POSITIVE_TTL`, and a name that
+//! does **not** exist is remembered for `NEGATIVE_TTL` — much shorter,
 //! because a name that failed is often a backend that has just come up, and
 //! the next flow should find it.
 //!

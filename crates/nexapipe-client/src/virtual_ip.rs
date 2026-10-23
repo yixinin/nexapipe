@@ -160,7 +160,7 @@ impl Pool {
 
     /// The address for `domain`, allocating one on first use.
     fn alloc(&mut self, domain: &str) -> u128 {
-        let key = normalise(domain);
+        let key = crate::domains::fold_domain(domain);
 
         // A domain that already has an address keeps it: the application may be
         // holding a connection open against it, and moving the address would
@@ -312,15 +312,6 @@ impl IpMapping {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
-}
-
-/// Fold a name to the form both maps are keyed on.
-///
-/// DNS names are case-insensitive and a fully qualified name may carry a
-/// trailing dot; `Example.COM.` and `example.com` are the same name and must not
-/// get two addresses.
-fn normalise(domain: &str) -> String {
-    domain.trim().trim_end_matches('.').to_lowercase()
 }
 
 #[cfg(test)]

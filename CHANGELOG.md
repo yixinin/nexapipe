@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Twenty-seven things land in this cycle so far: the device credential can be a **key**
+Thirty-one things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -28,7 +28,10 @@ config file can say rather than only an environment variable can, a name is
 spelled the same way in a client's list and in the server's routes, a client
 can be held to the ports it may reach and not only to the names, both clients
 can say how far away the path carrying the traffic is, the desktop app can
-stay in the tray instead of ending with its window, the third-party boundary
+stay in the tray instead of ending with its window, the desktop app can bring
+the tunnel back by itself after a restart, a login launch can show its window
+when the user wants to see it, the tray icon says whether the tunnel is up,
+the third-party boundary
 is two settings now rather than one, the Android app can bring the tunnel back
 after a restart, the Android client picks its address block instead of
 hard-coding one, the server's runtime state lives in a file of its own beside
@@ -46,7 +49,8 @@ a name with a control byte in front of it, a UDP flow's queue is bounded by
 bytes rather than only by datagrams, the local proxy holds two buffers per
 connection rather than three, a 2FA code from a step that has gone by is
 refused, the price of a second connection is measured now — it comes to a
-handshake, and the protocol is chosen at the handshake.
+handshake, the protocol is chosen at the handshake, and the pool's ceiling
+is counted per protocol.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -520,6 +524,29 @@ lookup, which is what a config written before the key existed does.
   keeps ending the app, because a hidden window with nowhere to come back from
   is an app nobody can reach.
 
+- **The desktop app can come back by itself.** A machine that woke up with the
+  tunnel down was a machine that forwarded nothing until someone opened the app
+  and pressed a button. "Connect after login" brings it up by itself, and it is
+  off until the user says otherwise: a proxy that reconnects on its own forwards
+  traffic on its own. It only happens for a launch the *machine* asked for — a
+  launch the user made is a launch the user is already looking at.
+
+- **A login launch can show its window.** The start-up entry used to mean one
+  thing: the app comes up in the tray, and there was no way to ask otherwise.
+  "Start silently" is now a preference, on by default, so a user who wants to
+  see the app arrive at login can have it — without the entry being rewritten,
+  because "the machine started this" and "this launch should be quiet" are two
+  different statements and are now two different things.
+
+- **The tray icon says whether the tunnel is up.** The icon is the app's only
+  always-on surface, and a window nobody opened is a window nobody is looking
+  at; the state was only visible by opening the app. The icon now carries it as
+  a word — "Nexa — Connected" — because a coloured dot would ask the user to
+  learn what the colour means. A failure says so too, rather than the same word
+  as "not connected": one is a switch that is off, the other is a switch that
+  was turned on and did not work. It is a state, not a control: the menu still
+  offers exactly what it did.
+
 - **`allow_ports` limits a client to the services it may reach.** `allow_hosts`
   says which *names* a client may reach, and a name is not a service: a host
   that answers on three ports is one name and three things to reach. The new
@@ -771,6 +798,22 @@ lookup, which is what a config written before the key existed does.
 
 ### Changed
 
+- **A `[local_proxy] strategy` the client cannot honour stops the local proxy
+  instead of being ignored.** The local proxy balances over a list of
+  *servers* and picks one of them for a connection, so the strategies it has
+  are `round_robin` and `random`. `least_conn` — which picks the backend of a
+  route with the fewest requests outstanding to it — is the server's own
+  strategy, and it means nothing to a client that is choosing between servers
+  it does not measure.
+  It used to answer **every** name it did not have with round-robin: a
+  `[local_proxy] strategy = "least_conn"`, or a misspelling of a name that
+  does exist, produced a proxy that ran round-robin while the file said
+  something else, and nothing reported the difference. The name is refused now,
+  the message says which names there are, and the process says so instead of
+  running on a strategy the file did not ask for.
+  The **routes'** own `strategy` key is untouched: `least_conn` is still what
+  it means there, and still what it does.
+
 - **The tunnel's congestion controller is BBR rather than Cubic.** Cubic is a
   loss-based controller: it reads a loss as "the link is congested" and cuts its
   window. On a long international path the loss is usually *noise* rather than
@@ -1003,6 +1046,70 @@ lookup, which is what a config written before the key existed does.
   five consecutive connect failures, where it used to return 502 each time.
 
 ### Fixed
+
+- **The client's own documentation builds without a warning.** `cargo doc -p
+  nexapipe-client` reported sixteen. Fifteen of them were links that pointed at
+  nothing: five named a thing the crate does not have — `Secret::expose_secret`,
+  which is `nexapipe_proto::secret::Secret`'s method and not one of the
+  client's own; `Self::two_factor`, which is a field of the pool's inner struct
+  and not an item of the pool; `Weak`, which is `std::sync::Weak`; and
+  `TunProxy::new` twice, which exists only on Android and so cannot be linked
+  from a page the desktop reads too — and ten linked to an item the crate keeps
+  to itself, so they rendered as text with a link that went nowhere. The
+  sixteenth was not a link at all: the JNI crate's note on the pkarr path
+  spelled a zone as `<z32>`, which rustdoc read as an unclosed HTML tag.
+
+  The links now point at the names that are really there, the two that could
+  name a path name it, and the ones that have no public name to point at are
+  code, the way the crate's other prose refers to them. `TunProxy::new` is
+  code on every host, because a link to it is broken on every host but one.
+
+- **The desktop app's own documentation builds without a warning.** `cargo doc`
+  in `ui-desktop/src-tauri` reported five. Three linked to `accept_invite`, a
+  Tauri command the crate keeps to itself — all forty-two of its commands are
+  private — so they rendered as text with a link that went nowhere. The other
+  two named functions the crate does not have: `token_matches_any` and
+  `read_token`, both of which went when the service's answer stopped being
+  "the first token found" and became "any published token, proved by a
+  challenge", and the prose that pointed at them was left behind. The links
+  now name the functions that are really there.
+
+- **The peer registry's documentation had a stray marker in it.** Fixing the
+  broken links in the entry below moved a line break in the module comment of
+  `conn::peers`, and the `//!` that used to end the line was left standing
+  where the sentence should have stopped: the rendered page said "closes.//!"
+  and ran the paragraph that follows straight into it. The marker is gone, and
+  the two paragraphs are two paragraphs again.
+
+- **The server's own documentation builds without a warning.** `cargo doc -p
+  nexapipe` reported eighteen, and every one of them was a link that pointed
+  at nothing: nine named a thing the crate does not have — `Self::kind` on
+  `BackendLookup`, where the method that tells the two refusals apart is
+  `reason`; `ConnectionLimiter::new`, whose name was right and whose path was
+  missing; `Connection`, which is iroh's type; `Bytes`, which is
+  `bytes::Bytes` — and nine linked to an item the crate keeps to itself, so
+  they rendered as text with a link that went nowhere. The links now point at
+  the names that are really there, and the ones that have no public name to
+  point at are code, the way the crate's other prose refers to them.
+
+- **The connection pool's ceiling is counted per protocol.** The protocol a
+  connection carries is chosen at the handshake, so a connection opened for
+  HTTP cannot carry an L4 tunnel, and the two cannot take each other's place.
+  The pool counted them together against one ceiling of ten: a protocol that
+  needed a connection of its own was refused — the connection was closed on
+  the spot and the flow failed with "the connection pool is full" — while
+  the other protocols' connections sat idle in the pool, unable to serve it.
+  The ceiling is now ten per protocol, and each protocol is counted on its
+  own.
+
+- **The crate's own documentation builds without a warning.** `cargo doc -p
+  nexapipe-proto` reported five: two links to an `ALPN_LEGACY` that the crate
+  never had — the constants are `ALPN_NEXAPIPE` and `ALPN_NEXAPIPE_LEGACY`,
+  and the two name different spellings — one to the private `preface` module,
+  one to a private `host`, and one to a `PREFACE_MAGIC` that was not in scope
+  where it was named. The links now point at the names that are really there,
+  and the prose says which spelling is the generic one and which is the one
+  that predates the prefix byte.
 
 - **The protocol's name on the wire is the name.** The ALPN was
   `"\x05nexapipe"` — the byte the L4 preface starts with, in front of the name.

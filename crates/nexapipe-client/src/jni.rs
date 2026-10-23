@@ -440,17 +440,8 @@ impl OverrideResolver {
     /// stored without the dot would otherwise never be found, and the query
     /// would fall through to the resolver the override exists to avoid.
     fn override_for(&self, host: &str) -> Option<&Vec<IpAddr>> {
-        self.overrides.get(&override_key(host))
+        self.overrides.get(&crate::domains::fold_domain(host))
     }
-}
-
-/// The key a domain is stored and looked up under.
-///
-/// A name and the same name with a trailing dot are the same name, and DNS
-/// names are case-insensitive, so both are folded away on the way in and on
-/// the way out.
-fn override_key(domain: &str) -> String {
-    domain.trim().trim_end_matches('.').to_lowercase()
 }
 
 impl fmt::Debug for OverrideResolver {
@@ -715,7 +706,7 @@ fn set_dns_servers(env: &mut Env<'_>, dns_servers: JString) -> jint {
 /// "domain=ip1,ip2;domain2=ip3,ip4". This function parses and stores them in DNS_OVERRIDES.
 /// OverrideResolver returns the pre-resolved IPs directly for these domains, bypassing hickory's
 /// UDP DNS queries (the GFW drops UDP DNS responses for iroh.link domains).
-/// This lets pkarr resolve (HTTPS to dns.iroh.link/pkarr/<z32>) reach iroh's pkarr server and fetch
+/// This lets pkarr resolve (HTTPS to dns.iroh.link/pkarr/`<z32>`) reach iroh's pkarr server and fetch
 /// the target node's EndpointInfo (relay URL + direct addr), even if DNS TXT is blocked by the GFW.
 /// Must be called before nativeStartIroh.
 #[unsafe(no_mangle)]
@@ -751,7 +742,7 @@ fn set_dns_override(env: &mut Env<'_>, overrides: JString) -> jint {
         }
         let mut parts = entry.splitn(2, '=');
         let domain = match parts.next() {
-            Some(d) => override_key(d),
+            Some(d) => crate::domains::fold_domain(d),
             None => continue,
         };
         if domain.is_empty() {
@@ -3138,14 +3129,17 @@ mod tests {
     #[test]
     fn an_override_is_found_however_the_name_is_spelled() {
         assert_eq!(
-            override_key("APS1-1.relay.n0.iroh.link."),
-            override_key("aps1-1.relay.n0.iroh.link")
+            crate::domains::fold_domain("APS1-1.relay.n0.iroh.link."),
+            crate::domains::fold_domain("aps1-1.relay.n0.iroh.link")
         );
         assert_eq!(
-            override_key("aps1-1.relay.n0.iroh.link."),
+            crate::domains::fold_domain("aps1-1.relay.n0.iroh.link."),
             "aps1-1.relay.n0.iroh.link"
         );
-        assert_eq!(override_key(" dns.iroh.link. "), "dns.iroh.link");
+        assert_eq!(
+            crate::domains::fold_domain(" dns.iroh.link. "),
+            "dns.iroh.link"
+        );
     }
 
     /// The lookup finds an override that was stored under the name without the
@@ -3156,7 +3150,7 @@ mod tests {
     fn an_override_stored_without_the_dot_is_found_with_it() {
         let mut overrides: HashMap<String, Vec<IpAddr>> = HashMap::new();
         overrides.insert(
-            override_key("aps1-1.relay.n0.iroh.link"),
+            crate::domains::fold_domain("aps1-1.relay.n0.iroh.link"),
             vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))],
         );
         let resolver = OverrideResolver::new(Vec::new(), overrides);

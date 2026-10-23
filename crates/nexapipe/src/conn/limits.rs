@@ -442,7 +442,7 @@ fn cap_from_env(var: &str) -> Option<usize> {
 /// Concurrent streams the whole process may have in flight, unless the config or the
 /// environment overrides it.
 ///
-/// A multiple of [`MAX_CONCURRENT_STREAMS_PER_CONNECTION`] for the same reason
+/// A multiple of `MAX_CONCURRENT_STREAMS_PER_CONNECTION` for the same reason
 /// the global connection cap is a multiple of the per-peer one: it reads as "the
 /// peers you would plausibly have, each opening its own streams".
 pub const DEFAULT_MAX_STREAMS_GLOBAL: usize = 64 * 256;
@@ -516,9 +516,9 @@ const ENV_MAX_BODY_BYTES_GLOBAL: &str = "NEXAPIPE_MAX_BODY_BYTES";
 
 /// Counts the bytes held in request bodies across the process.
 ///
-/// What this bounds is memory: [`MAX_REQUEST_BODY`](crate::http::MAX_REQUEST_BODY) per
-/// request is defensible, and the same 64 MB times every stream the process will
-/// accept at once is not. This is the third ceiling for the same reason the other
+/// What this bounds is memory: `MAX_REQUEST_BODY` per request is defensible,
+/// and the same 64 MB times every stream the process will accept at once is
+/// not. This is the third ceiling for the same reason the other
 /// two are there — each one bounds a resource that the per-connection and per-peer
 /// numbers cannot bound on their own.
 ///
@@ -543,9 +543,9 @@ const ENV_MAX_BODY_BYTES_GLOBAL: &str = "NEXAPIPE_MAX_BODY_BYTES";
 /// A process-wide static rather than something threaded through every call: the
 /// bodies are read deep inside the HTTP path, and the alternative is a parameter
 /// on every function between the accept loop and the readers. The same trade
-/// [`config_write_gate`](crate::conn::config_write_gate) makes. A reader that
-/// needs a budget of its own takes it as a parameter — that is how the chunked
-/// reader is tested without touching the shared one.
+/// `config_write_gate` makes. A reader that needs a budget of its own takes it
+/// as a parameter — that is how the chunked reader is tested without touching
+/// the shared one.
 #[derive(Debug)]
 pub struct ByteBudget {
     held: AtomicUsize,

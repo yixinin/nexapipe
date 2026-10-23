@@ -238,9 +238,10 @@ impl Metrics {
     ///
     /// Written once, when the endpoint is built, because that is when the caps
     /// are resolved from the environment. A `usize::MAX` global — the shape
-    /// [`ConnectionLimiter::new`] builds — is published as `0` rather than as
-    /// 18446744073709551615: a scrape cannot tell "unlimited" from "a number too
-    /// large to be a real limit", and `0` is what a dashboard should divide by
+    /// [`ConnectionLimiter::new`](crate::conn::limits::ConnectionLimiter::new)
+    /// builds — is published as `0` rather than as 18446744073709551615: a
+    /// scrape cannot tell "unlimited" from "a number too large to be a real
+    /// limit", and `0` is what a dashboard should divide by
     /// to mean *do not alarm on this one*.
     pub fn record_connection_limits(&self, per_peer: usize, global: usize) {
         let per_peer = u64::try_from(per_peer).unwrap_or(u64::MAX);

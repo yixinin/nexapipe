@@ -31,7 +31,12 @@
   },
   "tray": {
     "show": "Open Nexa",
-    "quit": "Quit"
+    "quit": "Quit",
+    "connected": "Nexa — Connected",
+    "connecting": "Nexa — Connecting…",
+    "disconnected": "Nexa — Not connected",
+    "failed": "Nexa — Connection failed",
+    "unknown": "Nexa — State unknown"
   },
   "common": {
     "save": "Save",
@@ -74,7 +79,8 @@
   "status": {
     "running": "Running",
     "stopped": "Stopped",
-    "starting": "Starting…"
+    "starting": "Starting…",
+    "unknown": "State unknown"
   },
   "mode": {
     "tun": "TUN",
@@ -261,7 +267,11 @@
     "tunDeviceNameHint": "Virtual network interface name (auto-assigned on macOS; ignored there)",
     "app": "App Settings",
     "launchAtStartup": "Launch at Startup",
-    "launchAtStartupHint": "Automatically run the proxy when the app launches",
+    "launchAtStartupHint": "Start the app when you log in",
+    "autoConnect": "Connect after login",
+    "autoConnectHint": "Bring the tunnel up by itself after a restart",
+    "silentStart": "Start silently",
+    "silentStartHint": "Come up in the tray without a window at login",
     "minimizeOnClose": "Minimize on Close",
     "minimizeOnCloseHint": "Minimize to the system tray when the close button is clicked",
     "minimizeOnCloseUnavailable": "This desktop has no system tray, so closing the window still ends the app",

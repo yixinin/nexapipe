@@ -21,6 +21,28 @@ export interface Prefs {
    * closes is not the always-on proxy the setting promises.
    */
   minimizeOnClose: boolean;
+  /**
+   * Whether a launch the machine asked for shows a window.
+   *
+   * True by default: a window appearing over whatever the user was doing at
+   * login is exactly what a launch nobody asked for should not do. Turning it
+   * off says the opposite — this particular user wants to see the app come up.
+   *
+   * Only about launches the *machine* asked for. A launch the user made shows
+   * its window whatever this says, because the user is already looking at it.
+   */
+  silentStart: boolean;
+  /**
+   * Whether the tunnel is brought up by itself after a restart.
+   *
+   * False by default: a proxy that reconnects on its own forwards traffic on
+   * its own, and that is the user's decision to make rather than the app's.
+   *
+   * The same shape as the Android app's "connect after a restart", and for the
+   * same reason: the switch says the machine should come up protected, and it
+   * is off until someone asks for it.
+   */
+  autoConnect: boolean;
 }
 
 const STORAGE_KEY = 'nexapipe.prefs';
@@ -30,6 +52,8 @@ const defaultPrefs: Prefs = {
   locale: '',
   sidebarCollapsed: false,
   minimizeOnClose: true,
+  silentStart: true,
+  autoConnect: false,
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -59,6 +83,10 @@ function loadPrefs(): Prefs {
         typeof parsed.minimizeOnClose === 'boolean'
           ? parsed.minimizeOnClose
           : defaultPrefs.minimizeOnClose,
+      silentStart:
+        typeof parsed.silentStart === 'boolean' ? parsed.silentStart : defaultPrefs.silentStart,
+      autoConnect:
+        typeof parsed.autoConnect === 'boolean' ? parsed.autoConnect : defaultPrefs.autoConnect,
     };
   } catch (error) {
     console.error('[prefs] failed to load:', error);
@@ -97,6 +125,14 @@ export function usePrefsStore() {
     prefs.minimizeOnClose = minimize;
   }
 
+  function setSilentStart(silent: boolean): void {
+    prefs.silentStart = silent;
+  }
+
+  function setAutoConnect(auto: boolean): void {
+    prefs.autoConnect = auto;
+  }
+
   function toggleSidebar(): void {
     prefs.sidebarCollapsed = !prefs.sidebarCollapsed;
   }
@@ -107,6 +143,8 @@ export function usePrefsStore() {
     setLocale,
     setSidebarCollapsed,
     setMinimizeOnClose,
+    setSilentStart,
+    setAutoConnect,
     toggleSidebar,
   };
 }

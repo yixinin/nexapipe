@@ -27,11 +27,11 @@ use tokio::time::Instant;
 /// Docker, on the host against the mounted file) writes `pending_enrollment`
 /// into the file, and without a reload the enrollment link only worked after a
 /// restart. When an auth state is present, a reload swaps the clients table in
-/// the same pass; see [`ConfigWatcher::reload_auth`].
+/// the same pass; see `ConfigWatcher::reload_auth`.
 ///
 /// `enabled` now moves too, in one direction only: a reload may turn 2FA *on*
 /// (for connections opened after it), and is refused when it would turn 2FA
-/// *off*. See [`ConfigWatcher::apply_auth_enabled`].
+/// *off*. See `ConfigWatcher::apply_auth_enabled`.
 pub struct ConfigWatcher {
     config_path: String,
     route_config: Arc<RoutingTable>,

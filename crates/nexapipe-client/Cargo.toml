@@ -60,13 +60,11 @@ libc = { version = "0.2", optional = true }
 totp-rs = { version = "6.0", features = ["gen_secret", "zeroize"] }
 base32 = "0.5"
 hex = "0.4"
-hmac = "0.13"
-sha2 = "0.11"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
-# Wiping credentials from memory when they go out of scope; see
-# `src/secret.rs`, which is the only place this crate uses it.
-zeroize.workspace = true
+# The challenge a response answers is signed with HMAC-SHA256, and the
+# credential is wiped when it goes out of scope. Both live in `nexapipe-proto`
+# now, which both sides link — so neither the hash nor the wipe is named here.
 
 [features]
 default = ["native-certs", "tracing"]

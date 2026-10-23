@@ -14,7 +14,7 @@ use error::{codes, AppError};
 use nexapipe_client::auth::DeviceKey;
 use nexapipe_client::provisioning::{EndpointInvite, EndpointTarget};
 use proxy::{
-    ConnectionConfig, ProxyLoadBalancingStrategy, ProxyManager, ProxyManagerConfig,
+    ConnectionConfig, ProxyManager, ProxyManagerConfig,
     ProxyNodeConfig, StartError,
 };
 use serde::Serialize;
@@ -382,8 +382,7 @@ async fn start_proxy(
     }
 
     let load_balancing = load_balancing.unwrap_or_else(|| "round_robin".to_string());
-    let load_balancing: ProxyLoadBalancingStrategy = load_balancing
-        .parse()
+    let load_balancing = nexapipe_client::lb::LoadBalancingStrategy::from_name(&load_balancing)
         .map_err(|e: String| AppError::cause(codes::PROXY_INVALID_LOAD_BALANCING, e))?;
 
     let local_addr = local_addr.unwrap_or_else(|| "127.0.0.1:8080".to_string());
@@ -503,6 +502,10 @@ async fn get_proxy_status(use_service: Option<bool>) -> Result<ProxyStatus, AppE
             Some(mode) => ProxyStatus::running_with(mode),
             None => ProxyStatus::starting(),
         },
+        // No manager here, and the service could not be asked: the tunnel may be the service's,
+        // and this process cannot say. "Stopped" would be a guess, and the guess is what starts a
+        // second tunnel over a live one — so the state is reported as unknown instead.
+        None if use_service => ProxyStatus::unknown(),
         None => ProxyStatus::stopped(),
     })
 }
@@ -715,7 +718,7 @@ async fn close_node_flows(
 /// nothing secret crosses either: the connection string is masked by
 /// [`credentials::mask`], and a TOTP secret or enrollment token a code carries is
 /// not handed to the renderer at all. Showing an invite needs neither, and
-/// [`accept_invite`] is what files them once the user says yes.
+/// `accept_invite` is what files them once the user says yes.
 ///
 /// The fields cross into TypeScript, where `InvitePayload` in `src/types/index.ts` spells them
 /// camelCase. Nothing in Tauri rewrites the keys of a command result — every struct has to ask
@@ -746,7 +749,7 @@ pub struct InvitePayload {
 /// The enrollment half of an invite: a token to spend, not a secret to keep.
 ///
 /// What crosses is *that* there is one and who it is for. The token itself is
-/// filed by [`accept_invite`] and never reaches the renderer.
+/// filed by `accept_invite` and never reaches the renderer.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InviteEnrollmentPayload {
@@ -768,7 +771,7 @@ pub struct InviteTotpPayload {
     pub issuer: String,
 }
 
-/// What [`accept_invite`] answers: which node an invite belongs to, and
+/// What `accept_invite` answers: which node an invite belongs to, and
 /// everything about it that is not a credential.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1729,6 +1732,29 @@ async fn set_tray_labels(app: AppHandle, show_label: String, quit_label: String)
     }
 }
 
+/// Writes the connection state onto the tray icon.
+///
+/// The words come from the renderer, which is the only side that knows the status
+/// and the language it should be said in.
+///
+/// Refused rather than trimmed when the text is not one short line: the text goes
+/// straight to a native tooltip and a native title, and a caller that could put
+/// a newline or a control character there would be writing into another
+/// process's window.
+///
+/// Infallible on purpose, like [`set_tray_labels`]: the state on the tray is
+/// information, and a tray that cannot be written to is still a working tray.
+#[tauri::command]
+async fn set_tray_status(app: AppHandle, status: String) {
+    if !tray::is_writable_status(&status) {
+        tracing::warn!("the tray status was refused: it is not a single short line");
+        return;
+    }
+    if let Err(e) = tray::set_status(&app, &status) {
+        tracing::warn!("the tray status could not be written: {e}");
+    }
+}
+
 /// How long the window stays hidden waiting for the frontend to paint, before it is shown
 /// anyway.
 ///
@@ -1948,6 +1974,7 @@ pub fn run() {
             is_background_launch,
             is_tray_available,
             set_tray_labels,
+            set_tray_status,
             quit::finish_quit,
             quit::quit_guard_ready
         ]);

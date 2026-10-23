@@ -17,18 +17,24 @@ publish = false
 bench = false
 
 [dependencies]
-# Two dependencies, and both of them are already in every build that links
-# this crate: the handshake is JSON, and the credential it carries is wiped
-# from memory when it goes out of scope.
+# Four dependencies, and all of them are already in every build that links
+# this crate: the handshake is JSON, the credential it carries is wiped from
+# memory when it goes out of scope, and the challenge a response answers is
+# signed with HMAC-SHA256.
 #
 # The crate used to be dependency-free, and the reason it was is still the
 # reason — it must stay cheap to compile for the Android target — but the two
-# crates that link it, the server and every client, pull in serde and zeroize
-# for themselves, so the marginal cost of naming them here is zero. The
-# alternative was a feature nobody would ever leave switched off.
+# crates that link it, the server and every client, pull in serde, zeroize,
+# hmac and sha2 for themselves, so the marginal cost of naming them here is
+# zero. The alternative was a feature nobody would ever leave switched off.
 serde = { version = "1.0.228", features = ["derive"] }
 # The handshake is JSON, and the error a bad message produces is a
 # `serde_json::Error` — it is part of the signature of `AuthMessage::from_bytes`,
 # so it is a dependency rather than a test-only one.
 serde_json = "1.0"
 zeroize.workspace = true
+# The challenge a response answers is signed with HMAC-SHA256. It used to be
+# signed once in the server and once in the client, with a comment in each
+# copy saying to keep them in step; the signature now lives here, once.
+hmac = "0.13"
+sha2 = "0.11"

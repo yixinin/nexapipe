@@ -66,7 +66,7 @@ pub mod jni;
 pub use client::IrohProxyClient;
 pub use connection_pool::{IrohConnectionPool, LinkKind, LinkStatus};
 pub use discovery::DiscoveryMode;
-pub use domains::{DomainNotes, domain_notes, should_proxy_domain};
+pub use domains::{DomainNotes, domain_notes, fold_domain, should_proxy_domain};
 pub use endpoint_group::{
     DomainMapping, EndpointGroup, NodeConfig, PooledConnection, PreconnectReport,
 };

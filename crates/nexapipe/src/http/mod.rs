@@ -1558,8 +1558,8 @@ pub enum RequestBody {
         /// **Shared, not owned twice.** The body is read into a buffer, and
         /// the request that goes to the backend used to be handed a *copy* of
         /// it: the buffer stayed alive for the retry, and the copy was thrown
-        /// away with the attempt. A [`Bytes`] is the same buffer with a
-        /// reference count, so the retry takes another reference to the same
+        /// away with the attempt. A [`Bytes`](bytes::Bytes) is the same buffer
+        /// with a reference count, so the retry takes another reference to the same
         /// bytes rather than a second copy of them.
         bytes: bytes::Bytes,
         /// The length to declare to the backend, when the client declared

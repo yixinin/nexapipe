@@ -31,7 +31,12 @@
   },
   "tray": {
     "show": "打开 Nexa",
-    "quit": "退出"
+    "quit": "退出",
+    "connected": "Nexa — 已连接",
+    "connecting": "Nexa — 连接中…",
+    "disconnected": "Nexa — 未连接",
+    "failed": "Nexa — 连接失败",
+    "unknown": "Nexa — 状态未知"
   },
   "common": {
     "save": "保存",
@@ -74,7 +79,8 @@
   "status": {
     "running": "运行中",
     "stopped": "已停止",
-    "starting": "启动中…"
+    "starting": "启动中…",
+    "unknown": "状态未知"
   },
   "mode": {
     "tun": "TUN 模式",
@@ -261,7 +267,11 @@
     "tunDeviceNameHint": "虚拟网卡名称（macOS 上由系统自动分配，该平台会忽略此值）",
     "app": "应用设置",
     "launchAtStartup": "开机自启",
-    "launchAtStartupHint": "应用启动时自动运行代理",
+    "launchAtStartupHint": "登录时启动应用",
+    "autoConnect": "登录后自动连接",
+    "autoConnectHint": "重启后自动恢复隧道连接",
+    "silentStart": "静默启动",
+    "silentStartHint": "登录时只在托盘运行，不弹出窗口",
     "minimizeOnClose": "关闭时最小化",
     "minimizeOnCloseHint": "点击关闭按钮时最小化到系统托盘",
     "minimizeOnCloseUnavailable": "当前桌面没有系统托盘，关闭窗口仍会退出应用",

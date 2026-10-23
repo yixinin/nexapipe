@@ -28,7 +28,12 @@ pub async fn run_local_proxy(
     tracing::info!("Starting local proxy on: {}", listen_addr);
     tracing::info!("Proxy domains: {:?}", proxy_domains);
 
-    let default_strategy = get_strategy(&config.strategy);
+    // The strategy is the client's, because what it picks is a node: the
+    // server's own `config::get_strategy` picks a backend out of a route's
+    // pool, which is a different choice with a different list. The rule that
+    // turns a name into one is the enum's own, in the client crate, and it
+    // refuses a name it does not have rather than answering with round-robin.
+    let default_strategy = local_proxy_strategy(config.strategy.as_deref())?;
 
     let endpoint_group = if let Some(nodes) = config.nodes {
         tracing::info!(
@@ -194,12 +199,77 @@ pub async fn run_local_proxy(
     Ok(())
 }
 
-fn get_strategy(strategy: &Option<String>) -> LoadBalancingStrategy {
-    match strategy.as_deref() {
-        Some("random") | Some("Random") => LoadBalancingStrategy::Random,
-        Some("round_robin") | Some("RoundRobin") | Some("roundrobin") => {
-            LoadBalancingStrategy::RoundRobin
+/// The strategy the local proxy picks a node with.
+///
+/// The local proxy is a **client** here: what it balances over is a list of
+/// servers, and it picks one of them for a connection. The server's own
+/// `config::get_strategy` balances over the backends of a route, which is a
+/// different list and a different choice, so the two rules are kept apart.
+///
+/// **A name it does not have is refused rather than guessed.** It used to be
+/// answered with round-robin — every unknown name, including a misspelling of
+/// one that exists — and the local proxy then ran a strategy the file did not
+/// say it was running, with nothing reporting it. Refusing it stops the
+/// process instead, which is the only thing that tells the operator the file
+/// is wrong.
+fn local_proxy_strategy(name: Option<&str>) -> anyhow::Result<LoadBalancingStrategy> {
+    match name {
+        None | Some("") => Ok(LoadBalancingStrategy::RoundRobin),
+        Some(name) => LoadBalancingStrategy::from_name(name).map_err(|e| anyhow::anyhow!("{e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A name that is not there is refused, and the local proxy does not
+    /// start.
+    ///
+    /// This is the behaviour change: a `[local_proxy] strategy` the client
+    /// cannot honour used to be answered with round-robin and the process ran
+    /// happily on a strategy nobody asked for.
+    #[test]
+    fn a_name_the_client_has_no_strategy_for_is_refused() {
+        for name in ["least_conn", "round-robin", "round_robinn"] {
+            let error = local_proxy_strategy(Some(name))
+                .expect_err("a name the client cannot honour must not start the proxy");
+            let message = error.to_string();
+            assert!(
+                message.contains(name),
+                "the refusal names the strategy it turned down: {message}"
+            );
+            assert!(
+                message.contains("strategy"),
+                "and says what the name was about: {message}"
+            );
         }
-        None | Some(_) => LoadBalancingStrategy::RoundRobin,
+    }
+
+    /// The two names the client has are honoured, under the spellings the
+    /// server accepts.
+    #[test]
+    fn the_names_the_client_has_are_honoured() {
+        assert_eq!(
+            local_proxy_strategy(Some("round_robin")).expect("a name the client has"),
+            LoadBalancingStrategy::RoundRobin
+        );
+        assert_eq!(
+            local_proxy_strategy(Some("Random")).expect("a name the client has"),
+            LoadBalancingStrategy::Random
+        );
+    }
+
+    /// A file that says nothing gets the default.
+    #[test]
+    fn no_strategy_is_the_default_one() {
+        assert_eq!(
+            local_proxy_strategy(None).expect("no strategy is the default"),
+            LoadBalancingStrategy::RoundRobin
+        );
+        assert_eq!(
+            local_proxy_strategy(Some("")).expect("an empty strategy is the default"),
+            LoadBalancingStrategy::RoundRobin
+        );
     }
 }

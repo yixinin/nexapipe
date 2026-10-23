@@ -55,9 +55,13 @@ const { ensureUnlocked } = useCredentialGate();
 
 const installing = ref(false);
 
-const modeLabel = computed(() =>
-  status.value.running ? t(`mode.${status.value.mode}`) : t('status.stopped'),
-);
+const modeLabel = computed(() => {
+  if (status.value.running) return t(`mode.${status.value.mode}`);
+  // The state could not be read, which is not the same as stopped: the service owns the
+  // tunnel and this process cannot see it. Saying "stopped" would be a guess.
+  if (status.value.mode === 'unknown') return t('status.unknown');
+  return t('status.stopped');
+});
 
 const statusLabel = computed(() => {
   if (status.value.running) return t('status.running');

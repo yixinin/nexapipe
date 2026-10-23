@@ -2591,7 +2591,6 @@ dependencies = [
  "flate2",
  "futures-util",
  "hex",
- "hmac",
  "http",
  "http-body-util",
  "hyper",
@@ -2611,7 +2610,6 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "tokio",
  "tokio-rustls",
@@ -2638,7 +2636,6 @@ dependencies = [
  "fastrand",
  "futures-util",
  "hex",
- "hmac",
  "http",
  "http-body-util",
  "hyper",
@@ -2657,7 +2654,6 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_json",
- "sha2",
  "tokio",
  "tokio-stream",
  "totp-rs",
@@ -2665,15 +2661,16 @@ dependencies = [
  "uniffi",
  "url",
  "webpki-roots",
- "zeroize",
 ]
 
 [[package]]
 name = "nexapipe-proto"
 version = "1.0.0"
 dependencies = [
+ "hmac",
  "serde",
  "serde_json",
+ "sha2",
  "zeroize",
 ]
 

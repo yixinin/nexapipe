@@ -6,6 +6,37 @@ pub enum LoadBalancingStrategy {
     Random,
 }
 
+impl LoadBalancingStrategy {
+    /// The strategy a name asks for.
+    ///
+    /// Refused rather than guessed, for the reason the server's own parser
+    /// refuses: a strategy the configuration does not name is a deployment
+    /// that runs differently from the one in the file, and nothing says so —
+    /// the traffic still flows, just not the way the configuration claims.
+    ///
+    /// The spellings are the server's, so a configuration that names one
+    /// means the same thing on both sides of the tunnel. `least_conn` is the
+    /// server's alone: it picks a backend out of a pool that tracks what each
+    /// backend is doing, and a client picking a node out of a list has no such
+    /// thing to pick the least of — so it is refused here, by name, rather
+    /// than quietly answered with round-robin.
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        match name.trim() {
+            "round_robin" | "RoundRobin" | "roundrobin" => Ok(Self::RoundRobin),
+            "random" | "Random" => Ok(Self::Random),
+            "least_conn" | "LeastConn" | "leastconn" => Err(
+                "least_conn is a server-side strategy: it picks the least loaded backend of a \
+                 route, and a client picks a node of a list it does not measure"
+                    .to_string(),
+            ),
+            other => Err(format!(
+                "strategy {other:?} is not a load balancing strategy; expected \"round_robin\" \
+                 (the default) or \"random\""
+            )),
+        }
+    }
+}
+
 pub struct RoundRobinBalancer {
     index: AtomicUsize,
 }
@@ -153,5 +184,81 @@ mod tests {
             2,
             "both healthy backends must be reachable: {seen:?}"
         );
+    }
+
+    /// The two names a client has, under every spelling the server accepts.
+    ///
+    /// The spellings are the server's, so a configuration that names one means
+    /// the same thing on both sides of the tunnel — and the server accepts
+    /// `RoundRobin` and `roundrobin` as well as `round_robin`, so the client
+    /// has to as well.
+    #[test]
+    fn a_name_the_server_understands_is_understood_here_too() {
+        for name in ["round_robin", "RoundRobin", "roundrobin"] {
+            assert_eq!(
+                LoadBalancingStrategy::from_name(name),
+                Ok(LoadBalancingStrategy::RoundRobin),
+                "{name}"
+            );
+        }
+        for name in ["random", "Random"] {
+            assert_eq!(
+                LoadBalancingStrategy::from_name(name),
+                Ok(LoadBalancingStrategy::Random),
+                "{name}"
+            );
+        }
+    }
+
+    /// The name is read the way a configuration is written: with the spaces a
+    /// hand-written file puts around it.
+    #[test]
+    fn a_name_with_spaces_around_it_is_still_the_name() {
+        assert_eq!(
+            LoadBalancingStrategy::from_name("  round_robin  "),
+            Ok(LoadBalancingStrategy::RoundRobin)
+        );
+        assert_eq!(
+            LoadBalancingStrategy::from_name("\trandom\n"),
+            Ok(LoadBalancingStrategy::Random)
+        );
+    }
+
+    /// `least_conn` is the server's alone, and it is refused **by name**.
+    ///
+    /// A client picks a node out of a list it does not measure, so there is no
+    /// "least loaded" to pick — and answering with round-robin instead would
+    /// be a deployment that runs differently from the one the file says, with
+    /// nothing reporting it. The refusal says what the name is, so the
+    /// operator does not have to guess why it was turned down.
+    #[test]
+    fn least_conn_is_refused_by_name_rather_than_answered_with_round_robin() {
+        for name in ["least_conn", "LeastConn", "leastconn"] {
+            let error = LoadBalancingStrategy::from_name(name)
+                .expect_err("a client has no least-loaded backend to pick");
+            assert!(
+                error.contains("least_conn"),
+                "the refusal names the strategy it turned down: {error}"
+            );
+            assert!(
+                error.contains("server-side"),
+                "and says whose strategy it is: {error}"
+            );
+        }
+    }
+
+    /// A name nobody supports is refused, and the refusal says what is
+    /// supported.
+    ///
+    /// This is the message an operator sees when the local proxy refuses to
+    /// start over a misspelled `strategy`, so it has to be enough to fix the
+    /// file with.
+    #[test]
+    fn an_unknown_name_is_refused_with_the_names_that_are_supported() {
+        let error = LoadBalancingStrategy::from_name("round-robin")
+            .expect_err("a hyphen is not the name of a strategy");
+        assert!(error.contains("round-robin"), "{error}");
+        assert!(error.contains("round_robin"), "{error}");
+        assert!(error.contains("random"), "{error}");
     }
 }

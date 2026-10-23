@@ -146,6 +146,8 @@ src-tauri/
 | `install_service` / `uninstall_service` / `is_service_running` | Manage the elevated background service. |
 | `get_startup_error` | Failure captured during startup, if any. |
 | `get_logs` | Recent log lines for the Logs page. |
+| `is_background_launch` | Whether the machine started the app rather than the user. |
+| `set_tray_status` | Writes the connection state onto the tray icon. |
 
 Errors come back as structured `AppError` values with stable codes
 (`codes::PROXY_TUN_UNAVAILABLE` and friends) that the frontend translates, so

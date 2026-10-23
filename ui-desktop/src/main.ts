@@ -21,11 +21,13 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
 import App from './App.vue';
 import router from './router';
-import i18n, { currentLocale, resolveLocale, setI18nLocale, translate } from './i18n';
+import i18n, { currentLocale, resolveLocale, setI18nLocale } from './i18n';
 import { applyStoredTheme } from './composables/useTheme';
 import { initPlatform } from './composables/useWindowControls';
-import { readStoredLocale } from './stores/prefs';
-import { initProxyState, onAppFocused } from './stores/proxy';
+import { readStoredLocale, usePrefsStore } from './stores/prefs';
+import { isBackgroundLaunch } from './api/autostart';
+import { setTrayLabels } from './api/tray';
+import { initProxyState, onAppFocused, refreshTrayStatus } from './stores/proxy';
 import { initGate, refreshGate } from './stores/gate';
 import { initConfigStore, initConfigStoreDeferred } from './stores/config';
 import { flushStartupTiming, mark } from './app/startup';
@@ -107,15 +109,20 @@ function firstFrame(limit: number): Promise<boolean> {
 async function showWindow(): Promise<void> {
   try {
     // A launch the machine asked for comes up in the tray instead: a window
-    // appearing over whatever the user was doing at login is exactly what the
-    // background flag exists to prevent. The backend's own fallback knows the
+    // appearing over whatever the user was doing at login is exactly what a
+    // launch nobody asked for should not do. The backend's own fallback knows the
     // same thing and does not show it either.
+    //
+    // Unless the user asked otherwise. `silentStart` is that preference: it says
+    // whether a machine-started launch is a quiet one, and a user who wants to
+    // see the app come up at login turns it off. The flag says *who* started the
+    // app; this says whether that launch should be quiet.
     //
     // Unless there is no tray to come up in. The tray is built on a best-effort
     // basis and can fail — a bare session, a container, a Linux host without a
     // StatusNotifier — and an app with no window and no tray icon is an app
     // nobody can reach again.
-    if ((await isBackgroundLaunch()) && (await isTrayAvailable())) {
+    if ((await isBackgroundLaunch()) && silentStart() && (await isTrayAvailable())) {
       mark('background');
       return;
     }
@@ -134,6 +141,17 @@ async function showWindow(): Promise<void> {
 }
 
 /**
+ * Whether a launch the machine asked for should be a quiet one.
+ *
+ * Read from the preferences rather than asked of the backend, because the
+ * preference is the user's and lives beside the theme and the language: it is
+ * a statement about how the app should appear, not about how it was started.
+ */
+function silentStart(): boolean {
+  return usePrefsStore().prefs.silentStart;
+}
+
+/**
  * Whether the tray icon exists.
  *
  * A failure is a "no": a tray that cannot be reached cannot be come back to,
@@ -144,39 +162,6 @@ async function isTrayAvailable(): Promise<boolean> {
     return await invoke<boolean>('is_tray_available');
   } catch {
     return false;
-  }
-}
-
-/**
- * Whether the machine started this app rather than a person.
- *
- * True when the start-up entry launched it: the window stays hidden and the app waits in the
- * tray. The answer is a failure by default — a launch that cannot tell is a launch that shows
- * its window, which is the ordinary case.
- */
-async function isBackgroundLaunch(): Promise<boolean> {
-  try {
-    return await invoke<boolean>('is_background_launch');
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Writes the tray menu in the user's language.
- *
- * The translations live here and the tray lives in the backend, so the words are handed over
- * once the locale is known. Best effort: a tray whose menu is in the wrong language is still a
- * working tray, and the backend keeps English until it hears otherwise.
- */
-async function setTrayLabels(): Promise<void> {
-  try {
-    await invoke('set_tray_labels', {
-      showLabel: translate('tray.show'),
-      quitLabel: translate('tray.quit'),
-    });
-  } catch (error) {
-    console.debug('[tray] the menu labels could not be set:', error);
   }
 }
 
@@ -208,9 +193,13 @@ async function bootstrap(): Promise<void> {
   // The tray menu is a native menu and not a template, so a language change does
   // not reach it on its own: the labels have to be written again, or the tray
   // keeps the language the app started in while everything else has changed.
+  // The status on the icon is in the same language, so it is written again too.
   watch(
     () => currentLocale(),
-    () => void setTrayLabels(),
+    () => {
+      void setTrayLabels();
+      refreshTrayStatus();
+    },
   );
 
   // Everything from here on is a projection no first screen renders, so it must not sit between

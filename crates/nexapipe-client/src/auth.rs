@@ -7,39 +7,20 @@
 // is whatever its enrollment produced.
 
 use crate::ClientError;
-use hmac::{Hmac, KeyInit, Mac};
 use iroh::endpoint::Connection;
 use nexapipe_proto::auth::{Algorithm as ProtoAlgorithm, AuthMessage, Format, VERSION_BINARY};
 use nexapipe_proto::secret::{SecretBytes, SecretString};
-use sha2::Sha256;
 use std::fmt;
 use totp_rs::{Algorithm, Builder, Secret as TotpSecret};
 
 /// Application error codes the server closes a connection with during the 2FA
-/// handshake. Must match `auth_close_code` in `crates/nexapipe/src/conn/mod.rs`
-/// and `PEER_NOT_ALLOWED_CLOSE_CODE` in
-/// `crates/nexapipe/src/conn/allow_list.rs`.
-mod auth_close_code {
-    /// No AUTH_START arrived within the handshake deadline, or the server does
-    /// not run the handshake on that first stream at all.
-    pub const REQUIRED: u32 = 2;
-    /// The handshake ran and the credentials were refused.
-    pub const REJECTED: u32 = 3;
-    /// The peer already holds as many connections as it is allowed.
-    pub const TOO_MANY: u32 = 4;
-    /// The server runs a `[peers]` allow-list and this Node ID is not on it.
-    /// Sent right after the QUIC handshake, so the client never gets as far as
-    /// sending credentials.
-    pub const PEER_NOT_ALLOWED: u32 = 5;
-    /// This credential was struck out of `[auth]` *while this connection was
-    /// open* — `nexapipe client revoke`, aimed at this client or at this one
-    /// device of it. Unlike the four above this does not arrive during the
-    /// handshake: a connection has to have authenticated to be revoked.
-    pub const REVOKED: u32 = 6;
-}
-
-/// HMAC-SHA256 keyed by the TOTP secret, used to sign auth challenges.
-type HmacSha256 = Hmac<Sha256>;
+/// handshake.
+///
+/// The numbers live in [`nexapipe_proto::auth::close_code`], which the server
+/// links too: they used to be written down here and kept in step with the
+/// server's copy by a comment in each, which is the whole failure mode of a
+/// protocol written down twice.
+use nexapipe_proto::auth::close_code as auth_close_code;
 
 /// TOTP algorithm variants
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -438,10 +419,10 @@ impl TwoFactorAuth {
     /// a secret-based credential, an Ed25519 signature over those same bytes
     /// for a key-based one.
     ///
-    /// Keep in sync with `hmac_signature` in `crates/nexapipe/src/auth/totp.rs`
-    /// and `sign_message` in `crates/nexapipe/src/auth/device_key.rs`: whichever
-    /// proof is in play, what is signed is the nonce, byte for byte, then the
-    /// timestamp as little-endian bytes.
+    /// What is signed is defined once, in
+    /// [`nexapipe_proto::auth::challenge_message`], which the server links too:
+    /// whichever proof is in play, what is signed is the nonce, byte for byte,
+    /// then the timestamp as little-endian bytes.
     ///
     /// Fallible in the type only: HMAC takes a key of any length — a long one is
     /// hashed, a short one is zero-padded — so this has never failed. It is
@@ -450,16 +431,11 @@ impl TwoFactorAuth {
     pub fn sign_challenge(&self, nonce: &[u8], timestamp: i64) -> Result<Vec<u8>, ClientError> {
         match &self.proof {
             Proof::Totp { secret, .. } => {
-                let mut mac = HmacSha256::new_from_slice(secret.as_slice())
-                    .map_err(|e| ClientError::Other(format!("HMAC rejected the secret: {e}")))?;
-                mac.update(nonce);
-                mac.update(&timestamp.to_le_bytes());
-                Ok(mac.finalize().into_bytes().to_vec())
+                nexapipe_proto::auth::hmac_challenge(secret.as_slice(), nonce, timestamp)
+                    .map_err(|e| ClientError::Other(format!("HMAC rejected the secret: {e}")))
             }
             Proof::Key(key) => {
-                let mut message = Vec::with_capacity(nonce.len() + 8);
-                message.extend_from_slice(nonce);
-                message.extend_from_slice(&timestamp.to_le_bytes());
+                let message = nexapipe_proto::auth::challenge_message(nonce, timestamp);
                 Ok(key.sign(&message).to_bytes().to_vec())
             }
         }
@@ -826,7 +802,8 @@ pub struct IssuedCredential {
     /// Empty when the device was issued a key instead — see [`Self::public_key`].
     ///
     /// A [`SecretString`]: the credential is wiped when this is dropped, and
-    /// the value is read through [`Secret::expose_secret`] where it has to be.
+    /// the value is read through [`nexapipe_proto::secret::Secret::expose_secret`]
+    /// where it has to be.
     pub secret: SecretString,
     pub algorithm: String,
     /// The public half of the key the device was issued, lowercase hex — the

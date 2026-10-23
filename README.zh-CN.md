@@ -999,6 +999,11 @@ domains = ["app.example.com"]
 `[local_proxy]` 层级的 `server_ticket` 与 `server_node_id` 仍然可用但已废弃 ——
 优先使用 `[[local_proxy.nodes]]`。
 
+`[local_proxy]` 下的 `strategy` 取 `round_robin`（默认）或 `random`。它是在本地代理
+持有的**服务器**之间挑选，而 `least_conn` —— 服务端自己的策略，挑的是某条路由中
+在途请求最少的后端 —— 不在其中；本地代理遇到它会拒绝启动，而不是悄悄换成别的
+均衡方式。
+
 **本地代理不校验连接方**：它直接交出那条已经完成认证的连接的隧道，
 因此任何能连上该端口的一方都能在没有凭据的情况下拿到隧道。所以
 `listen_addr` 必须写回环地址，非回环地址在启动时会被拒绝 —— 判定依据是

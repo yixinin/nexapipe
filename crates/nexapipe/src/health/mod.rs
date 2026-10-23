@@ -685,6 +685,12 @@ mod tests {
 
     /// The same round, with the backend down from the start and staying down:
     /// the status is written once, and the failure is counted once.
+    ///
+    /// The end of the round is not enough to tell a round that marked the
+    /// backend once from a round that marked it twice — both leave it
+    /// unhealthy. The pool is asked instead, because the pool is what was
+    /// marked: a backend that is marked unhealthy twice in one round is
+    /// counted twice, and the count is the transition itself.
     #[tokio::test]
     async fn a_backend_named_twice_is_marked_once_per_round() {
         let backend = DEAD_BACKEND.to_string();
@@ -699,6 +705,11 @@ mod tests {
         assert!(
             !healthy(&pool, &backend).await,
             "a failed probe at the threshold empties the pool"
+        );
+        assert_eq!(
+            pool.backend_failures(&backend).await,
+            Some(1),
+            "one backend is marked unhealthy once per round, not once per probe of it"
         );
     }
 

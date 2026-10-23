@@ -182,6 +182,11 @@ description = "Enables the set_tray_labels command without any pre-configured sc
 commands.allow = ["set_tray_labels"]
 
 [[permission]]
+identifier = "allow-set-tray-status"
+description = "Enables the set_tray_status command without any pre-configured scope."
+commands.allow = ["set_tray_status"]
+
+[[permission]]
 identifier = "allow-start-proxy"
 description = "Enables the start_proxy command without any pre-configured scope."
 commands.allow = ["start_proxy"]

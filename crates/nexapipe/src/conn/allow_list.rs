@@ -40,13 +40,16 @@ pub struct PeerAllowList {
 }
 
 /// The close code a refused peer is sent, in the same register as the 2FA ones
-/// in [`super::auth_close_code`].
+/// in `auth_close_code`.
 ///
 /// It travels in the CONNECTION_CLOSE frame, so the client can read it and say
 /// "this Node ID is not in the server's allow list" rather than reporting a
-/// mysterious connection loss. Kept in sync with the client's own copy by hand,
-/// exactly like the codes it sits next to.
-pub const PEER_NOT_ALLOWED_CLOSE_CODE: u32 = 5;
+/// mysterious connection loss.
+///
+/// The number lives in [`nexapipe_proto::auth::close_code`], which the client
+/// links too: it used to be written down here and kept in step with the
+/// client's copy by hand, exactly like the codes it sits next to.
+pub use nexapipe_proto::auth::close_code::PEER_NOT_ALLOWED as PEER_NOT_ALLOWED_CLOSE_CODE;
 
 /// The reason sent with [`PEER_NOT_ALLOWED_CLOSE_CODE`].
 ///

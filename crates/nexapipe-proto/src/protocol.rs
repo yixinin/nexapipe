@@ -9,10 +9,11 @@
 //! line.
 //!
 //! That works, and it is what the server still does for a client that asks
-//! for [`ALPN_LEGACY`]. But it makes the server **sniff**: the first bytes
-//! have to be read before the connection's purpose is known, and a codec
-//! that wants the whole head — [`hyper`](https://docs.rs/hyper) — cannot
-//! have it without the bytes being read and handed back.
+//! for the generic name — [`crate::ALPN_NEXAPIPE`]. But it makes the server
+//! **sniff**: the first bytes have to be read before the connection's purpose
+//! is known, and a codec that wants the whole head —
+//! [`hyper`](https://docs.rs/hyper) — cannot have it without the bytes being
+//! read and handed back.
 //!
 //! Choosing the protocol with ALPN says the same thing at the handshake,
 //! where it belongs, and the server knows what a connection is before a
@@ -25,12 +26,20 @@
 //! more, and one connection's buffers more, against a server that knows
 //! what it is serving.
 //!
-//! # The old one
+//! # The two generic names
 //!
-//! [`ALPN_LEGACY`] is what the client used before this, and it keeps
-//! working: a connection negotiated with it is served the way it always
-//! was, by the first byte of each stream. It is not removed — a client
-//! that predates this cannot be made to speak a protocol it does not know.
+//! There are two spellings that both mean "the first byte of each stream
+//! decides", and they are different things:
+//!
+//! * [`crate::ALPN_NEXAPIPE`] is `b"nexapipe"` — the generic name, and the
+//!   one a client that names no protocol in particular gets;
+//! * [`crate::ALPN_NEXAPIPE_LEGACY`] is `b"\x05nexapipe"` — the spelling
+//!   that predates the prefix byte being dropped, which a client of that
+//!   vintage offers and cannot be made to offer anything else.
+//!
+//! Both name [`Protocol::Legacy`], because both mean the same thing, and a
+//! connection negotiated with either is served the way it always was: by the
+//! first byte of each stream.
 
 /// The ALPN of a connection that carries HTTP requests.
 pub const ALPN_HTTP: &[u8] = b"nexapipe/http";
@@ -52,7 +61,7 @@ pub enum Protocol {
     /// HTTP requests.
     Http,
     /// L4 tunnels: a TCP or UDP stream to a backend, framed by the preface
-    /// in [`crate::preface`].
+    /// in [`crate::Preface`].
     L4,
     /// A TLS session, terminated by the backend and routed on its SNI.
     Tls,

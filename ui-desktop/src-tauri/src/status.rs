@@ -12,9 +12,9 @@ use crate::proxy::manager::ProxyMode;
 
 /// How the proxy is currently forwarding traffic.
 ///
-/// `Starting` and `Stopped` describe the absence of a live mode rather than a mode of their own,
-/// but the UI renders all four on a single status line, so they live in one enum instead of
-/// forcing the frontend to combine two fields.
+/// `Starting`, `Stopped` and `Unknown` describe the absence of a live mode rather than a mode of
+/// their own, but the UI renders all five on a single status line, so they live in one enum
+/// instead of forcing the frontend to combine two fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyModeKind {
@@ -28,6 +28,14 @@ pub enum ProxyModeKind {
     LocalProxy,
     Starting,
     Stopped,
+    /// The state could not be read.
+    ///
+    /// Not the same as [`ProxyModeKind::Stopped`]: "stopped" is a fact, and this is the absence
+    /// of one. The service owns the tunnel when the app runs in service mode, so a failed read
+    /// of the service's state leaves the question open — and a question that is open must not be
+    /// answered with "stopped", because answering it that way is what starts a second tunnel
+    /// over a live one.
+    Unknown,
 }
 
 impl From<ProxyMode> for ProxyModeKind {
@@ -66,6 +74,19 @@ impl ProxyStatus {
         Self {
             running: false,
             mode: ProxyModeKind::Stopped,
+        }
+    }
+
+    /// The state could not be read, and this process cannot say what it is.
+    ///
+    /// The service owns the tunnel when the app runs in service mode, so a
+    /// failed read of the service's state leaves the question open. Answering
+    /// it with "stopped" would be a guess — and the guess is what starts a
+    /// second tunnel over a live one.
+    pub fn unknown() -> Self {
+        Self {
+            running: false,
+            mode: ProxyModeKind::Unknown,
         }
     }
 
@@ -261,6 +282,38 @@ mod tests {
             serde_json::to_string(&status).unwrap(),
             r#"{"running":true,"mode":"local_proxy"}"#
         );
+    }
+
+    /// **An unreadable state is not a stopped one.**
+    ///
+    /// The frontend asks "is it stopped?" before it starts a tunnel by itself, and a state
+    /// that could not be read must not answer that question. "Stopped" is a fact and
+    /// "unknown" is the absence of one, so the two have to be different values on the wire —
+    /// and the unknown one has to say so.
+    #[test]
+    fn an_unreadable_state_is_not_a_stopped_one() {
+        let status = ProxyStatus::unknown();
+        assert!(
+            !status.running,
+            "a state that could not be read is not forwarding traffic"
+        );
+        assert_eq!(
+            status.mode,
+            ProxyModeKind::Unknown,
+            "the state is unknown, and it says so"
+        );
+        assert_ne!(
+            status.mode,
+            ProxyModeKind::Stopped,
+            "unknown is not stopped: the difference is the whole point"
+        );
+        assert_eq!(
+            serde_json::to_string(&status).unwrap(),
+            r#"{"running":false,"mode":"unknown"}"#
+        );
+        let parsed: ProxyStatus =
+            serde_json::from_str(r#"{"running":false,"mode":"unknown"}"#).unwrap();
+        assert_eq!(parsed.mode, ProxyModeKind::Unknown);
     }
 
     /// The frontend keys nodes off `connection` and reads `link` as one of three fixed

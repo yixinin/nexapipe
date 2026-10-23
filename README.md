@@ -1141,6 +1141,12 @@ The same domain may appear on several nodes; that is how you load balance across
 servers. `server_ticket` and `server_node_id` at the `[local_proxy]` level still
 work but are deprecated — prefer `[[local_proxy.nodes]]`.
 
+`strategy` under `[local_proxy]` is `round_robin` (the default) or `random`. It
+picks between the **servers** the local proxy has, so `least_conn` — the
+server's own strategy, which picks the backend of a route with the fewest
+requests outstanding to it — is not one of them, and the local proxy refuses to
+start on it rather than quietly balancing some other way.
+
 **The local proxy does not authenticate the peer that connects to it**: it hands
 out the tunnel of a connection that has already authenticated, so whoever
 reaches the port gets that tunnel without a credential. `listen_addr` therefore
