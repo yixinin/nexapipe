@@ -16,7 +16,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use hyper::rt::ReadBufCursor;
+use hyper::rt::{Read, ReadBufCursor, Write};
 use pin_project_lite::pin_project;
 
 /// An iroh bi-stream seen as hyper's IO.
@@ -130,6 +130,70 @@ impl std::future::Future for TokioSleep {
 }
 
 impl hyper::rt::Sleep for TokioSleep {}
+
+/// The other side of an upgrade, as tokio's IO.
+///
+/// Once the `101` is written the connection stops being HTTP and becomes
+/// bytes, and hyper hands those bytes over through its own traits. The copy
+/// loop that moves them is tokio's, so the two are bridged here — the same
+/// job [`IrohIo`] does in the other direction.
+pub struct UpgradedIo {
+    inner: hyper::upgrade::Upgraded,
+}
+
+impl UpgradedIo {
+    /// The stream hyper handed over.
+    pub fn new(inner: hyper::upgrade::Upgraded) -> Self {
+        Self { inner }
+    }
+}
+
+impl tokio::io::AsyncRead for UpgradedIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        // Hyper's cursor is over the part of the buffer that is not filled
+        // yet, and it is told how much was read afterwards.
+        let filled = {
+            // SAFETY: the unfilled part of the buffer is exactly the memory
+            // hyper is about to fill, and the cursor is told afterwards how
+            // much of it was.
+            let unfilled = unsafe { buf.unfilled_mut() };
+            let mut hyper_buf = hyper::rt::ReadBuf::uninit(unfilled);
+            let cursor = hyper_buf.unfilled();
+            match Pin::new(&mut this.inner).poll_read(cx, cursor) {
+                Poll::Ready(Ok(())) => hyper_buf.filled().len(),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        };
+        // The bytes hyper read are in the buffer, and `filled` is how many of
+        // them there are.
+        buf.advance(filled);
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl tokio::io::AsyncWrite for UpgradedIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
 
 #[cfg(test)]
 mod tests {
