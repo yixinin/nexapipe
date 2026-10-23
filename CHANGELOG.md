@@ -1452,6 +1452,17 @@ lookup, which is what a config written before the key existed does.
 
 ### Security
 
+- **The constant-time utility the crypto stack sits on was patched.**
+  RUSTSEC-2026-0385 landed against `ctutils` 0.4.2 — the crate `digest`
+  uses for its constant-time comparisons, and `digest` is what
+  `curve25519-dalek` sits on, and `iroh` behind it. The mask generation of
+  `ctutils::Choice` is a `const fn` and cannot use the `asm!`-backed
+  generation of the `cmov` crate, so the code it produced could contain a
+  branch on a secret value, and the `u128` comparisons branched on 32-bit
+  targets. A branch on a secret is what a covert channel needs.
+  Both lockfiles now pin `ctutils` 0.4.5, which carries the fix — the
+  corrected generation, verified with BINSEC — and nothing else in either
+  lockfile moves.
 - **The macOS bundles can be signed and notarized.** The desktop builds
   attached to GitHub releases were neither: an unsigned app is quarantined by
   Gatekeeper, and the only ways through it — "Control-click → Open" or
