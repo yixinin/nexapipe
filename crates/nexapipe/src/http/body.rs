@@ -408,6 +408,17 @@ pub fn empty_body() -> ProxyBody {
     UnsyncBoxBody::new(empty)
 }
 
+/// A body that carries these bytes and nothing else.
+///
+/// The length of such a body is known, so the answer that carries it is
+/// framed with a length of its own: the client is never told one length and
+/// given another.
+pub fn bytes_body(bytes: bytes::Bytes) -> ProxyBody {
+    let inner =
+        Full::new(bytes).map_err(|never: std::convert::Infallible| -> BodyError { match never {} });
+    UnsyncBoxBody::new(inner)
+}
+
 /// What the proxy knows about a body that is still on the client's stream.
 ///
 /// Shared between the body the request carries and the request that owns it:
