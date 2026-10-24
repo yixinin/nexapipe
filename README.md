@@ -121,7 +121,7 @@ bindings for Swift/Kotlin/Python. See
 | `ui-android/` | Android app (Kotlin + Compose). |
 | `ui-desktop/` | Tauri 2 desktop app (Vue 3 + TypeScript). |
 | `config.toml.example` | Example server + client configuration covering every section. It ships with 2FA **on** and no client enrolled, so a fresh install refuses every connection until one is enrolled. Copy it to `config.toml` — that name is gitignored, it is the operator's live config. The docker compose file uses `config/config.toml` instead, picked up via `NEXAPIPE_CONFIG_DIR=/app/config`. |
-| `config.toml.2fa.example` | The same, with a `[auth.clients]` entry — a client that is enrolled already. |
+| `config.toml.2fa.example` | The same, with a `[auth.clients]` entry — a client that is enrolled already. **The secret in it is published**, so it is a demonstration of what an enrolled client looks like rather than one to use: replace it with `nexapipe --generate-2fa client-001 --force` before the listener is reachable. |
 | `run_android.ps1` | One-shot Android debug loop (build → install → launch → logcat). |
 
 ---
@@ -145,7 +145,8 @@ left at its default. The client side is the same length — see
 [Minimal config](#minimal-config), which also lists what each omitted key
 defaults to. Start from `config.toml.example` instead when you want every
 section written out, or `config.toml.2fa.example` when you want a client that
-is enrolled already.
+is enrolled already — and replace that client's secret before the listener is
+reachable, because the one in the file is published.
 
 Leave the file out entirely and the server writes a minimal `config.toml` for you
 instead of refusing to start — 2FA on, nothing routed, nothing enrolled. It is a

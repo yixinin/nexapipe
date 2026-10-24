@@ -4,21 +4,36 @@
 #
 #   cp config.toml.2fa.example config.toml    # config.toml is gitignored
 #
+# **The secret below is published.** It is in a public repository, so anybody
+# can compute a valid code from it. It is here to show what an enrolled client
+# looks like, not to be used as one: replace it before the listener is
+# reachable, with
+#
+#   nexapipe --generate-2fa client-001 --force
+#
+# The Node ID is a reachability credential on its own — anybody who learns it
+# reaches every route on a server that has 2FA off — and the 2FA secret is
+# what closes that. A published secret is a published way in.
+#
 # Every command in the comments below takes `--config config.toml` rather than
 # `--config config.toml.2fa.example` on purpose: `--generate-2fa` and
 # `--generate-invite --registration` **write back into the file they are pointed
 # at**, so aiming them at this example would rotate the secrets in git.
 #
 # The secrets below are the only credential gating the iroh listener, so keep
-# the file private: with `enabled = true` the server refuses to start when
-# config.toml is readable or writable by another account — `chmod 600` it.
+# the file private: `chmod 600` it. The server does **not** refuse to start on
+# a file another account can read — it says so once in the log and starts
+# anyway, because a `0644` bind mount has to start (ROADMAP §3.5). The mode is
+# the operator's to set, and the warning is the only thing that says so.
 #
 # This file is the 2FA one; the sibling `config.toml.example` writes out every
-# other section (relay modes, all four route modes, `[log]`) at length and leaves
-# `[auth]` off. `[[routes]]` and `[auth.clients]` are reread every 5 s and take
-# effect without a restart; `[auth] enabled = true` is picked up live too (but
-# turning it off is not), while `[server]`, `[iroh]`, `[peers]`, the `[auth]`
-# TOTP parameters and `[log]` need a restart.
+# other section (relay modes, all four route modes, `[log]`) at length and
+# turns `[auth]` on without enrolling a client, so a fresh install refuses
+# every connection until one is enrolled. `[[routes]]` and `[auth.clients]`
+# are reread every 5 s and take effect without a restart; `[auth]
+# enabled = true` is picked up live too (but turning it off is not), while
+# `[server]`, `[iroh]`, `[peers]`, the `[auth]` TOTP parameters and `[log]`
+# need a restart.
 
 # ===== Server Configuration =====
 
