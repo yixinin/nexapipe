@@ -650,13 +650,13 @@ fn debug_of_a_whole_invite_redacts_the_credential_it_carries() {
 fn a_parameter_name_is_matched_without_its_case() {
     let bare = EndpointInvite::new(EndpointTarget::NodeId(node_id().to_string()), &[]).unwrap();
     let uri = format!(
-        "{}&Secret=JBSWY3DPEHPK3PXP&client=client-001",
+        "{}&Secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&client=client-001",
         bare.to_uri()
     );
     let parsed = EndpointInvite::from_uri(&uri).expect("the code carries a credential");
     let totp = parsed.totp.expect("the credential is not dropped");
     assert_eq!(totp.client_id, "client-001");
-    assert_eq!(totp.secret.as_str(), "JBSWY3DPEHPK3PXP");
+    assert_eq!(totp.secret.as_str(), "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
 }
 
 /// A malformed escape sequence is refused rather than kept as a literal `%`.

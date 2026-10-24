@@ -309,10 +309,10 @@ class EndpointInviteTest {
      */
     @Test
     fun a_parameter_name_is_matched_without_its_case() {
-        val uri = "${bare()}&Secret=JBSWY3DPEHPK3PXP&client=client-001"
+        val uri = "${bare()}&Secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&client=client-001"
         val invite = success(uri)
         assertEquals("client-001", invite.totp?.clientId)
-        assertEquals("JBSWY3DPEHPK3PXP", invite.totp?.secret)
+        assertEquals("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", invite.totp?.secret)
     }
 
     /**
