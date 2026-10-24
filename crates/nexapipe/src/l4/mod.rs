@@ -632,7 +632,20 @@ where
         }
     };
 
-    let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
+    // The bind is the one step of the flow that can fail for reasons that
+    // have nothing to do with the backend: an exhausted descriptor table, a
+    // host with IPv6 disabled. It is answered like the other failures are —
+    // one status byte, so the client can tell a backend it could not reach
+    // from a server that closed the tunnel without answering.
+    let socket = Arc::new(match UdpSocket::bind(bind_addr).await {
+        Ok(socket) => socket,
+        Err(e) => {
+            let _ = write_status(&mut stream, Status::BackendFailed).await;
+            return Err(anyhow::anyhow!(
+                "failed to bind the UDP socket on {bind_addr}: {e}"
+            ));
+        }
+    });
 
     // A connected UDP socket drops datagrams from anybody else, which keeps an
     // off-path attacker from injecting replies into the tunnel.
@@ -1105,5 +1118,50 @@ mod flow_tests {
             "a refused flow reports success"
         );
         assert_eq!(budget.held(), 0, "a refused flow holds bytes");
+    }
+
+    /// A flow that cannot bind its socket is answered, not dropped.
+    ///
+    /// Every other decision path in the flow writes exactly one status byte
+    /// before the stream ends. The bind did not, so the client saw the
+    /// server close the tunnel without answering — which it can only report
+    /// as "the server closed the UDP tunnel before answering" rather than as
+    /// a backend that could not be reached — and the access log recorded the
+    /// flow as a bare 502 with no cause.
+    #[tokio::test]
+    async fn a_udp_flow_that_cannot_bind_its_socket_answers_backend_failed() {
+        let budget = Arc::new(ByteBudget::new(FLOW_BUFFER_BYTES));
+        let (mut client, server) = tokio::io::duplex(64);
+
+        let error = serve_udp_flow(
+            server,
+            "127.0.0.1:9".parse().unwrap(),
+            // Not an address, so the bind fails before a socket exists.
+            "not-an-address:0",
+            Vec::new(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            &budget,
+        )
+        .await;
+
+        assert!(error.is_err(), "a flow that cannot bind reports success");
+
+        let mut byte = [0u8; 1];
+        client.read_exact(&mut byte).await.unwrap();
+        assert_eq!(
+            Status::from_byte(byte[0]),
+            Status::BackendFailed,
+            "a flow that cannot bind its socket is not answered with a status"
+        );
+
+        // Exactly one byte: the flow ends on the status, it does not go on to
+        // open the tunnel.
+        let mut rest = [0u8; 1];
+        assert_eq!(
+            client.read(&mut rest).await.unwrap(),
+            0,
+            "the flow wrote more than the status byte"
+        );
     }
 }
