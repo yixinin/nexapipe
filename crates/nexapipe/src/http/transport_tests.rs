@@ -1525,3 +1525,94 @@ async fn a_body_that_is_given_up_on_hands_its_reservation_back() {
         "the body that was given up on hands its reservation back"
     );
 }
+
+/// A client that asks for gzip is answered with it.
+///
+/// The whole negotiation is here, end to end: the header the client sends,
+/// the header that goes back, and the bytes that come with it.
+#[tokio::test]
+async fn a_client_that_asks_for_gzip_is_answered_with_it() {
+    let port = backend_answering(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 5\r\n\r\nhello",
+    )
+    .await;
+    let backend = format!("http://127.0.0.1:{port}");
+    let config = route_table(vec![backend], 1);
+    let clients =
+        BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("http://retry.test/")
+        .header("host", "retry.test")
+        .header("accept-encoding", "gzip")
+        .body(Full::new(bytes::Bytes::new()))
+        .expect("a request");
+
+    let response = proxy_request(&clients, request, config)
+        .await
+        .expect("the backend answers");
+
+    assert_eq!(
+        response
+            .headers()
+            .get("content-encoding")
+            .map(|value| value.to_str().unwrap()),
+        Some("gzip"),
+        "the body was not compressed"
+    );
+
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("the body")
+        .to_bytes();
+    let mut decoded = String::new();
+    std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&body[..]), &mut decoded)
+        .expect("the body is gzip");
+    assert_eq!(decoded, "hello", "the body did not survive the round trip");
+}
+
+/// A client that refuses gzip is answered without it.
+///
+/// RFC 9110 §12.5.3: `gzip;q=0` is the client saying it cannot decode gzip.
+/// A body it cannot read is a body it silently drops, so the answer has to go
+/// out in the clear.
+#[tokio::test]
+async fn a_client_that_refuses_gzip_is_answered_without_it() {
+    let port = backend_answering(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 5\r\n\r\nhello",
+    )
+    .await;
+    let backend = format!("http://127.0.0.1:{port}");
+    let config = route_table(vec![backend], 1);
+    let clients =
+        BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("http://retry.test/")
+        .header("host", "retry.test")
+        .header("accept-encoding", "gzip;q=0")
+        .body(Full::new(bytes::Bytes::new()))
+        .expect("a request");
+
+    let response = proxy_request(&clients, request, config)
+        .await
+        .expect("the backend answers");
+
+    assert!(
+        response.headers().get("content-encoding").is_none(),
+        "the body was compressed anyway: {:?}",
+        response.headers()
+    );
+
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("the body")
+        .to_bytes();
+    assert_eq!(body.as_ref(), b"hello", "the body was changed");
+}

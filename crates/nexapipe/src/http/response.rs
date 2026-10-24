@@ -119,6 +119,41 @@ pub(super) fn should_compress(content_type: Option<&str>) -> bool {
     }
 }
 
+/// Whether the client said it can take a gzip body.
+///
+/// RFC 9110 §12.5.3: a content coding is acceptable when the client names it
+/// and the quality value it gives it is not zero. `gzip;q=0` is the client
+/// saying it cannot decode gzip, and answering with one anyway hands it a
+/// body it did not ask for and cannot read.
+///
+/// The header is a list, not a word: `br, gzip;q=0.5` asks for br first and
+/// accepts gzip at half a weight, and a `gzip;q=0` in the middle of a list
+/// refuses gzip while the rest of the list stands.
+pub(super) fn accepts_gzip(accept_encoding: Option<&str>) -> bool {
+    let Some(header) = accept_encoding else {
+        return false;
+    };
+    header.split(',').any(|coding| {
+        let mut parts = coding.split(';');
+        let name = parts.next().unwrap_or_default().trim();
+        if !name.eq_ignore_ascii_case("gzip") {
+            return false;
+        }
+        // The quality value: a coding with no `q` is asked for at full weight,
+        // and one whose `q` cannot be read is not asked for at all.
+        let quality = parts.find_map(|parameter| {
+            let (name, value) = parameter.split_once('=')?;
+            name.trim()
+                .eq_ignore_ascii_case("q")
+                .then_some(value.trim())
+        });
+        match quality {
+            None => true,
+            Some(value) => value.parse::<f32>().is_ok_and(|quality| quality > 0.0),
+        }
+    })
+}
+
 pub(super) async fn compress_response(
     response: Response<hyper::body::Incoming>,
     encoding: &str,

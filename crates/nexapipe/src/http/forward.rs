@@ -191,8 +191,7 @@ where
 
         if content_encoding.is_none()
             && should_compress(content_type)
-            && let Some(encodings) = accept_encoding
-            && encodings.contains("gzip")
+            && accepts_gzip(accept_encoding.as_deref())
         {
             // The whole body is read and compressed here, so the backend is
             // done with it before the answer goes out: the lease goes back
