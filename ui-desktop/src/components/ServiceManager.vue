@@ -16,7 +16,10 @@ const { t } = useI18n();
 // something is *answering* on the IPC port. A registered service is up as far as the OS is
 // concerned well before it listens, and a service that never answers anything cannot be read as
 // one that is out of date.
-const { refreshServiceRunning, settleService, serviceRunning } = useProxyStore();
+// Which build the service says it is comes from the same place, and for the same reason: the
+// store reads it in the same round trip as the liveness answer, so the two are never compared
+// across two moments — a version read that failed because the IPC was busy is not a drift.
+const { refreshServiceRunning, settleService, serviceRunning, serviceVersion } = useProxyStore();
 
 const state = ref<ServiceState>("not_installed");
 const isLoading = ref(false);
@@ -27,11 +30,6 @@ const messageType = ref<"success" | "error" | "info">("info");
 /// This build, which is what the service is compared against. Empty until the app has said,
 /// and a comparison against nothing is one the panel does not draw.
 const appVersion = ref("");
-/// Which build the service says it is, once something on the IPC port is answering. `null` when
-/// that answer did not come back — either nothing was reachable, which [`serviceRunning`] has
-/// already ruled out by then, or the service predates the question and closes the connection
-/// instead, which is the case the notice is for.
-const serviceVersion = ref<string | null>(null);
 
 /// Which build the service was *installed* from, read from the record the install wrote.
 ///
@@ -85,13 +83,6 @@ async function refresh() {
   }
 
   try {
-    serviceVersion.value = await invoke<string | null>("get_service_version");
-  } catch (e) {
-    console.error("[service] failed to read the service version:", errorDetail(e));
-    serviceVersion.value = null;
-  }
-
-  try {
     installedVersion.value = await invoke<string | null>("get_service_installed_version");
   } catch (e) {
     console.error("[service] failed to read the installed service version:", errorDetail(e));
@@ -106,11 +97,14 @@ async function refresh() {
 /// that simply hadn't answered was reported as drift. That conflation was platform-agnostic but
 /// hit macOS / Linux first when the desktop's webview ACL refused the version query (PR #100),
 /// and it would still bite whenever the daemon's IPC handshake is older than the question.
+///
+/// The build has to be a build the service named: `undefined` means the store has no answer to
+/// give yet, which is not the same as one that differs.
 const versionMismatch = computed(
   () =>
     appVersion.value !== "" &&
     serviceRunning.value &&
-    serviceVersion.value !== null &&
+    typeof serviceVersion.value === "string" &&
     serviceVersion.value !== appVersion.value,
 );
 
@@ -123,6 +117,9 @@ const versionMismatch = computed(
 ///
 /// Drawn as its own computed so the [`needsUpgradeMessage`] can branch on it and the future-
 /// debugging surface stays one boolean away.
+///
+/// `null` and not `undefined`: the store leaves the version unknown while a read that timed out
+/// is all it has, and a service that has merely not answered *yet* is not a drift.
 const versionUnknown = computed(
   () =>
     appVersion.value !== "" &&
@@ -158,8 +155,16 @@ const installedVersionMismatch = computed(
 /// expects. A service left behind by an upgrade keeps running — the job is fine, the
 /// protocol is not — and this is the one signal that says so without the service having to
 /// answer anything.
+///
+/// The service has to have stopped answering and to have not said which build it is. A read
+/// that timed out is neither: the store leaves the liveness and the version alone until the
+/// silence has been repeated, and claiming a drift here on a single missed deadline would
+/// invite a reinstall of a service that was only busy.
 const serviceUnreachable = computed(
-  () => state.value === "running" && !serviceRunning.value,
+  () =>
+    state.value === "running" &&
+    !serviceRunning.value &&
+    serviceVersion.value === null,
 );
 
 /// Any drift state warrants the banner; the wording is what tells them apart.
@@ -256,8 +261,9 @@ async function run(
       await refreshServiceRunning();
     }
     // Re-read even after a failure: an install that could not start the service, or an
-    // uninstall that was refused, still leaves something behind to show. The versions are read
-    // after the service facts above, because the banner compares them against `serviceRunning`.
+    // uninstall that was refused, still leaves something behind to show. The version the
+    // banner compares against comes from the store, which read it in the same round trip as
+    // the service facts above rather than at a moment of its own.
     await refresh();
     // Said after the settle: a command whose effect never showed up is not a success, even
     // though the service manager accepted it.
