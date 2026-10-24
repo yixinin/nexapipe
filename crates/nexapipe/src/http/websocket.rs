@@ -39,6 +39,29 @@ use crate::routes::BackendInfo;
 /// every 8 KiB of the stream.
 const WS_COPY_BUFFER: usize = 64 * 1024;
 
+/// The largest refusal body this proxy carries to the client.
+///
+/// A refusal is an explanation, not a payload: a line of JSON, a short HTML
+/// page, a sentence. Sixteen kilobytes is far more than any of those needs,
+/// and far less than a body would have to be for carrying it whole to be
+/// worth it — and the bound is what stops a backend that answers a refusal
+/// with an endless body from holding the connection open.
+const MAX_REFUSAL_BODY: usize = 16 * 1024;
+
+/// The longest size line a chunked body may have.
+///
+/// The line is a number and, maybe, an extension, and neither is worth more
+/// than this: a longer line is a framing that cannot be followed, and the
+/// body ends where the line stops fitting.
+const MAX_CHUNK_SIZE_LINE: usize = 1024;
+
+/// The longest trailer line a chunked body may have.
+///
+/// The trailers are metadata this proxy does not forward, so a long one is
+/// only a framing to be followed — but it is still a line a backend may keep
+/// sending, and it is bounded like the head is.
+const MAX_TRAILER_LINE: usize = 64 * 1024;
+
 /// What the backend answered to the upgrade.
 pub struct Handshake {
     /// The status the backend answered with.
@@ -53,6 +76,11 @@ pub struct Handshake {
     pub trailing: Vec<u8>,
     /// The backend's stream, for the session itself.
     pub backend: BackendStream,
+    /// The body the backend sent with its refusal.
+    ///
+    /// `None` for the `101`: it has no body, and the bytes after its head
+    /// are the session's rather than the refusal's.
+    pub refusal: Option<RefusalBody>,
 }
 
 impl Handshake {
@@ -71,14 +99,16 @@ impl Handshake {
     /// The backend's refusal, which the client gets as an ordinary answer.
     ///
     /// The backend did not agree to the upgrade, so there is no session: what
-    /// it said is the answer.
+    /// it said is the answer — the status, the headers, and the body, which
+    /// is where the reason for the refusal usually is.
     pub fn refusal_response(&self) -> Response<ProxyBody> {
-        let mut response = Response::new(crate::http::body::empty_body());
+        let mut response = Response::new(self.refusal_body());
         *response.status_mut() =
             StatusCode::from_u16(self.status).unwrap_or(StatusCode::BAD_GATEWAY);
         for (name, value) in &self.headers {
             // The framing headers describe the backend's own hop and say
-            // nothing about this one.
+            // nothing about this one: the body below is framed by this
+            // proxy, with a length of its own.
             if name.as_str().eq_ignore_ascii_case("content-length")
                 || name.as_str().eq_ignore_ascii_case("transfer-encoding")
                 || name.as_str().eq_ignore_ascii_case("connection")
@@ -89,6 +119,49 @@ impl Handshake {
         }
         response
     }
+
+    /// The body the client gets with the refusal.
+    ///
+    /// A body of a known length is carried by a body that knows its length,
+    /// so the answer is framed with that length: the client is never told one
+    /// length and given another.
+    fn refusal_body(&self) -> ProxyBody {
+        let Some(refusal) = &self.refusal else {
+            return crate::http::body::empty_body();
+        };
+        if refusal.bytes.is_empty() || !status_may_have_body(self.status) {
+            return crate::http::body::empty_body();
+        }
+        crate::http::body::bytes_body(refusal.bytes.clone())
+    }
+
+    /// How many bytes the refusal's body carries.
+    ///
+    /// What the client is given, for the access log: a refusal that carries
+    /// an explanation sent those bytes, and a log that says it sent none is
+    /// a log that cannot say what the client was told.
+    pub fn refusal_body_len(&self) -> usize {
+        self.refusal
+            .as_ref()
+            .map_or(0, |refusal| refusal.bytes.len())
+    }
+}
+
+/// The body a backend sent with its refusal of an upgrade.
+///
+/// The bytes are the body itself: the framing the backend used — a length,
+/// the chunks, the end of the connection — is not part of them, because the
+/// client gets the body and not the way it was sent.
+pub struct RefusalBody {
+    /// The bytes of the body.
+    pub bytes: bytes::Bytes,
+    /// Whether the body is short of what the backend promised.
+    ///
+    /// A backend that declared a length and then sent less, or one that was
+    /// cut off by the limit or by the deadline, leaves a body that is not the
+    /// whole one. The client still gets what arrived — the reason is usually
+    /// in it — but the answer does not claim to be more than it is.
+    pub truncated: bool,
 }
 
 /// Whether the request is an upgrade this module handles.
@@ -209,13 +282,402 @@ pub async fn handshake(
     }
 
     let parsed = crate::http::legacy::parse_http_response_legacy(&response_buf)?;
+    let status = parsed.status().as_u16();
+    let headers = parsed.headers().clone();
+
+    // The `101` has no body: the bytes after its head are the session's, and
+    // they are already in `trailing`.
+    if status == 101 {
+        return Ok(Handshake {
+            status,
+            headers,
+            trailing,
+            backend: backend_stream,
+            refusal: None,
+        });
+    }
+
+    // A refusal has a body, and the body is the point of it: a backend that
+    // answers `403` with a JSON explanation says why in the body, and a
+    // client that is given the status alone cannot tell what went wrong.
+    //
+    // The body is read here rather than at the call site because this is the
+    // only place that speaks HTTP/1 to a backend by hand: the framing the
+    // backend used has to be followed here, and what comes out of it is the
+    // body the client gets.
+    let refusal = read_refusal_body(
+        status,
+        &mut backend_stream,
+        &headers,
+        trailing,
+        timeouts.deadlines.body,
+    )
+    .await;
+    if refusal.truncated {
+        tracing::warn!(
+            "The backend's refusal of the WebSocket upgrade is short: {} bytes",
+            refusal.bytes.len()
+        );
+    }
 
     Ok(Handshake {
-        status: parsed.status().as_u16(),
-        headers: parsed.headers().clone(),
-        trailing,
+        status,
+        headers,
+        // The bytes after the head were the beginning of the body, and the
+        // body is now read: there is nothing left over for the session.
+        trailing: Vec::new(),
         backend: backend_stream,
+        refusal: Some(refusal),
     })
+}
+
+/// Reads the body a backend sent with its refusal of an upgrade.
+///
+/// The body is read by hand, because the proxy is the one that has to follow
+/// the backend's framing and then re-frame it for the client: a length, the
+/// chunks, or the end of the connection. Whatever the backend used, what the
+/// client gets is the body itself — the framing describes the backend's own
+/// hop and says nothing about this one.
+///
+/// The read is bounded twice over: by the size of the body and by the
+/// deadline. A declared length is not believed — the limit is checked
+/// against the bytes as they arrive — and a body without a length is read
+/// until the backend closes the connection, which is what such a body means.
+async fn read_refusal_body(
+    status: u16,
+    stream: &mut BackendStream,
+    headers: &HeaderMap,
+    trailing: Vec<u8>,
+    deadline: Duration,
+) -> RefusalBody {
+    // A status that has no content has no body: RFC 9110 gives a `1xx`, a
+    // `204` and a `304` none, and bytes after one of them are not a body —
+    // a client reads them as the next message.
+    if !status_may_have_body(status) {
+        return RefusalBody {
+            bytes: bytes::Bytes::new(),
+            truncated: false,
+        };
+    }
+
+    let mut reader = BodyReader::new(stream, trailing, deadline);
+    let (bytes, truncated) = match Framing::of(headers) {
+        Framing::Length(len) => read_length(&mut reader, len).await,
+        Framing::Chunked => read_chunked(&mut reader).await,
+        Framing::UntilClose => read_until_close(&mut reader).await,
+    };
+
+    RefusalBody {
+        bytes: bytes::Bytes::from(bytes),
+        truncated,
+    }
+}
+
+/// Whether a status may carry a body.
+///
+/// RFC 9110: a `1xx`, a `204` and a `304` have no content, and bytes after
+/// one of them are not a body.
+fn status_may_have_body(status: u16) -> bool {
+    !matches!(status, 101..=199 | 204 | 304)
+}
+
+/// How the backend framed the body of its refusal.
+enum Framing {
+    /// A length: the body is exactly this many bytes.
+    Length(usize),
+    /// Chunks: the body is a sequence of chunks, and the framing is not part
+    /// of it.
+    Chunked,
+    /// Neither: the body ends when the connection does.
+    UntilClose,
+}
+
+impl Framing {
+    /// The framing the backend's headers describe.
+    ///
+    /// The chunking wins over a length: RFC 9110 says a message that carries
+    /// both is framed by the chunking, and the chunking is the one that
+    /// describes the bytes that are actually there.
+    fn of(headers: &HeaderMap) -> Framing {
+        if is_chunked(headers) {
+            return Framing::Chunked;
+        }
+        if let Some(len) = content_length(headers) {
+            return Framing::Length(len);
+        }
+        Framing::UntilClose
+    }
+}
+
+/// Whether the backend said it is sending the body in chunks.
+fn is_chunked(headers: &HeaderMap) -> bool {
+    headers
+        .get_all("transfer-encoding")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| {
+            value
+                .rsplit(',')
+                .next()
+                .map(str::trim)
+                .is_some_and(|last| last.eq_ignore_ascii_case("chunked"))
+        })
+}
+
+/// The length the backend gave its body, if it gave one that can be read.
+///
+/// A length that cannot be read, and a message with two lengths that
+/// disagree, are both messages whose body cannot be found: they are treated
+/// as a body without one.
+fn content_length(headers: &HeaderMap) -> Option<usize> {
+    let mut lengths: Vec<usize> = Vec::new();
+    for value in headers.get_all("content-length") {
+        let Ok(value) = value.to_str() else {
+            return None;
+        };
+        let Ok(length) = value.trim().parse::<usize>() else {
+            return None;
+        };
+        lengths.push(length);
+    }
+    let first = *lengths.first()?;
+    if lengths.iter().any(|other| *other != first) {
+        return None;
+    }
+    Some(first)
+}
+
+/// Reads a body the backend gave a length for.
+///
+/// The length is not believed: the limit is checked against the bytes as they
+/// arrive, and a body that is shorter than the length it was given is a body
+/// that was cut short.
+async fn read_length(reader: &mut BodyReader<'_>, len: usize) -> (Vec<u8>, bool) {
+    let want = len.min(MAX_REFUSAL_BODY);
+    let (bytes, complete) = reader.read_exact(want).await;
+    (bytes, !complete || want < len)
+}
+
+/// Reads a body that ends when the connection does.
+///
+/// A body without a length is a body that ends when the connection ends, so
+/// the end of the connection is where this one is whole — and it is over the
+/// limit or out of time that makes it short.
+async fn read_until_close(reader: &mut BodyReader<'_>) -> (Vec<u8>, bool) {
+    let mut body = Vec::new();
+    loop {
+        if reader.pending().is_empty() {
+            match reader.fill().await {
+                Ok(true) => {}
+                Ok(false) => return (body, false),
+                Err(_) => return (body, true),
+            }
+        }
+        let room = MAX_REFUSAL_BODY - body.len();
+        if room == 0 {
+            return (body, true);
+        }
+        let take = room.min(reader.pending().len());
+        body.extend_from_slice(&reader.take(take));
+    }
+}
+
+/// Reads a chunked body and drops the framing.
+///
+/// The chunks are how the backend sent the body; the client gets the body.
+/// The sizes are read as they come, and the limit is checked against the
+/// bytes as they arrive: a chunk that says it is enormous does not make the
+/// proxy believe it.
+async fn read_chunked(reader: &mut BodyReader<'_>) -> (Vec<u8>, bool) {
+    let mut body = Vec::new();
+    loop {
+        let line = match reader.read_line(MAX_CHUNK_SIZE_LINE).await {
+            Ok(Some(line)) => line,
+            // The end of the connection, or a framing that cannot be
+            // followed: the body is short of what it was.
+            Ok(None) | Err(_) => return (body, true),
+        };
+        let Some(size) = chunk_size(&line) else {
+            return (body, true);
+        };
+        if size == 0 {
+            // The trailers end the body. They are not forwarded: the client
+            // gets the body, and this proxy frames it.
+            loop {
+                match reader.read_line(MAX_TRAILER_LINE).await {
+                    Ok(Some(line)) if line.is_empty() => return (body, false),
+                    Ok(Some(_)) => continue,
+                    Ok(None) | Err(_) => return (body, true),
+                }
+            }
+        }
+        let room = MAX_REFUSAL_BODY - body.len();
+        if room == 0 {
+            return (body, true);
+        }
+        let want = size.min(room as u64) as usize;
+        let (data, complete) = reader.read_exact(want).await;
+        body.extend_from_slice(&data);
+        if !complete || want as u64 != size {
+            return (body, true);
+        }
+        // The line ending that ends the chunk.
+        let (ending, complete) = reader.read_exact(2).await;
+        if !complete || ending.as_slice() != b"\r\n".as_slice() {
+            return (body, true);
+        }
+    }
+}
+
+/// The size a chunk's size line says, if it says one.
+///
+/// The line is the size and, maybe, an extension: `1*HEXDIG [ ";" chunk-ext ]`.
+fn chunk_size(line: &[u8]) -> Option<u64> {
+    let size = match line.iter().position(|byte| *byte == b';') {
+        Some(at) => &line[..at],
+        None => line,
+    };
+    let text = std::str::from_utf8(size).ok()?.trim();
+    u64::from_str_radix(text, 16).ok()
+}
+
+/// The backend's bytes, read a piece at a time.
+///
+/// The bytes that came with the head are the first of the body, and they are
+/// already read: reading them again would lose them, so they are the
+/// reader's first buffer.
+struct BodyReader<'a> {
+    stream: &'a mut BackendStream,
+    /// The bytes that have been read but not used yet.
+    buffered: Vec<u8>,
+    /// How much of `buffered` has been used.
+    used: usize,
+    /// When the read runs out of time.
+    ///
+    /// A phase deadline, taken once: a backend that sends a byte before each
+    /// expiry renews nothing.
+    deadline: tokio::time::Instant,
+}
+
+impl<'a> BodyReader<'a> {
+    fn new(stream: &'a mut BackendStream, buffered: Vec<u8>, deadline: Duration) -> Self {
+        Self {
+            stream,
+            buffered,
+            used: 0,
+            deadline: tokio::time::Instant::now() + deadline,
+        }
+    }
+
+    /// The bytes that are read but not used yet.
+    fn pending(&self) -> &[u8] {
+        &self.buffered[self.used..]
+    }
+
+    /// Uses up to `n` of the pending bytes.
+    fn take(&mut self, n: usize) -> Vec<u8> {
+        let end = (self.used + n).min(self.buffered.len());
+        let taken = self.buffered[self.used..end].to_vec();
+        self.used = end;
+        taken
+    }
+
+    /// Reads more of the backend's bytes.
+    ///
+    /// `Ok(true)` is more bytes, `Ok(false)` is the end of the connection, and
+    /// an error is the deadline or a broken connection: both end the body.
+    async fn fill(&mut self) -> std::io::Result<bool> {
+        if self.used == self.buffered.len() {
+            self.buffered.clear();
+            self.used = 0;
+        }
+        let mut chunk = [0u8; 8192];
+        let read = tokio::time::timeout_at(self.deadline, self.stream.read(&mut chunk)).await;
+        match read {
+            Ok(Ok(0)) => Ok(false),
+            Ok(Ok(n)) => {
+                self.buffered.extend_from_slice(&chunk[..n]);
+                Ok(true)
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the backend did not finish the refusal body in time",
+            )),
+        }
+    }
+
+    /// Reads exactly `n` bytes, or as many as there are.
+    ///
+    /// The second value says whether they were all there: a backend that
+    /// promised a length and sent less broke its promise, and the body it
+    /// sent is short.
+    async fn read_exact(&mut self, n: usize) -> (Vec<u8>, bool) {
+        let mut out = Vec::with_capacity(n.min(MAX_REFUSAL_BODY));
+        while out.len() < n {
+            if self.pending().is_empty() {
+                match self.fill().await {
+                    Ok(true) => {}
+                    Ok(false) => return (out, false),
+                    Err(_) => return (out, false),
+                }
+            }
+            let take = (n - out.len()).min(self.pending().len());
+            out.extend_from_slice(&self.take(take));
+        }
+        (out, true)
+    }
+
+    /// Reads one line, without its ending.
+    ///
+    /// `Ok(None)` is the end of the connection before a line; a line longer
+    /// than `max` is an error, because a framing that cannot be followed is
+    /// not a framing.
+    async fn read_line(&mut self, max: usize) -> std::io::Result<Option<Vec<u8>>> {
+        let mut line = Vec::new();
+        loop {
+            if self.pending().is_empty() {
+                match self.fill().await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Ok(if line.is_empty() { None } else { Some(line) });
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            match self.pending().iter().position(|byte| *byte == b'\n') {
+                Some(at) => {
+                    let mut rest = self.take(at + 1);
+                    // The line ending goes with the line: what is left is the
+                    // line itself.
+                    rest.pop();
+                    if rest.last() == Some(&b'\r') {
+                        rest.pop();
+                    }
+                    line.extend_from_slice(&rest);
+                    if line.len() > max {
+                        return Err(line_too_long());
+                    }
+                    return Ok(Some(line));
+                }
+                None => {
+                    let pending = self.pending().len();
+                    line.extend_from_slice(&self.take(pending));
+                    if line.len() > max {
+                        return Err(line_too_long());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The error a line that cannot be followed is.
+fn line_too_long() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "the line is longer than the framing allows",
+    )
 }
 
 /// How long the session waits for the other direction after one of them ends.
