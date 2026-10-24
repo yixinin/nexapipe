@@ -231,7 +231,7 @@ fn an_absent_algorithm_name_is_the_default() {
 /// that reason; this is the test that keeps the hand-written ones honest.
 #[test]
 fn no_debug_output_carries_a_secret() {
-    let secret = "JBSWY3DPEHPK3PXP";
+    let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
     let config = TwoFactorConfig {
         client_id: "node-1".to_string(),
         secret: SecretString::new(secret.to_string()),
@@ -271,7 +271,7 @@ fn no_debug_output_carries_a_secret() {
 fn a_masked_secret_still_says_whether_there_is_one() {
     let with_secret = TwoFactorConfig {
         client_id: "node-1".to_string(),
-        secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+        secret: SecretString::new("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()),
         algorithm: TotpAlgorithm::SHA1,
     };
     let without = TwoFactorConfig {
@@ -289,9 +289,9 @@ fn a_masked_secret_still_says_whether_there_is_one() {
         present != absent,
         "a masked secret and an absent one are indistinguishable"
     );
-    assert!(present.contains("16 chars"), "the length is not reported");
+    assert!(present.contains("32 chars"), "the length is not reported");
     // The whole point of masking, stated as a test: the length is not the value.
-    assert!(!present.contains("JBSWY3DPEHPK3PXP"));
+    assert!(!present.contains("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"));
 }
 
 /// A stand-in nonce, built rather than written out — the twin of the helper
@@ -318,7 +318,7 @@ fn enrollment_messages_keep_their_wire_names() {
 
     let issue = AuthMessage::EnrollIssue {
         client_id: "client-001".to_string(),
-        secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+        secret: SecretString::new("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()),
         algorithm: ProtoAlgorithm::Sha1,
         digits: 6,
         period: 30,
@@ -507,13 +507,13 @@ fn a_key_credential_signs_the_nonce_then_the_little_endian_timestamp() {
 fn an_issued_credential_comes_back_in_the_form_it_was_configured_with() {
     let auth = TwoFactorAuth::with_params(
         "client-001",
-        "JBSWY3DPEHPK3PXP",
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
         TotpAlgorithm::SHA256,
         30,
         6,
     )
     .unwrap();
-    assert_eq!(auth.secret_base32(), "JBSWY3DPEHPK3PXP");
+    assert_eq!(auth.secret_base32(), "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
     assert_eq!(auth.algorithm_name(), "sha256");
 }
 
@@ -523,15 +523,19 @@ fn an_issued_credential_comes_back_in_the_form_it_was_configured_with() {
 #[test]
 fn a_secret_decodes_in_any_spelling() {
     for spelling in [
-        "JBSWY3DPEHPK3PXP",
-        "jbswy3dpehpk3pxp",
-        "JbSwY3dPeHpK3pXp",
-        "JBSW Y3DP EHPK 3PXP",
-        "jbswy3dpehpk3pxp==",
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+        "jbswy3dpehpk3pxpjbswy3dpehpk3pxp",
+        "JbSwY3dPeHpK3pXpJbSwY3dPeHpK3pXp",
+        "JBSW Y3DP EHPK 3PXP JBSW Y3DP EHPK 3PXP",
+        "jbswy3dpehpk3pxpjbswy3dpehpk3pxp==",
     ] {
         let auth = TwoFactorAuth::new("client-001", spelling, TotpAlgorithm::SHA1)
             .unwrap_or_else(|e| panic!("{spelling:?} should decode: {e}"));
-        assert_eq!(auth.secret_base32(), "JBSWY3DPEHPK3PXP", "{spelling:?}");
+        assert_eq!(
+            auth.secret_base32(),
+            "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+            "{spelling:?}"
+        );
     }
 }
 
@@ -543,15 +547,58 @@ fn a_secret_that_is_not_base32_is_still_refused() {
     assert!(TwoFactorAuth::new("client-001", "", TotpAlgorithm::SHA1).is_err());
 }
 
+/// A secret that decodes to less than 128 bits is refused where it is
+/// configured.
+///
+/// The TOTP library refuses such a seed when the validator is built, which
+/// happens at the first handshake — so without this the only symptom of a
+/// secret that can never work is a library error about a secret length, at
+/// the moment a connection is being made. The floor is the same one the
+/// server applies when it reads the config, and the same one the invite
+/// parser applies when it reads an invite.
+#[test]
+fn a_secret_too_short_to_be_a_secret_is_refused() {
+    // One byte, five bytes, ten bytes: each of these decodes cleanly, and
+    // each of them is below the floor.
+    for short in ["ab", "AEBAGBAF", "JBSWY3DPEHPK3PXP"] {
+        let error = TwoFactorAuth::new("client-001", short, TotpAlgorithm::SHA1)
+            .expect_err("a seed under 128 bits is refused");
+        let error = error.to_string();
+        assert!(
+            error.contains("at least 16 bytes"),
+            "the refusal says what the floor is: {error}"
+        );
+        assert!(
+            !error.contains(short),
+            "the secret is not quoted back: {error}"
+        );
+    }
+
+    // Sixteen bytes is the floor itself, and it is accepted.
+    assert!(
+        TwoFactorAuth::new(
+            "client-001",
+            "AEBAGBAFAYDQQCIKBMGA2DQPCA",
+            TotpAlgorithm::SHA1
+        )
+        .is_ok(),
+        "a 128-bit secret is the shortest one that works"
+    );
+}
+
 /// A device is named on AUTH_START *and* on AUTH_RESPONSE, because the
 /// server reads the name off the response when it decides which secret to
 /// check against. Naming it on the first alone would ask to be counted as a
 /// device while proving possession of the client's own secret.
 #[test]
 fn a_named_device_speaks_on_both_messages() {
-    let auth = TwoFactorAuth::new("client-001", "JBSWY3DPEHPK3PXP", TotpAlgorithm::SHA1)
-        .unwrap()
-        .with_device("laptop-7f3a9c21");
+    let auth = TwoFactorAuth::new(
+        "client-001",
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+        TotpAlgorithm::SHA1,
+    )
+    .unwrap()
+    .with_device("laptop-7f3a9c21");
     assert_eq!(auth.device_id(), Some("laptop-7f3a9c21"));
 
     let start = AuthMessage::Start {
@@ -580,7 +627,12 @@ fn a_named_device_speaks_on_both_messages() {
 /// has never seen.
 #[test]
 fn an_unnamed_device_leaves_the_field_off_the_wire() {
-    let auth = TwoFactorAuth::new("client-001", "JBSWY3DPEHPK3PXP", TotpAlgorithm::SHA1).unwrap();
+    let auth = TwoFactorAuth::new(
+        "client-001",
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+        TotpAlgorithm::SHA1,
+    )
+    .unwrap();
     assert_eq!(auth.device_id(), None);
 
     let start = AuthMessage::Start {
@@ -598,7 +650,7 @@ fn an_unnamed_device_leaves_the_field_off_the_wire() {
 /// one still has to deserialize.
 #[test]
 fn an_issue_from_a_server_that_names_no_device_still_parses() {
-    let wire = br#"{"type":"ENROLL_ISSUE","client_id":"client-001","secret":"JBSWY3DPEHPK3PXP","algorithm":"SHA1","digits":6,"period":30}"#;
+    let wire = br#"{"type":"ENROLL_ISSUE","client_id":"client-001","secret":"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP","algorithm":"SHA1","digits":6,"period":30}"#;
     let issue = AuthMessage::from_bytes(wire).unwrap();
     match issue {
         AuthMessage::EnrollIssue { device_id, .. } => assert_eq!(device_id, None),
@@ -688,7 +740,12 @@ fn a_device_key_that_is_not_a_key_is_refused() {
 /// payload as JSON and would choke on it.
 #[test]
 fn the_first_message_announces_the_version_the_client_speaks() {
-    let auth = TwoFactorAuth::new("client-001", "JBSWY3DPEHPK3PXP", TotpAlgorithm::SHA1).unwrap();
+    let auth = TwoFactorAuth::new(
+        "client-001",
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+        TotpAlgorithm::SHA1,
+    )
+    .unwrap();
     let start = auth.start_message(1);
 
     assert_eq!(

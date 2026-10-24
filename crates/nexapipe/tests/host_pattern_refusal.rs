@@ -56,7 +56,7 @@ fn an_allow_hosts_entry_that_folds_into_the_catch_all_is_refused() {
             "[auth]\n\
              \n\
              [auth.clients.client-001]\n\
-             secret = \"JBSWY3DPEHPK3PXP\"\n\
+             secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
              allow_hosts = [\"{spelling}\"]\n"
         ))
         .expect_err("the pattern has to be refused");

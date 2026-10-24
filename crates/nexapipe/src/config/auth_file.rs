@@ -368,7 +368,7 @@ impl ProxyConfig {
                     let window = auth_toml.window.unwrap_or(1);
                     validate_totp_parameters(time_step, digits, window)?;
 
-                    Some(crate::auth::AuthConfig {
+                    let auth = crate::auth::AuthConfig {
                         enabled: auth_toml.enabled.unwrap_or(false),
                         issuer: auth_toml
                             .issuer
@@ -380,7 +380,13 @@ impl ProxyConfig {
                         clients,
                         max_attempts: auth_toml.max_attempts.unwrap_or(5),
                         lockout_duration: auth_toml.lockout_duration.unwrap_or(300),
-                    })
+                    };
+                    // A seed that cannot work is a configuration error, and
+                    // this is where it is found: the seed is decoded lazily
+                    // otherwise, so it would surface as a failed login at the
+                    // operator's first attempt.
+                    crate::auth::config::validate_seeds(&auth)?;
+                    Some(auth)
                 } else {
                     None
                 }

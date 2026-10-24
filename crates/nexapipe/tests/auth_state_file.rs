@@ -22,7 +22,7 @@ fn config_with_client() -> &'static str {
      max_attempts = 3\n\
      lockout_duration = 300\n\
      [auth.clients.client-001]\n\
-     secret = \"JBSWY3DPEHPK3PXP\"\n\
+     secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
      created_at = \"1723756800\"\n\
      [auth.clients.client-001.devices.laptop]\n\
      secret = \"KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP\"\n\
@@ -72,7 +72,7 @@ fn a_counted_failure_lands_in_the_state_file_and_not_in_the_configuration() {
         "one mistake is not a lockout yet: {state_on_disk}"
     );
     assert!(
-        !state_on_disk.contains("JBSWY3DPEHPK3PXP"),
+        !state_on_disk.contains("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"),
         "a credential has no business in the state file: {state_on_disk}"
     );
 
@@ -132,7 +132,7 @@ fn a_configuration_that_carries_counters_still_locks_out() {
          max_attempts = 3\n\
          lockout_duration = 300\n\
          [auth.clients.client-001]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          created_at = \"1723756800\"\n\
          failed_attempts = 3\n\
          locked_until = 4102444800\n",

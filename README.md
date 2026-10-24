@@ -592,10 +592,10 @@ What those commands read and write is a `devices` table beside the client's own
 
 ```toml
 [auth.clients.client-001]
-secret = "JBSWY3DPEHPK3PXP"        # the credential of the device that names none
+secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"        # the credential of the device that names none
 
 [auth.clients.client-001.devices.laptop]
-secret = "MFRGGZDFMZTWQ2LK"        # issued at enrollment, revocable on its own
+secret = "MFRGGZDFMZTWQ2LKMFRGGZDFMZTWQ2LK"        # issued at enrollment, revocable on its own
 created_at = "1723756800"
 ```
 
@@ -1499,8 +1499,15 @@ with a key, a signature over that connection's challenge (see
    lockout_duration = 300
 
    [auth.clients.client-001]     # written by --generate-2fa
-   secret = "JBSWY3DPEHPK3PXP"
+   secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
    ```
+
+   A secret has to be at least 16 bytes once Base32-decoded — 128 bits, what
+   RFC 4226 asks for and what the TOTP library both sides use refuses to work
+   with below. A shorter one is refused when the config is read, and the
+   refusal names the client and the device it belongs to: a seed that cannot
+   verify is a configuration error, and finding it out at the first login is
+   too late.
 
 3. On the client, either scan the QR code in the app, or set the credentials in
    `[local_proxy.two_factor]`:
@@ -1509,7 +1516,7 @@ with a key, a signature over that connection's challenge (see
    [local_proxy.two_factor]
    enabled = true
    client_id = "client-001"
-   secret = "JBSWY3DPEHPK3PXP"
+   secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
    algorithm = "sha1"
    ```
 
@@ -1536,7 +1543,7 @@ The QR code carries a standard `otpauth://` URI, so any authenticator app can
 import it:
 
 ```text
-otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXP&issuer=NexaPipe&algorithm=SHA1&digits=6&period=30
+otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=NexaPipe&algorithm=SHA1&digits=6&period=30
 ```
 
 - Set `issuer` under `[auth]` to change the label shown by the app; `--issuer`
@@ -1631,7 +1638,7 @@ cargo run -p nexapipe -- --generate-invite client-001 --qr-format unicode
 ```text
 nexapipe://endpoint/a612…7063?v=1&name=Home&domains=app.example.com,comfyui.example.com
     &relay=https://relay.example&client=client-001&issuer=NexaPipe
-    &secret=JBSWY3DPEHPK3PXP&algorithm=SHA1&digits=6&period=30
+    &secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&algorithm=SHA1&digits=6&period=30
 ```
 
 | Part | Meaning |

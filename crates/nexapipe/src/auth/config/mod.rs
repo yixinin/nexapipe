@@ -292,6 +292,38 @@ impl AuthConfig {
     }
 }
 
+/// Checks every seed in the configuration.
+///
+/// The decode is lazy: a seed is read when a connection proves itself, and
+/// the TOTP library refuses a seed under 128 bits when it builds the
+/// validator. So without this, a seed that cannot work is found at the
+/// operator's first login — long after it was accepted, handed out in an
+/// enrollment URI and written down — and it is found as a failed
+/// authentication rather than as the configuration error it is.
+///
+/// A seed that is empty is not a seed: a client with no secret of its own
+/// answers with the device's, and a device that proves itself with a
+/// signature carries no seed at all.
+pub fn validate_seeds(config: &AuthConfig) -> anyhow::Result<()> {
+    for (client_id, client) in &config.clients {
+        if !client.secret.as_str().is_empty() {
+            decode_base32_secret(client.secret.as_str()).map_err(|reason| {
+                anyhow::anyhow!("the seed of client {client_id:?} is not usable: {reason}")
+            })?;
+        }
+        for (device, entry) in &client.devices {
+            if !entry.secret.as_str().is_empty() {
+                decode_base32_secret(entry.secret.as_str()).map_err(|reason| {
+                    anyhow::anyhow!(
+                        "the seed of device {device:?} of client {client_id:?} is not usable: {reason}"
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Decodes a stored Base32 secret, shared by [`ClientAuth`] and
 /// [`DeviceAuth`].
 ///
@@ -306,12 +338,25 @@ fn decode_base32_secret(stored: &str) -> Result<SecretBytes, anyhow::Error> {
     // being left in the heap for the allocator to hand out again.
     let secret = crate::auth::otpauth::normalize_secret(stored)
         .ok_or_else(|| anyhow::anyhow!("Invalid Base32 secret"))?;
-    base32::decode(
+    let decoded = base32::decode(
         base32::Alphabet::Rfc4648 { padding: false },
         secret.as_str(),
     )
-    .map(SecretBytes::new)
-    .ok_or_else(|| anyhow::anyhow!("Invalid Base32 secret"))
+    .ok_or_else(|| anyhow::anyhow!("Invalid Base32 secret"))?;
+    // A seed that decodes to nothing is a challenge keyed with an empty key,
+    // and one that decodes to a handful of bytes is a challenge anybody can
+    // brute force. The TOTP library refuses such a seed when the validator is
+    // built, which is at the operator's first login: the seed is refused here
+    // instead, at the start, where the operator is told why.
+    if decoded.len() < crate::auth::otpauth::MIN_SECRET_BYTES {
+        anyhow::bail!(
+            "the seed decodes to {} byte{}; a TOTP secret is at least {} bytes",
+            decoded.len(),
+            if decoded.len() == 1 { "" } else { "s" },
+            crate::auth::otpauth::MIN_SECRET_BYTES
+        );
+    }
+    Ok(SecretBytes::new(decoded))
 }
 
 /// Seconds since the Unix epoch.

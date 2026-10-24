@@ -149,7 +149,7 @@ fn invite() -> EndpointInvite {
     .unwrap()
     .with_name("Home")
     .with_totp(Some(
-        InviteTotp::new("client-001", "jbswy3dpehpk3pxp").unwrap(),
+        InviteTotp::new("client-001", "jbswy3dpehpk3pxpjbswy3dpehpk3pxp").unwrap(),
     ))
 }
 
@@ -376,8 +376,8 @@ fn rejects_a_relay_that_is_not_a_url() {
 
 #[test]
 fn normalizes_the_secret() {
-    let totp = InviteTotp::new("client-001", " jbswy3dpehpk3pxp== ").unwrap();
-    assert_eq!(totp.secret.as_str(), "JBSWY3DPEHPK3PXP");
+    let totp = InviteTotp::new("client-001", " jbswy3dpehpk3pxpjbswy3dpehpk3pxp== ").unwrap();
+    assert_eq!(totp.secret.as_str(), "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
     assert_eq!(totp.issuer, DEFAULT_ISSUER);
 }
 
@@ -385,9 +385,30 @@ fn normalizes_the_secret() {
 fn rejects_a_secret_that_is_not_base32() {
     let error = InviteTotp::new("client-001", "hello-there").unwrap_err();
     assert!(error.to_string().contains("is not Base32"), "{error}");
+}
 
-    let error = InviteTotp::new("client-001", "ab").unwrap_err();
-    assert!(error.to_string().contains("too short"), "{error}");
+/// A secret that decodes to less than 128 bits is refused.
+///
+/// The same floor the server applies: a seed under it is a credential that
+/// can never verify, so an invite carrying one is refused here rather than
+/// at the server's first login — after the user has already imported it and
+/// entered the code their authenticator app shows them.
+#[test]
+fn rejects_a_secret_too_short_to_be_a_secret() {
+    // One byte, five bytes, ten bytes: each of these decodes cleanly, and
+    // each of them is below the floor.
+    for short in ["ab", "AEBAGBAF", "JBSWY3DPEHPK3PXP"] {
+        let error = InviteTotp::new("client-001", short).unwrap_err();
+        let error = error.to_string();
+        assert!(
+            error.contains("at least 16 bytes"),
+            "the refusal says what the floor is: {error}"
+        );
+        assert!(
+            !error.contains(short),
+            "the secret is not quoted back: {error}"
+        );
+    }
 }
 
 #[test]
@@ -403,7 +424,7 @@ fn a_rejected_secret_is_not_quoted_back() {
 #[test]
 fn needs_a_client_id_next_to_the_secret() {
     let uri = format!(
-        "{INVITE_SCHEME}://{NODE_ID_HOST}/{}/?secret=JBSWY3DPEHPK3PXP",
+        "{INVITE_SCHEME}://{NODE_ID_HOST}/{}/?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
         node_id()
     );
     let error = EndpointInvite::from_uri(&uri).unwrap_err();
@@ -422,7 +443,7 @@ fn needs_a_secret_next_to_the_other_two_factor_parameters() {
 
 #[test]
 fn reads_a_nested_otpauth_uri() {
-    let embedded = "otpauth%3A%2F%2Ftotp%2FNexaPipe%3Aclient-001%3Fsecret%3DJBSWY3DPEHPK3PXP\
+    let embedded = "otpauth%3A%2F%2Ftotp%2FNexaPipe%3Aclient-001%3Fsecret%3DJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\
                     %26issuer%3DNexaPipe%26algorithm%3DSHA256";
     let uri = format!(
         "{INVITE_SCHEME}://{NODE_ID_HOST}/{}/?otpauth={embedded}",
@@ -432,7 +453,7 @@ fn reads_a_nested_otpauth_uri() {
     let totp = parsed.totp.unwrap();
     assert_eq!(totp.client_id, "client-001");
     assert_eq!(totp.issuer, "NexaPipe");
-    assert_eq!(totp.secret.as_str(), "JBSWY3DPEHPK3PXP");
+    assert_eq!(totp.secret.as_str(), "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
     assert_eq!(totp.algorithm, TotpAlgorithm::SHA256);
 }
 
@@ -440,7 +461,7 @@ fn reads_a_nested_otpauth_uri() {
 fn rejects_an_algorithm_the_client_cannot_generate() {
     let uri = format!(
         "{INVITE_SCHEME}://{NODE_ID_HOST}/{}/?client=client-001\
-         &secret=JBSWY3DPEHPK3PXP&algorithm=MD5",
+         &secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&algorithm=MD5",
         node_id()
     );
     let error = EndpointInvite::from_uri(&uri).unwrap_err();
@@ -452,7 +473,7 @@ fn rejects_an_algorithm_the_client_cannot_generate() {
     // The default is SHA1, and the name is case insensitive.
     let uri = format!(
         "{INVITE_SCHEME}://{NODE_ID_HOST}/{}/?client=client-001\
-         &secret=JBSWY3DPEHPK3PXP&algorithm=sha256",
+         &secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&algorithm=sha256",
         node_id()
     );
     let parsed = EndpointInvite::from_uri(&uri).unwrap();
@@ -473,7 +494,7 @@ fn reads_a_code_printed_by_the_server() {
     let uri = "nexapipe://endpoint/a612286b30098f67db06783c45004e43cf182e06806540e7e6260a0f009a7063\
                ?v=1&name=Home&domains=example.com,api.example.com\
                &relay=https%3A%2F%2Frelay.example.com\
-               &client=client-001&issuer=NexaPipe&secret=JBSWY3DPEHPK3PXP\
+               &client=client-001&issuer=NexaPipe&secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\
                &algorithm=SHA256&digits=6&period=30";
     let invite = EndpointInvite::from_uri(uri).unwrap();
 
@@ -490,7 +511,7 @@ fn reads_a_code_printed_by_the_server() {
     let totp = invite.totp.as_ref().unwrap();
     assert_eq!(totp.client_id, "client-001");
     assert_eq!(totp.issuer, "NexaPipe");
-    assert_eq!(totp.secret.as_str(), "JBSWY3DPEHPK3PXP");
+    assert_eq!(totp.secret.as_str(), "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
     assert_eq!(totp.algorithm, TotpAlgorithm::SHA256);
     assert_eq!((totp.digits, totp.period), (6, 30));
 
@@ -504,7 +525,7 @@ fn warns_about_two_factor_parameters_the_client_drops() {
     let totp = InviteTotp::with_params(
         DEFAULT_ISSUER,
         "client-001",
-        "JBSWY3DPEHPK3PXP",
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
         TotpAlgorithm::SHA512,
         8,
         60,
@@ -519,7 +540,7 @@ fn warns_about_two_factor_parameters_the_client_drops() {
     assert!(warnings[0].contains("ignored"), "{warnings:?}");
 
     assert!(
-        InviteTotp::new("client-001", "JBSWY3DPEHPK3PXP")
+        InviteTotp::new("client-001", "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
             .unwrap()
             .client_warnings()
             .is_empty()
@@ -563,7 +584,7 @@ fn a_v1_code_may_not_carry_an_enrollment_token() {
 #[test]
 fn a_token_and_a_secret_cannot_share_a_code() {
     let uri = format!(
-        "nexapipe://endpoint/{}?v=2&client=client-001&enroll=token-abc&secret=JBSWY3DPEHPK3PXP",
+        "nexapipe://endpoint/{}?v=2&client=client-001&enroll=token-abc&secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
         node_id()
     );
     let err = EndpointInvite::from_uri(&uri).unwrap_err().to_string();
@@ -573,7 +594,7 @@ fn a_token_and_a_secret_cannot_share_a_code() {
     let invite = EndpointInvite::new(EndpointTarget::NodeId(node_id().to_string()), &[])
         .unwrap()
         .with_totp(Some(
-            InviteTotp::new("client-001", "JBSWY3DPEHPK3PXP").unwrap(),
+            InviteTotp::new("client-001", "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP").unwrap(),
         ))
         .with_enrollment(Some(InviteEnrollment::new("client-001", "tok").unwrap()));
     assert!(invite.totp.is_none());
@@ -590,14 +611,14 @@ fn an_empty_enrollment_token_is_refused() {
 /// error, a UI binding, a log line — may carry one.
 #[test]
 fn debug_never_prints_the_secret() {
-    let totp = InviteTotp::new("client-001", "jbswy3dpehpk3pxp").unwrap();
+    let totp = InviteTotp::new("client-001", "jbswy3dpehpk3pxpjbswy3dpehpk3pxp").unwrap();
     let printed = format!("{totp:?}");
     // Static messages, not `{printed}`: an assertion message is a log sink
     // to a scanner, and one that prints the Debug output taints the secret
     // straight into it — even though what it would print is already
     // redacted, which taint tracking cannot see.
     assert!(
-        !printed.contains("JBSWY3DPEHPK3PXP"),
+        !printed.contains("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"),
         "the secret must not appear in Debug output"
     );
     assert!(
@@ -626,8 +647,15 @@ fn debug_never_prints_the_enrollment_token() {
 #[test]
 fn debug_of_a_whole_invite_redacts_the_credential_it_carries() {
     let printed = format!("{:?}", invite());
-    assert!(!printed.contains("JBSWY3DPEHPK3PXP"), "{printed}");
-    assert!(invite().to_uri().contains("secret=JBSWY3DPEHPK3PXP"));
+    assert!(
+        !printed.contains("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"),
+        "{printed}"
+    );
+    assert!(
+        invite()
+            .to_uri()
+            .contains("secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
+    );
 
     let with_token = EndpointInvite::new(EndpointTarget::NodeId(node_id().to_string()), &[])
         .unwrap()

@@ -16,6 +16,16 @@ mod message;
 mod totp;
 mod two_factor;
 
+/// The smallest seed a TOTP secret may be, in bytes.
+///
+/// The same floor the server applies, and the same one
+/// [`crate::provisioning`] applies to an invite: RFC 4226 asks for at least
+/// 128 bits, and the TOTP library both sides build their codes with refuses
+/// to work with less. A seed under it is a credential that can never verify,
+/// so it is refused where it is configured rather than at the first handshake
+/// — where the only symptom is a library error about a secret length.
+pub(crate) const MIN_SECRET_BYTES: usize = 16;
+
 #[cfg(test)]
 mod tests;
 

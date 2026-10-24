@@ -454,7 +454,9 @@ mod tests {
         last_used: Option<u64>,
     ) -> ClientAuth {
         ClientAuth {
-            secret: nexapipe_proto::secret::SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+            secret: nexapipe_proto::secret::SecretString::new(
+                "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string(),
+            ),
             created_at: "0".to_string(),
             allow_hosts: None,
             allow_ports: None,
@@ -496,7 +498,9 @@ mod tests {
         alice.devices.insert(
             "laptop".to_string(),
             crate::auth::DeviceAuth {
-                secret: nexapipe_proto::secret::SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+                secret: nexapipe_proto::secret::SecretString::new(
+                    "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string(),
+                ),
                 public_key: None,
                 created_at: "0".to_string(),
                 last_used: None,
@@ -518,7 +522,9 @@ mod tests {
         alice.devices.insert(
             "laptop".to_string(),
             crate::auth::DeviceAuth {
-                secret: nexapipe_proto::secret::SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+                secret: nexapipe_proto::secret::SecretString::new(
+                    "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string(),
+                ),
                 public_key: None,
                 created_at: "0".to_string(),
                 last_used: None,

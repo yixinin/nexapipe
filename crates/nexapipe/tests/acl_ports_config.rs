@@ -29,7 +29,7 @@ fn an_allow_ports_list_reaches_the_acl() {
          enabled = true\n\
          \n\
          [auth.clients.client-001]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          allow_ports = [443, 8443]\n",
     )
     .expect("the config has to load");
@@ -54,7 +54,7 @@ fn the_strict_flag_reaches_the_acl() {
          enabled = true\n\
          \n\
          [auth.clients.client-001]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          allow_ports = [443]\n\
          allow_ports_strict = true\n",
     )
@@ -82,7 +82,7 @@ fn the_strict_flag_is_off_by_default() {
          enabled = true\n\
          \n\
          [auth.clients.client-001]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          allow_ports = [443]\n",
     )
     .expect("the config has to load");
@@ -103,7 +103,7 @@ fn a_client_without_allow_ports_is_not_limited_by_ports() {
          enabled = true\n\
          \n\
          [auth.clients.client-001]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n",
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n",
     )
     .expect("the config has to load");
 
@@ -122,7 +122,7 @@ fn the_host_and_the_port_are_independent_in_a_config() {
          enabled = true\n\
          \n\
          [auth.clients.client-001]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          allow_hosts = [\"api.example.com\"]\n\
          allow_ports = [443]\n",
     )
@@ -148,7 +148,7 @@ fn a_port_of_zero_is_refused() {
          enabled = true\n\
          \n\
          [auth.clients.client-001]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          allow_ports = [443, 0]\n",
     )
     .unwrap();

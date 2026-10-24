@@ -38,12 +38,14 @@ fn device(secret: &str) -> DeviceAuth {
 #[test]
 fn authenticating_as_a_device_stamps_that_device() {
     let mut client = client();
-    client
-        .devices
-        .insert("laptop".to_string(), device("LAPTOPSECRET"));
-    client
-        .devices
-        .insert("phone".to_string(), device("PHONESECRET"));
+    client.devices.insert(
+        "laptop".to_string(),
+        device("LAPTOPSECRETLAPTOPSECRETLAPTOPSE"),
+    );
+    client.devices.insert(
+        "phone".to_string(),
+        device("PHONESECRETPHONESECRETPHONESECRE"),
+    );
 
     assert!(
         client.record_device_success_at("laptop", 1_000),
@@ -88,17 +90,20 @@ fn a_secret_decodes_the_way_an_invite_writes_it() {
     // has to decode too, or the client is stuck at "Invalid Base32 secret"
     // with nothing pointing at the spelling.
     let mut lower = client();
-    lower.secret = SecretString::new("jbswy3dpehpk3pxp".to_string());
+    lower.secret = SecretString::new("jbswy3dpehpk3pxpjbswy3dpehpk3pxp".to_string());
     let mut padded = client();
-    padded.secret = SecretString::new("my======".to_string());
+    padded.secret = SecretString::new("JBSWY3DPEHPK3PXPGEZDGNBVGY3TQ===".to_string());
     let mut plain = client();
-    plain.secret = SecretString::new("JBSWY3DPEHPK3PXP".to_string());
+    plain.secret = SecretString::new("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string());
 
     assert_eq!(
         lower.decode_secret().unwrap(),
         plain.decode_secret().unwrap()
     );
-    assert_eq!(padded.decode_secret().unwrap().as_slice(), b"f");
+    assert_eq!(
+        padded.decode_secret().unwrap().as_slice(),
+        b"Hello!\xde\xad\xbe\xef12345678"
+    );
 }
 
 /// `Debug` is what a log line uses, and the whole config — this struct
@@ -108,12 +113,15 @@ fn a_secret_decodes_the_way_an_invite_writes_it() {
 #[test]
 fn a_client_prints_no_credentials() {
     let mut c = client();
-    c.secret = SecretString::new("JBSWY3DPEHPK3PXP".to_string());
+    c.secret = SecretString::new("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string());
     c.pending_enrollment = Some(SecretString::new("deadbeef".to_string()));
 
     let rendered = format!("{c:?}");
     assert!(rendered.contains("<redacted>"), "{rendered}");
-    assert!(!rendered.contains("JBSWY3DPEHPK3PXP"), "{rendered}");
+    assert!(
+        !rendered.contains("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"),
+        "{rendered}"
+    );
     assert!(!rendered.contains("deadbeef"), "{rendered}");
 }
 
@@ -378,7 +386,9 @@ fn the_memory_is_the_credential_s_own() {
     config.clients.insert(
         "alice".to_string(),
         ClientAuth {
-            secret: nexapipe_proto::secret::SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+            secret: nexapipe_proto::secret::SecretString::new(
+                "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string(),
+            ),
             created_at: "0".to_string(),
             allow_hosts: None,
             allow_ports: None,
@@ -388,7 +398,7 @@ fn the_memory_is_the_credential_s_own() {
                 "laptop".to_string(),
                 DeviceAuth {
                     secret: nexapipe_proto::secret::SecretString::new(
-                        "JBSWY3DPEHPK3PXP".to_string(),
+                        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string(),
                     ),
                     public_key: None,
                     created_at: "0".to_string(),
@@ -436,15 +446,19 @@ fn the_memory_is_the_credential_s_own() {
 #[test]
 fn a_device_secret_decodes_the_way_a_clients_does() {
     assert_eq!(
-        device("JBSWY3DPEHPK3PXP")
+        device("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
             .decode_secret()
             .unwrap()
             .as_slice(),
-        b"Hello!\xde\xad\xbe\xef"
+        b"Hello!\xde\xad\xbe\xefHello!\xde\xad\xbe\xef"
     );
     assert_eq!(
-        device("jbswy3dpehpk3pxp").decode_secret().unwrap(),
-        device("JBSWY3DPEHPK3PXP").decode_secret().unwrap(),
+        device(&"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_lowercase())
+            .decode_secret()
+            .unwrap(),
+        device("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
+            .decode_secret()
+            .unwrap(),
         "the case an invite writes is the case this has to read"
     );
     assert!(
@@ -458,11 +472,11 @@ fn a_device_secret_decodes_the_way_a_clients_does() {
 /// an unnamed device has nowhere else to look.
 #[test]
 fn a_client_without_a_device_table_has_none() {
-    let parsed: ClientAuth =
-        toml::from_str(r#"secret = "JBSWY3DPEHPK3PXP""#).expect("a plain client still parses");
+    let parsed: ClientAuth = toml::from_str(r#"secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP""#)
+        .expect("a plain client still parses");
 
     assert!(parsed.devices.is_empty(), "{parsed:?}");
-    assert_eq!(parsed.secret.as_str(), "JBSWY3DPEHPK3PXP");
+    assert_eq!(parsed.secret.as_str(), "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
 }
 
 /// The table is spelled the way a `[auth.clients.<id>]` entry nests it, so
@@ -471,20 +485,23 @@ fn a_client_without_a_device_table_has_none() {
 fn a_device_table_parses_into_named_devices() {
     let parsed: ClientAuth = toml::from_str(
         r#"
-        secret = "CLIENTSECRET"
+        secret = "CLIENTSECRETCLIENTSECRETCLIENTSE"
 
         [devices.laptop]
-        secret = "LAPTOPSECRET"
+        secret = "LAPTOPSECRETLAPTOPSECRETLAPTOPSE"
 
         [devices.phone]
-        secret = "PHONESECRET"
+        secret = "PHONESECRETPHONESECRETPHONESECRE"
         created_at = "1700000000"
         "#,
     )
     .expect("a device table parses");
 
     assert_eq!(parsed.devices.len(), 2);
-    assert_eq!(parsed.devices["laptop"].secret.as_str(), "LAPTOPSECRET");
+    assert_eq!(
+        parsed.devices["laptop"].secret.as_str(),
+        "LAPTOPSECRETLAPTOPSECRETLAPTOPSE"
+    );
     assert_eq!(parsed.devices["phone"].created_at, "1700000000");
     // Issued-at is filled in when the config does not say, the way a
     // client's is: a device with an empty one looks never-issued.
@@ -504,12 +521,12 @@ fn a_device_table_parses_into_named_devices() {
 #[test]
 fn a_client_survives_a_toml_round_trip_unchanged() {
     let written = r#"
-        secret = "CLIENTSECRET"
+        secret = "CLIENTSECRETCLIENTSECRETCLIENTSE"
         created_at = "1700000000"
         pending_enrollment = "deadbeef"
 
         [devices.laptop]
-        secret = "LAPTOPSECRET"
+        secret = "LAPTOPSECRETLAPTOPSECRETLAPTOPSE"
         created_at = "1700000000"
         "#;
 
@@ -517,7 +534,7 @@ fn a_client_survives_a_toml_round_trip_unchanged() {
     let written_back = toml::to_string(&parsed).expect("a client serializes");
 
     assert!(
-        written_back.contains(r#"secret = "CLIENTSECRET""#),
+        written_back.contains(r#"secret = "CLIENTSECRETCLIENTSECRETCLIENTSE""#),
         "{written_back}"
     );
     assert!(
@@ -525,14 +542,17 @@ fn a_client_survives_a_toml_round_trip_unchanged() {
         "{written_back}"
     );
     assert!(
-        written_back.contains(r#"secret = "LAPTOPSECRET""#),
+        written_back.contains(r#"secret = "LAPTOPSECRETLAPTOPSECRETLAPTOPSE""#),
         "{written_back}"
     );
     // And it reads back as the same thing, which is the part that matters
     // for a file the server rewrites on every counter change.
     let reparsed: ClientAuth = toml::from_str(&written_back).expect("it parses back");
-    assert_eq!(reparsed.secret.as_str(), "CLIENTSECRET");
-    assert_eq!(reparsed.devices["laptop"].secret.as_str(), "LAPTOPSECRET");
+    assert_eq!(reparsed.secret.as_str(), "CLIENTSECRETCLIENTSECRETCLIENTSE");
+    assert_eq!(
+        reparsed.devices["laptop"].secret.as_str(),
+        "LAPTOPSECRETLAPTOPSECRETLAPTOPSE"
+    );
 }
 
 /// `Debug` is what a log line uses, and the whole config is logged when it
@@ -541,14 +561,22 @@ fn a_client_survives_a_toml_round_trip_unchanged() {
 #[test]
 fn a_device_secret_is_no_more_printable_than_a_clients() {
     let mut c = client();
-    c.secret = SecretString::new("CLIENTSECRET".to_string());
-    c.devices
-        .insert("laptop".to_string(), device("LAPTOPSECRET"));
+    c.secret = SecretString::new("CLIENTSECRETCLIENTSECRETCLIENTSE".to_string());
+    c.devices.insert(
+        "laptop".to_string(),
+        device("LAPTOPSECRETLAPTOPSECRETLAPTOPSE"),
+    );
 
     let rendered = format!("{c:?}");
     assert!(rendered.contains("<redacted>"), "{rendered}");
-    assert!(!rendered.contains("CLIENTSECRET"), "{rendered}");
-    assert!(!rendered.contains("LAPTOPSECRET"), "{rendered}");
+    assert!(
+        !rendered.contains("CLIENTSECRETCLIENTSECRETCLIENTSE"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("LAPTOPSECRETLAPTOPSECRETLAPTOPSE"),
+        "{rendered}"
+    );
 }
 
 /// `counter_snapshot` exists so that counting a wrong code does not copy a
@@ -559,8 +587,10 @@ fn a_device_secret_is_no_more_printable_than_a_clients() {
 #[test]
 fn a_counter_snapshot_carries_no_device_secret() {
     let mut c = client();
-    c.devices
-        .insert("laptop".to_string(), device("LAPTOPSECRET"));
+    c.devices.insert(
+        "laptop".to_string(),
+        device("LAPTOPSECRETLAPTOPSECRETLAPTOPSE"),
+    );
     let config = AuthConfig {
         enabled: true,
         clients: HashMap::from([("alice".to_string(), c)]),

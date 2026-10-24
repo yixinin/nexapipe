@@ -684,7 +684,7 @@ mod tests {
     #[test]
     fn a_server_with_a_secret_never_enrolls() {
         let mut server = server(unused_backend_id(), vec!["example.test".to_string()]);
-        server.two_factor = Some(two_factor("JBSWY3DPEHPK3PXP"));
+        server.two_factor = Some(two_factor("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"));
         server.enrollment = Some(enrollment());
 
         assert!(

@@ -191,7 +191,7 @@ fn render_blocks(matrix: &[Vec<bool>], ink: Option<&str>, dark_is_ink: bool) -> 
 mod tests {
     use super::*;
 
-    const URI: &str = "otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXP\
+    const URI: &str = "otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\
                        &issuer=NexaPipe&algorithm=SHA1&digits=6&period=30";
 
     /// The printable body of a rendering, with the per-line color escapes

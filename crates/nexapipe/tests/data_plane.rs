@@ -1848,7 +1848,7 @@ fn client_hello_with_sni(sni: &str) -> Vec<u8> {
 const CLIENT_ID: &str = "client-001";
 
 /// The secret it shares with the server.
-const SECRET: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+const SECRET: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
 
 /// A 2FA configuration with one client and one secret.
 fn auth_config() -> AuthConfig {

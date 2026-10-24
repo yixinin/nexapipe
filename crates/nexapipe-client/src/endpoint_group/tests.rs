@@ -392,8 +392,12 @@ async fn per_backend_two_factor_does_not_spill_to_other_backends() {
     .await
     .unwrap();
 
-    let auth = TwoFactorAuth::new("client-a", "JBSWY3DPEHPK3PXP", TotpAlgorithm::SHA1)
-        .expect("a Base32 secret must decode");
+    let auth = TwoFactorAuth::new(
+        "client-a",
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+        TotpAlgorithm::SHA1,
+    )
+    .expect("a Base32 secret must decode");
     group
         .set_two_factor_for(&backend_a.to_string(), Some(auth))
         .await;

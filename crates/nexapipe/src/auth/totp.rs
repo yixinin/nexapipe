@@ -407,7 +407,9 @@ mod tests {
 
     fn config_with_one_client() -> AuthConfig {
         let client = ClientAuth {
-            secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+            secret: SecretString::new(
+                "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string(),
+            ),
             created_at: String::new(),
             allow_hosts: None,
             allow_ports: None,
@@ -435,7 +437,9 @@ mod tests {
     /// shorter than 128 bits — and the tests below reach the TOTP check.
     fn config_with_one_device() -> AuthConfig {
         let client = ClientAuth {
-            secret: SecretString::new("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()),
+            secret: SecretString::new(
+                "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string(),
+            ),
             created_at: String::new(),
             allow_hosts: None,
             allow_ports: None,

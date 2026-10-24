@@ -92,7 +92,7 @@ const CASES: &[Case] = &[
     },
     Case {
         section: "[local_proxy.two_factor]",
-        file: "[local_proxy]\nenabled = false\nlisten_addr = \"127.0.0.1:8081\"\nproxy_domains = []\n\n[local_proxy.two_factor]\nenabled = true\nclient_id = \"client-001\"\nsecret = \"JBSWY3DPEHPK3PXP\"\nalgorithmme = \"sha1\"\n",
+        file: "[local_proxy]\nenabled = false\nlisten_addr = \"127.0.0.1:8081\"\nproxy_domains = []\n\n[local_proxy.two_factor]\nenabled = true\nclient_id = \"client-001\"\nsecret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\nalgorithmme = \"sha1\"\n",
         key: "algorithmme",
     },
     Case {
@@ -220,7 +220,7 @@ fn the_auth_section_is_still_read() {
     let path = dir.path().join("config.toml");
     std::fs::write(
         &path,
-        "[auth]\nenabled = true\nissuer = \"NexaPipe\"\n\n[auth.clients.client-001]\nsecret = \"JBSWY3DPEHPK3PXP\"\n",
+        "[auth]\nenabled = true\nissuer = \"NexaPipe\"\n\n[auth.clients.client-001]\nsecret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n",
     )
     .expect("write the config");
 

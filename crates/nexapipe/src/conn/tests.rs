@@ -33,7 +33,7 @@ async fn the_state_file_carries_the_counters_as_of_the_write() {
         &path,
         "[auth]\nenabled = true\n\
          [auth.clients.client-001]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n",
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n",
     )
     .unwrap();
 
@@ -316,7 +316,7 @@ fn auth_with_pending(token: Option<&str>) -> AuthConfig {
     cfg.clients.insert(
         "alice".to_string(),
         ClientAuth {
-            secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+            secret: SecretString::new("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()),
             created_at: "0".to_string(),
             allow_hosts: None,
             allow_ports: None,
@@ -377,7 +377,11 @@ fn an_enrollment_that_names_a_device_writes_only_its_own_entry() {
     let mut cfg = auth_with_pending(Some("0123456789abcdef"));
     let shared = cfg.clients["alice"].secret.clone();
 
-    let slot = issue_enrolled_secret(&mut cfg, "alice", &device_secret("laptop", "LAPTOPSECRET"));
+    let slot = issue_enrolled_secret(
+        &mut cfg,
+        "alice",
+        &device_secret("laptop", "LAPTOPSECRETLAPTOPSECRETLAPTOPSE"),
+    );
 
     let alice = &cfg.clients["alice"];
     assert_eq!(
@@ -385,7 +389,10 @@ fn an_enrollment_that_names_a_device_writes_only_its_own_entry() {
         shared.expose_secret(),
         "the shared secret was rotated too"
     );
-    assert_eq!(alice.devices["laptop"].secret.as_str(), "LAPTOPSECRET");
+    assert_eq!(
+        alice.devices["laptop"].secret.as_str(),
+        "LAPTOPSECRETLAPTOPSECRETLAPTOPSE"
+    );
     assert!(
         alice.pending_enrollment.is_none(),
         "the token was left spendable"
@@ -430,10 +437,15 @@ fn an_enrollment_that_names_no_device_rotates_the_clients_secret() {
     let slot = issue_enrolled_secret(
         &mut cfg,
         "alice",
-        &IssuedCredential::SharedSecret(SecretString::new("NEWSECRET".to_string())),
+        &IssuedCredential::SharedSecret(SecretString::new(
+            "NEWSECRETNEWSECRETNEWSECRETNEWSE".to_string(),
+        )),
     );
 
-    assert_eq!(cfg.clients["alice"].secret.as_str(), "NEWSECRET");
+    assert_eq!(
+        cfg.clients["alice"].secret.as_str(),
+        "NEWSECRETNEWSECRETNEWSECRETNEWSE"
+    );
     assert!(cfg.clients["alice"].devices.is_empty());
     assert!(matches!(slot, EnrollmentSlot::Shared { .. }));
 }
@@ -447,7 +459,7 @@ fn a_failed_write_puts_the_device_it_replaced_back() {
     cfg.clients.get_mut("alice").unwrap().devices.insert(
         "laptop".to_string(),
         DeviceAuth {
-            secret: SecretString::new("OLDSECRET".to_string()),
+            secret: SecretString::new("OLDSECRETOLDSECRETOLDSECRETOLDSE".to_string()),
             public_key: None,
             created_at: "0".to_string(),
             last_used: None,
@@ -455,16 +467,23 @@ fn a_failed_write_puts_the_device_it_replaced_back() {
         },
     );
 
-    let slot = issue_enrolled_secret(&mut cfg, "alice", &device_secret("laptop", "NEWSECRET"));
+    let slot = issue_enrolled_secret(
+        &mut cfg,
+        "alice",
+        &device_secret("laptop", "NEWSECRETNEWSECRETNEWSECRETNEWSE"),
+    );
     assert_eq!(
         cfg.clients["alice"].devices["laptop"].secret.as_str(),
-        "NEWSECRET"
+        "NEWSECRETNEWSECRETNEWSECRETNEWSE"
     );
 
     undo_enrolled_secret(&mut cfg, "alice", slot, "0123456789abcdef");
 
     let alice = &cfg.clients["alice"];
-    assert_eq!(alice.devices["laptop"].secret.as_str(), "OLDSECRET");
+    assert_eq!(
+        alice.devices["laptop"].secret.as_str(),
+        "OLDSECRETOLDSECRETOLDSECRETOLDSE"
+    );
     assert_eq!(
         alice
             .pending_enrollment
@@ -482,7 +501,11 @@ fn a_failed_write_puts_the_device_it_replaced_back() {
 fn a_failed_write_takes_back_a_device_that_had_no_entry() {
     let mut cfg = auth_with_pending(Some("0123456789abcdef"));
 
-    let slot = issue_enrolled_secret(&mut cfg, "alice", &device_secret("phone", "NEWSECRET"));
+    let slot = issue_enrolled_secret(
+        &mut cfg,
+        "alice",
+        &device_secret("phone", "NEWSECRETNEWSECRETNEWSECRETNEWSE"),
+    );
     undo_enrolled_secret(&mut cfg, "alice", slot, "0123456789abcdef");
 
     let alice = &cfg.clients["alice"];
@@ -499,7 +522,9 @@ fn a_failed_write_puts_the_clients_secret_back() {
     let slot = issue_enrolled_secret(
         &mut cfg,
         "alice",
-        &IssuedCredential::SharedSecret(SecretString::new("NEWSECRET".to_string())),
+        &IssuedCredential::SharedSecret(SecretString::new(
+            "NEWSECRETNEWSECRETNEWSECRETNEWSE".to_string(),
+        )),
     );
     undo_enrolled_secret(&mut cfg, "alice", slot, "0123456789abcdef");
 
@@ -784,7 +809,7 @@ fn auth_with_device(device: &str, token: Option<&str>) -> AuthConfig {
     cfg.clients.get_mut("alice").unwrap().devices.insert(
         device.to_string(),
         DeviceAuth {
-            secret: SecretString::new("DEVICESECRET".to_string()),
+            secret: SecretString::new("DEVICESECRETDEVICESECRETDEVICESE".to_string()),
             public_key: None,
             created_at: "0".to_string(),
             last_used: None,

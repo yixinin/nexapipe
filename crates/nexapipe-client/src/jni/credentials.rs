@@ -635,7 +635,7 @@ mod tests {
     fn a_node_with_a_secret_still_authenticates_with_the_secret() {
         let cfg: NodeCredential = (
             "client-001".to_string(),
-            SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+            SecretString::new("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()),
             "sha1".to_string(),
             Some("laptop".to_string()),
         );
@@ -674,7 +674,7 @@ mod tests {
         let key = DeviceKey::generate();
         let cfg: NodeCredential = (
             "client-001".to_string(),
-            SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+            SecretString::new("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()),
             "sha1".to_string(),
             Some("phone-1a2b3c4d".to_string()),
         );
@@ -697,7 +697,7 @@ mod tests {
         let key = DeviceKey::generate();
         let cfg: NodeCredential = (
             "client-001".to_string(),
-            SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+            SecretString::new("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()),
             "sha1".to_string(),
             None,
         );

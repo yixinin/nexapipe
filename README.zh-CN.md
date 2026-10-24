@@ -525,10 +525,10 @@ nexapipe client revoke laptop-1 --device laptop --config config.toml
 
 ```toml
 [auth.clients.client-001]
-secret = "JBSWY3DPEHPK3PXP"        # 未命名设备所用的那个凭据
+secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"        # 未命名设备所用的那个凭据
 
 [auth.clients.client-001.devices.laptop]
-secret = "MFRGGZDFMZTWQ2LK"        # 注册时签发，可单独吊销
+secret = "MFRGGZDFMZTWQ2LKMFRGGZDFMZTWQ2LK"        # 注册时签发，可单独吊销
 created_at = "1723756800"
 ```
 
@@ -1320,8 +1320,13 @@ TUN 的网卡拒绝了 IPv6 地址的情况，此时 AAAA 应答为空，解析�
    lockout_duration = 300
 
    [auth.clients.client-001]     # 由 --generate-2fa 写入
-   secret = "JBSWY3DPEHPK3PXP"
+   secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
    ```
+
+   密钥在 Base32 解码后至少要有 16 字节——128 位，也就是 RFC 4226 的要求，也正是
+   双方所用的 TOTP 库拒绝再短的长度。更短的密钥在读取配置时就会被拒绝，拒绝信息
+   会指出是哪个客户端、哪台设备：无法用于校验的密钥属于配置错误，等到第一次登录
+   才发现就太晚了。
 
 3. 在客户端上，要么在应用里扫描二维码，要么在 `[local_proxy.two_factor]` 里设置
    凭证：
@@ -1330,7 +1335,7 @@ TUN 的网卡拒绝了 IPv6 地址的情况，此时 AAAA 应答为空，解析�
    [local_proxy.two_factor]
    enabled = true
    client_id = "client-001"
-   secret = "JBSWY3DPEHPK3PXP"
+   secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
    algorithm = "sha1"
    ```
 
@@ -1352,7 +1357,7 @@ TUN 的网卡拒绝了 IPv6 地址的情况，此时 AAAA 应答为空，解析�
 二维码携带的是标准 `otpauth://` URI，所以任何认证器应用都能导入：
 
 ```text
-otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXP&issuer=NexaPipe&algorithm=SHA1&digits=6&period=30
+otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=NexaPipe&algorithm=SHA1&digits=6&period=30
 ```
 
 - 在 `[auth]` 下设置 `issuer` 可改变应用显示的标签；`--issuer` 可覆盖单次运行的
@@ -1427,7 +1432,7 @@ cargo run -p nexapipe -- --generate-invite client-001 --qr-format unicode
 ```text
 nexapipe://endpoint/a612…7063?v=1&name=Home&domains=app.example.com,comfyui.example.com
     &relay=https://relay.example&client=client-001&issuer=NexaPipe
-    &secret=JBSWY3DPEHPK3PXP&algorithm=SHA1&digits=6&period=30
+    &secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&algorithm=SHA1&digits=6&period=30
 ```
 
 | 部分 | 含义 |

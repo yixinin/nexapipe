@@ -21,7 +21,7 @@ endpoint:
 
 ```toml
 [auth.clients.client-001]
-secret = "JBSWY3DPEHPK3PXP"        # the credential of the device that names none
+secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"        # the credential of the device that names none
 
 [auth.clients.client-001.devices.laptop-7f3a9c21]
 public_key = "…"                   # a device that proves itself with a key

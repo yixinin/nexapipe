@@ -7,7 +7,7 @@
 use anyhow::{Result, bail};
 use nexapipe_proto::secret::SecretString;
 
-use crate::auth::TotpAlgorithm;
+use crate::auth::{MIN_SECRET_BYTES, TotpAlgorithm};
 
 use super::DEFAULT_ISSUER;
 use super::credential::InviteTotp;
@@ -141,18 +141,24 @@ pub(super) fn normalize_secret(raw: &str) -> Result<SecretString> {
     // The secret itself is left out of both messages: these errors are shown
     // to a user and end up in logs, and this module redacts the secret
     // everywhere else it prints an invite.
-    if secret.as_str().len() < 8 {
-        bail!(
-            "the 2FA secret is too short: {} characters, at least 8",
-            secret.as_str().len()
-        );
-    }
     if !secret
         .as_str()
         .chars()
         .all(|c| matches!(c, 'A'..='Z' | '2'..='7'))
     {
         bail!("the 2FA secret is not Base32");
+    }
+    let decoded = base32::decode(
+        base32::Alphabet::Rfc4648 { padding: false },
+        secret.as_str(),
+    )
+    .ok_or_else(|| anyhow::anyhow!("the 2FA secret is not Base32"))?;
+    if decoded.len() < MIN_SECRET_BYTES {
+        bail!(
+            "the 2FA secret decodes to {} byte{}; a TOTP secret is at least {MIN_SECRET_BYTES} bytes",
+            decoded.len(),
+            if decoded.len() == 1 { "" } else { "s" }
+        );
     }
     Ok(secret)
 }

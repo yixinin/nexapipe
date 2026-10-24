@@ -990,7 +990,7 @@ fn credential(client_id: &str, secret: &str, device: Option<&str>) -> TwoFactorA
 /// the pool would close every request in flight over a rotation.
 #[test]
 fn a_rotated_secret_is_the_same_identity() {
-    let before = credential("client-001", "JBSWY3DPEHPK3PXP", None);
+    let before = credential("client-001", "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", None);
     let after = credential("client-001", "KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP", None);
 
     assert!(!identity_changed(Some(&before), Some(&after)));
@@ -1000,8 +1000,8 @@ fn a_rotated_secret_is_the_same_identity() {
 /// authenticated as the old one are not the new one's.
 #[test]
 fn a_different_client_is_a_different_identity() {
-    let before = credential("client-001", "JBSWY3DPEHPK3PXP", None);
-    let after = credential("client-002", "JBSWY3DPEHPK3PXP", None);
+    let before = credential("client-001", "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", None);
+    let after = credential("client-002", "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", None);
 
     assert!(identity_changed(Some(&before), Some(&after)));
 }
@@ -1010,8 +1010,16 @@ fn a_different_client_is_a_different_identity() {
 /// connection authenticated as one device is not the other's.
 #[test]
 fn a_different_device_is_a_different_identity() {
-    let before = credential("client-001", "JBSWY3DPEHPK3PXP", Some("laptop"));
-    let after = credential("client-001", "JBSWY3DPEHPK3PXP", Some("phone"));
+    let before = credential(
+        "client-001",
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+        Some("laptop"),
+    );
+    let after = credential(
+        "client-001",
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+        Some("phone"),
+    );
 
     assert!(identity_changed(Some(&before), Some(&after)));
 }
@@ -1021,8 +1029,12 @@ fn a_different_device_is_a_different_identity() {
 /// the client's.
 #[test]
 fn a_named_device_is_not_the_client_it_belongs_to() {
-    let unnamed = credential("client-001", "JBSWY3DPEHPK3PXP", None);
-    let named = credential("client-001", "JBSWY3DPEHPK3PXP", Some("laptop"));
+    let unnamed = credential("client-001", "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", None);
+    let named = credential(
+        "client-001",
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+        Some("laptop"),
+    );
 
     assert!(identity_changed(Some(&unnamed), Some(&named)));
 }
@@ -1031,7 +1043,7 @@ fn a_named_device_is_not_the_client_it_belongs_to() {
 /// both changes.
 #[test]
 fn dropping_or_adding_a_credential_is_a_change() {
-    let auth = credential("client-001", "JBSWY3DPEHPK3PXP", None);
+    let auth = credential("client-001", "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", None);
 
     assert!(identity_changed(Some(&auth), None));
     assert!(identity_changed(None, Some(&auth)));

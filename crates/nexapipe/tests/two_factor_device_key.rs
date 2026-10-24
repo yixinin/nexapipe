@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A 160-bit Base32 secret — the client's own. In this file it is always the
 /// credential a key device must *not* be answerable with.
-const SECRET: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+const SECRET: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
 
 fn now() -> i64 {
     SystemTime::now()
@@ -334,7 +334,7 @@ fn keeps_a_key_device_when_it_writes_counters() {
              [auth]\n\
              enabled = true\n\
              [auth.clients.client-001]\n\
-             secret = \"JBSWY3DPEHPK3PXP\"\n\
+             secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
              created_at = \"1723756800\"\n\
              [auth.clients.client-001.devices.phone]\n\
              public_key = \"{key}\"\n\

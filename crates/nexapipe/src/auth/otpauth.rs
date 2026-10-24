@@ -9,7 +9,7 @@
 //! one generated on the phone round trip through the same parser:
 //!
 //! ```text
-//! otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXP&issuer=NexaPipe&algorithm=SHA1&digits=6&period=30
+//! otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=NexaPipe&algorithm=SHA1&digits=6&period=30
 //!          |    |          |                                                        |
 //!          |    |          +-- account name, read back as the client ID            +-- parameters, all lowercase keys
 //!          |    +------------- `issuer:account`, the colon is kept literal
@@ -37,6 +37,19 @@ pub const CLIENT_PERIOD: u32 = 30;
 
 /// Base32 alphabet (RFC 4648) without padding.
 const BASE32_ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+/// The smallest seed a TOTP secret may be, in bytes.
+///
+/// RFC 4226 asks for at least 128 bits, and that is also what the TOTP
+/// library this server builds its codes with refuses to work with below: a
+/// seed that decodes to less keys the HMAC with a key that carries no
+/// entropy, and the library's own refusal is the only thing standing
+/// between a one-character seed and a challenge that verifies with it.
+///
+/// The check lives here rather than in the library, because the library's
+/// refusal happens at the operator's first login — long after the seed was
+/// accepted, handed out in an enrollment URI and written down.
+pub const MIN_SECRET_BYTES: usize = 16;
 
 /// One enrollment entry: everything an authenticator app needs to derive the
 /// same codes this server expects.
@@ -81,14 +94,11 @@ impl OtpAuthUri {
 
         let secret = normalize_secret(secret)
             .ok_or_else(|| anyhow::anyhow!("the secret is not a Base32 string"))?;
-        if base32::decode(
+        let decoded = base32::decode(
             base32::Alphabet::Rfc4648 { padding: false },
             secret.as_str(),
         )
-        .is_none()
-        {
-            bail!("the secret is not a Base32 string");
-        }
+        .ok_or_else(|| anyhow::anyhow!("the secret is not a Base32 string"))?;
 
         let algorithm = match algorithm.trim().to_ascii_lowercase().as_str() {
             "sha1" => "SHA1",
@@ -100,9 +110,26 @@ impl OtpAuthUri {
             ),
         };
 
-        if digits == 0 || digits > 10 {
-            bail!("the digit count must be between 1 and 10, got {}", digits);
+        // A seed that decodes to nothing is a challenge keyed with an empty
+        // key, and one that decodes to a handful of bytes is a challenge
+        // anybody can brute force. The library refuses such a seed when the
+        // validator is built, which is at the operator's first login: the URI
+        // handed out here is the credential, and it has to be one that works.
+        if decoded.len() < MIN_SECRET_BYTES {
+            bail!(
+                "the seed decodes to {} byte{}; a TOTP secret is at least {MIN_SECRET_BYTES} bytes",
+                decoded.len(),
+                if decoded.len() == 1 { "" } else { "s" }
+            );
         }
+
+        // 6 to 8 digits: what the TOTP library this server verifies against
+        // accepts, and what the configuration loader accepts. A URI that
+        // asks for any other count is a credential no server can verify.
+        if !(6..=8).contains(&digits) {
+            bail!("the digit count must be 6, 7 or 8 digits long, got {digits}");
+        }
+
         if period == 0 {
             bail!("the time step must be at least one second");
         }
@@ -224,7 +251,15 @@ mod tests {
     use crate::auth::TotpAlgorithm;
 
     fn entry(client_id: &str) -> OtpAuthUri {
-        OtpAuthUri::new("NexaPipe", client_id, "JBSWY3DPEHPK3PXP", "sha1", 6, 30).unwrap()
+        OtpAuthUri::new(
+            "NexaPipe",
+            client_id,
+            "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+            "sha1",
+            6,
+            30,
+        )
+        .unwrap()
     }
 
     /// The exact string the Android client's `OtpAuth.parse` is fed by a QR
@@ -233,21 +268,28 @@ mod tests {
     fn builds_the_canonical_uri() {
         assert_eq!(
             entry("client-001").to_uri(),
-            "otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXP\
+            "otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\
              &issuer=NexaPipe&algorithm=SHA1&digits=6&period=30"
         );
     }
 
     #[test]
     fn uppercases_the_algorithm_and_strips_secret_padding() {
-        let uri = OtpAuthUri::new("NexaPipe", "c1", "jbswy3dpehpk3pxp==", "Sha256", 8, 60)
-            .unwrap()
-            .to_uri();
+        let uri = OtpAuthUri::new(
+            "NexaPipe",
+            "c1",
+            "jbswy3dpehpk3pxpjbswy3dpehpk3pxpgezdgnbvgy3tq===",
+            "Sha256",
+            8,
+            60,
+        )
+        .unwrap()
+        .to_uri();
         // The URI is deliberately not part of the message: it carries the
         // secret, and an assertion failure would put it wherever the test
         // output goes.
         assert!(uri.ends_with("&algorithm=SHA256&digits=8&period=60"));
-        assert!(uri.contains("?secret=JBSWY3DPEHPK3PXP&"));
+        assert!(uri.contains("?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPGEZDGNBVGY3TQ&"));
     }
 
     #[test]
@@ -255,7 +297,7 @@ mod tests {
         let uri = OtpAuthUri::new(
             "My Company",
             "client 001",
-            "JBSWY3DPEHPK3PXP",
+            "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
             "sha1",
             6,
             30,
@@ -264,7 +306,7 @@ mod tests {
         .to_uri();
         assert_eq!(
             uri,
-            "otpauth://totp/My%20Company:client%20001?secret=JBSWY3DPEHPK3PXP\
+            "otpauth://totp/My%20Company:client%20001?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\
              &issuer=My%20Company&algorithm=SHA1&digits=6&period=30"
         );
     }
@@ -282,7 +324,7 @@ mod tests {
 
     #[test]
     fn rejects_malformed_entries() {
-        let secret = "JBSWY3DPEHPK3PXP";
+        let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
         assert!(OtpAuthUri::new("", "c1", secret, "sha1", 6, 30).is_err());
         assert!(OtpAuthUri::new("NexaPipe", "  ", secret, "sha1", 6, 30).is_err());
         assert!(OtpAuthUri::new("NexaPipe", "c1", "not-base32!", "sha1", 6, 30).is_err());
@@ -295,11 +337,94 @@ mod tests {
     #[test]
     fn normalizes_secrets_like_the_clients_do() {
         assert_eq!(
-            normalize_secret(" jbswy3dp ehpk3pxp==\n").map(|secret| secret.as_str().to_string()),
-            Some("JBSWY3DPEHPK3PXP".to_string())
+            normalize_secret(" jbswy3dp ehpk3pxp jbswy3dp ehpk3pxp==\n")
+                .map(|secret| secret.as_str().to_string()),
+            Some("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string())
         );
         assert_eq!(normalize_secret("JBSWY3DPEHPK3PX1"), None);
         assert_eq!(normalize_secret("  "), None);
+    }
+
+    /// A seed that decodes to less than 128 bits is refused.
+    ///
+    /// RFC 4226 asks for a 128-bit key, and that is also what the TOTP
+    /// library this server verifies codes with refuses to work with below: a
+    /// seed of a handful of bytes is a challenge anybody can brute force.
+    ///
+    /// The refusal has to happen *here*, where the credential is made: the
+    /// URI is what the operator scans into their authenticator app and what
+    /// the client is told to derive codes from, so a URI built from a seed
+    /// that can never verify is a credential that works for nobody.
+    #[test]
+    fn a_seed_too_short_to_be_a_secret_is_refused() {
+        // One byte, five bytes, ten bytes, fifteen bytes: each of these
+        // decodes cleanly and each of them is below the floor.
+        for seed in [
+            "AE",
+            "AEBAGBAF",
+            "JBSWY3DPEHPK3PXP",
+            "AEBAGBAFAYDQQCIKBMGA2DQP",
+        ] {
+            let refusal = OtpAuthUri::new("NexaPipe", "c1", seed, "sha1", 6, 30)
+                .expect_err("a seed under 128 bits is refused");
+            let refusal = refusal.to_string();
+            assert!(
+                refusal.contains("at least"),
+                "the refusal says what the floor is: {refusal}"
+            );
+            assert!(
+                refusal.contains("byte"),
+                "the refusal says how short the seed was: {refusal}"
+            );
+        }
+
+        // Sixteen bytes is the floor itself, and it is accepted: a seed that
+        // exactly meets it has 128 bits of key.
+        assert!(
+            OtpAuthUri::new(
+                "NexaPipe",
+                "c1",
+                "AEBAGBAFAYDQQCIKBMGA2DQPCA",
+                "sha1",
+                6,
+                30
+            )
+            .is_ok(),
+            "a 128-bit seed is the shortest one that works"
+        );
+    }
+
+    /// A digit count no TOTP implementation can produce is refused.
+    ///
+    /// The library verifies 6, 7 and 8 digit codes. A URI that asks for
+    /// anything else is a credential whose codes the server will never
+    /// accept, and the operator finds out at the first login — so the URI
+    /// refuses to be built at all.
+    #[test]
+    fn a_digit_count_no_server_can_verify_is_refused() {
+        let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+
+        for digits in [0u32, 1, 5, 9, 10, 12] {
+            let refusal = OtpAuthUri::new("NexaPipe", "c1", secret, "sha1", digits, 30)
+                .expect_err("a digit count outside 6..=8 is refused");
+            let refusal = refusal.to_string();
+            assert!(
+                refusal.contains("digit count"),
+                "the refusal says which knob was wrong: {refusal}"
+            );
+            assert!(
+                refusal.contains(&digits.to_string()),
+                "the refusal says what the count was: {refusal}"
+            );
+        }
+
+        // The three counts the library accepts are all accepted.
+        for digits in [6u32, 7, 8] {
+            assert!(
+                OtpAuthUri::new("NexaPipe", "c1", secret, "sha1", digits, 30).is_ok(),
+                "{digits} digits is a count the library verifies"
+            );
+        }
     }
 
     #[test]
@@ -307,7 +432,15 @@ mod tests {
         let ok = entry("c1");
         assert!(ok.client_warnings().is_empty());
 
-        let odd = OtpAuthUri::new("NexaPipe", "c1", "JBSWY3DPEHPK3PXP", "sha1", 8, 60).unwrap();
+        let odd = OtpAuthUri::new(
+            "NexaPipe",
+            "c1",
+            "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+            "sha1",
+            8,
+            60,
+        )
+        .unwrap();
         assert_eq!(odd.client_warnings().len(), 2);
     }
 
@@ -319,9 +452,14 @@ mod tests {
             time_step: 30,
             ..Default::default()
         };
-        let uri = OtpAuthUri::from_auth_config("NexaPipe", "c1", "JBSWY3DPEHPK3PXP", &config)
-            .unwrap()
-            .to_uri();
+        let uri = OtpAuthUri::from_auth_config(
+            "NexaPipe",
+            "c1",
+            "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+            &config,
+        )
+        .unwrap()
+        .to_uri();
         assert!(uri.contains("&algorithm=SHA512&digits=6&period=30"));
     }
 

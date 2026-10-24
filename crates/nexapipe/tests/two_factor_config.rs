@@ -36,10 +36,10 @@ fn loads_the_auth_section_of_the_example_config() {
         .clients
         .get("client-001")
         .expect("client-001 is configured");
-    assert_eq!(client.secret.as_str(), "JBSWY3DPEHPK3PXP");
+    assert_eq!(client.secret.as_str(), "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
     assert_eq!(
         auth.clients.get("client-002").map(|c| c.secret.as_str()),
-        Some("KBSWY3DPEHPK3PXQ")
+        Some("KBSWY3DPEHPK3PXQKBSWY3DPEHPK3PXQ")
     );
 }
 
@@ -178,7 +178,87 @@ fn builds_the_enrollment_uri_from_the_loaded_settings() {
     assert_eq!(
         uri.to_uri(),
         "otpauth://totp/NexaPipe:client-001\
-         ?secret=JBSWY3DPEHPK3PXP&issuer=NexaPipe&algorithm=SHA1&digits=6&period=30"
+         ?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=NexaPipe&algorithm=SHA1&digits=6&period=30"
     );
     assert!(uri.client_warnings().is_empty());
+}
+
+/// A seed that is too short to be a secret is refused when the config is
+/// read.
+///
+/// The decode is lazy: a seed is read when a connection proves itself, and
+/// the TOTP library refuses one under 128 bits when it builds the validator.
+/// So without this check a seed that can never work is found at the
+/// operator's first login — long after it was accepted, handed out in an
+/// enrollment URI and written down — and it is found as a *failed
+/// authentication* rather than as the configuration error it is.
+///
+/// The refusal names the client, so an operator with a hundred clients in
+/// the file knows which one to look at.
+#[test]
+fn a_seed_too_short_to_be_a_secret_refuses_to_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[[routes]]\n\
+         host_pattern = \"*\"\n\
+         mode = \"http\"\n\
+         backends = [\"http://127.0.0.1:18080\"]\n\
+         \n\
+         [auth]\n\
+         enabled = true\n\
+         \n\
+         [auth.clients.client-001]\n\
+         secret = \"AE\"\n",
+    )
+    .unwrap();
+
+    let refusal = ProxyConfig::load_with_auth(path.to_str().unwrap())
+        .expect_err("a seed of one byte is not a secret");
+    let refusal = refusal.to_string();
+    assert!(
+        refusal.contains("client-001"),
+        "the refusal names the client whose seed is too short: {refusal}"
+    );
+    assert!(
+        refusal.contains("at least"),
+        "the refusal says what the floor is: {refusal}"
+    );
+}
+
+/// A device's own seed is checked the same way.
+///
+/// The device table is a second place a seed is written, and it is the one
+/// an enrollment puts there: a device that cannot verify is a device that
+/// enrolls and then cannot connect, which is worse than a refusal.
+#[test]
+fn a_devices_seed_too_short_to_be_a_secret_refuses_to_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[[routes]]\n\
+         host_pattern = \"*\"\n\
+         mode = \"http\"\n\
+         backends = [\"http://127.0.0.1:18080\"]\n\
+         \n\
+         [auth]\n\
+         enabled = true\n\
+         \n\
+         [auth.clients.client-001]\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
+         \n\
+         [auth.clients.client-001.devices.laptop]\n\
+         secret = \"AE\"\n",
+    )
+    .unwrap();
+
+    let refusal = ProxyConfig::load_with_auth(path.to_str().unwrap())
+        .expect_err("a device seed of one byte is not a secret");
+    let refusal = refusal.to_string();
+    assert!(
+        refusal.contains("laptop"),
+        "the refusal names the device whose seed is too short: {refusal}"
+    );
 }

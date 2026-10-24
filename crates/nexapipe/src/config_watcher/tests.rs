@@ -280,7 +280,7 @@ fn removed_devices_of(
     let after: HashMap<String, ClientAuth> = after
         .iter()
         .map(|(id, devices)| {
-            let mut client = client("SECRETSECRETSECR");
+            let mut client = client("SECRETSECRETSECRSECRETSECRETSECR");
             client.devices = devices
                 .iter()
                 .map(|(name, secret)| (name.to_string(), device(secret)))
@@ -432,7 +432,7 @@ async fn a_snapshot_is_merged_without_reading_the_file() {
     let path = dir.path().join("config.toml");
     std::fs::write(
         &path,
-        "[auth]\n\n[auth.clients.from-the-file]\nsecret = \"FROMTHEFILE\"\n",
+        "[auth]\n\n[auth.clients.from-the-file]\nsecret = \"FROMTHEFILEFROMTHEFILEFROMTHEFIL\"\n",
     )
     .unwrap();
     let path = path.to_str().unwrap().to_string();
@@ -444,7 +444,7 @@ async fn a_snapshot_is_merged_without_reading_the_file() {
         .reload_auth(
             Some(config_with(&[(
                 "from-the-snapshot",
-                client("FROMTHESNAPSHOT"),
+                client("FROMTHESNAPSHOTFROMTHESNAPSHOTFR"),
             )])),
             state.enroll_epoch(),
         )
@@ -478,7 +478,7 @@ async fn a_snapshot_an_enrollment_made_stale_is_read_again() {
     // The file names one client and the snapshot names another.
     std::fs::write(
         &path,
-        "[auth]\nenabled = true\n\n[auth.clients.from-the-file]\nsecret = \"FROMTHEFILE\"\n",
+        "[auth]\nenabled = true\n\n[auth.clients.from-the-file]\nsecret = \"FROMTHEFILEFROMTHEFILEFROMTHEFIL\"\n",
     )
     .unwrap();
     let path = path.to_str().unwrap().to_string();
@@ -494,7 +494,7 @@ async fn a_snapshot_an_enrollment_made_stale_is_read_again() {
             .reload_auth(
                 Some(config_with(&[(
                     "from-the-snapshot",
-                    client("FROMTHESNAPSHOT"),
+                    client("FROMTHESNAPSHOTFROMTHESNAPSHOTFR"),
                 )])),
                 // The epoch as it was when the snapshot was taken.
                 state.enroll_epoch() - 1,
@@ -526,7 +526,7 @@ async fn a_reload_whose_second_read_fails_is_tried_again() {
     let path = dir.path().join("config.toml");
     std::fs::write(
         &path,
-        "[auth]\n\n[auth.clients.from-the-file]\nsecret = \"FROMTHEFILE\"\n",
+        "[auth]\n\n[auth.clients.from-the-file]\nsecret = \"FROMTHEFILEFROMTHEFILEFROMTHEFIL\"\n",
     )
     .unwrap();
     let path = path.to_str().unwrap().to_string();
@@ -544,7 +544,7 @@ async fn a_reload_whose_second_read_fails_is_tried_again() {
             .reload_auth(
                 Some(config_with(&[(
                     "from-the-snapshot",
-                    client("FROMTHESNAPSHOT"),
+                    client("FROMTHESNAPSHOTFROMTHESNAPSHOTFR"),
                 )])),
                 state.enroll_epoch() - 1,
             )
@@ -564,7 +564,7 @@ async fn a_reload_applies_both_halves_of_one_read() {
     std::fs::write(
         &path,
         "[[routes]]\nhost_pattern = \"app.test\"\nbackends = [\"http://127.0.0.1:1\"]\n\n\
-         [auth]\nenabled = true\n\n[auth.clients.client-001]\nsecret = \"JBSWY3DPEHPK3PXP\"\n",
+         [auth]\nenabled = true\n\n[auth.clients.client-001]\nsecret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n",
     )
     .unwrap();
     let path = path.to_str().unwrap().to_string();
@@ -595,10 +595,10 @@ async fn a_reload_applies_both_halves_of_one_read() {
 /// restart, and a client deleted from the file stops authenticating.
 #[test]
 fn a_reload_picks_up_an_invited_client_and_drops_a_removed_one() {
-    let mut live = config_with(&[("old", client("OLDOLDOLDOLDOLD"))]);
+    let mut live = config_with(&[("old", client("OLDOLDOLDOLDOLDOLDOLDOLDOLDOLDOL"))]);
     let incoming = config_with(&[
-        ("old", client("OLDOLDOLDOLDOLD")),
-        ("new", client("NEWNEWNEWNEWNEW")),
+        ("old", client("OLDOLDOLDOLDOLDOLDOLDOLDOLDOLDOL")),
+        ("new", client("NEWNEWNEWNEWNEWNEWNEWNEWNEWNEWNE")),
     ]);
 
     let (added, removed, _rotated) = merge_auth_clients(&mut live, &incoming);
@@ -606,7 +606,10 @@ fn a_reload_picks_up_an_invited_client_and_drops_a_removed_one() {
     assert_eq!(added, vec!["new".to_string()]);
     assert!(removed.is_empty());
     assert_eq!(live.clients.len(), 2);
-    assert_eq!(live.clients["new"].secret.as_str(), "NEWNEWNEWNEWNEW");
+    assert_eq!(
+        live.clients["new"].secret.as_str(),
+        "NEWNEWNEWNEWNEWNEWNEWNEWNEWNEWNE"
+    );
 
     let (added, removed, _rotated) = merge_auth_clients(&mut live, &config_with(&[]));
 
@@ -623,7 +626,7 @@ fn a_reload_picks_up_an_invited_client_and_drops_a_removed_one() {
 /// memory are not reset by the reload — the file's copy may be stale.
 #[test]
 fn a_surviving_client_keeps_its_counters_and_takes_the_files_secret() {
-    let mut live = config_with(&[("client-001", client("OLDSECRETVALUE"))]);
+    let mut live = config_with(&[("client-001", client("OLDSECRETVALUEOLDSECRETVALUEOLDS"))]);
     let existing = live.clients.get_mut("client-001").unwrap();
     existing.failed_attempts = 2;
     existing.locked_until = Some(12345);
@@ -631,7 +634,7 @@ fn a_surviving_client_keeps_its_counters_and_takes_the_files_secret() {
     existing.enrollment_failed_attempts = 2;
     existing.enrollment_locked_until = Some(54321);
 
-    let mut incoming_client = client("NEWSECRETVALUE");
+    let mut incoming_client = client("NEWSECRETVALUENEWSECRETVALUENEWS");
     incoming_client.pending_enrollment = Some(SecretString::new("token".to_string()));
     let incoming = config_with(&[("client-001", incoming_client)]);
 
@@ -639,7 +642,7 @@ fn a_surviving_client_keeps_its_counters_and_takes_the_files_secret() {
 
     assert!(added.is_empty() && removed.is_empty());
     let client = &live.clients["client-001"];
-    assert_eq!(client.secret.as_str(), "NEWSECRETVALUE");
+    assert_eq!(client.secret.as_str(), "NEWSECRETVALUENEWSECRETVALUENEWS");
     assert_eq!(
         client
             .pending_enrollment
@@ -661,13 +664,13 @@ fn a_surviving_client_keeps_its_counters_and_takes_the_files_secret() {
 /// own budget rather than one lockout away from closed.
 #[test]
 fn a_new_invite_starts_with_its_own_budget() {
-    let mut live = config_with(&[("client-001", client("SECRETVALUE"))]);
+    let mut live = config_with(&[("client-001", client("SECRETVALUESECRETVALUESECRETVALU"))]);
     let existing = live.clients.get_mut("client-001").unwrap();
     existing.pending_enrollment = Some(SecretString::new("old-token".to_string()));
     existing.enrollment_failed_attempts = 2;
     existing.enrollment_locked_until = Some(54321);
 
-    let mut incoming_client = client("SECRETVALUE");
+    let mut incoming_client = client("SECRETVALUESECRETVALUESECRETVALU");
     incoming_client.pending_enrollment = Some(SecretString::new("new-token".to_string()));
     let incoming = config_with(&[("client-001", incoming_client)]);
 
@@ -695,7 +698,7 @@ fn config_with_pending_token(path: &std::path::Path, token: &str) {
     std::fs::write(
         path,
         format!(
-            "[auth]\nenabled = true\n\n[auth.clients.client-001]\nsecret = \"JBSWY3DPEHPK3PXP\"\n\
+            "[auth]\nenabled = true\n\n[auth.clients.client-001]\nsecret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
              pending_enrollment = \"{token}\"\n"
         ),
     )
@@ -717,7 +720,7 @@ fn state_file_with_enrollment_counters(
     locked_until: u64,
 ) {
     let mut config = crate::auth::AuthConfig::default();
-    let mut client = client("JBSWY3DPEHPK3PXP");
+    let mut client = client("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
     client.pending_enrollment = Some(SecretString::new(token.to_string()));
     client.enrollment_failed_attempts = attempts;
     client.enrollment_locked_until = Some(locked_until);
@@ -946,7 +949,7 @@ async fn a_state_built_without_a_section_still_reloads_one() {
     let path = dir.path().join("config.toml");
     std::fs::write(
         &path,
-        "[auth]\nenabled = true\n\n[auth.clients.client-001]\nsecret = \"JBSWY3DPEHPK3PXP\"\n",
+        "[auth]\nenabled = true\n\n[auth.clients.client-001]\nsecret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n",
     )
     .unwrap();
     // Private, because enabling 2FA is refused against a file anyone else
@@ -1137,18 +1140,18 @@ fn a_device_stamp_is_written_back_without_touching_its_secret() {
         &path,
         "[auth]\n\
          [auth.clients.alice]\n\
-         secret = \"ALICEALICEALICEA\"\n\
+         secret = \"ALICEALICEALICEAALICEALICEALICEA\"\n\
          \n\
          [auth.clients.alice.devices.laptop]\n\
-         secret = \"LAPTOPLAPTOPLAPT\"\n",
+         secret = \"LAPTOPLAPTOPLAPTLAPTOPLAPTOPLAPT\"\n",
     )
     .expect("write the config");
 
-    let mut alice = client("ALICEALICEALICEA");
+    let mut alice = client("ALICEALICEALICEAALICEALICEALICEA");
     alice.devices = [(
         "laptop".to_string(),
         DeviceAuth {
-            secret: SecretString::new("LAPTOPLAPTOPLAPT".to_string()),
+            secret: SecretString::new("LAPTOPLAPTOPLAPTLAPTOPLAPTOPLAPT".to_string()),
             public_key: None,
             created_at: "0".to_string(),
             last_used: Some(1700000000),
@@ -1169,7 +1172,7 @@ fn a_device_stamp_is_written_back_without_touching_its_secret() {
         "the device stamp did not reach the file: {on_disk}"
     );
     assert!(
-        !on_disk.contains("LAPTOPLAPTOPLAPT"),
+        !on_disk.contains("LAPTOPLAPTOPLAPTLAPTOPLAPTOPLAPT"),
         "the snapshot's blanked secret must not be written: {on_disk}"
     );
 
@@ -1178,10 +1181,10 @@ fn a_device_stamp_is_written_back_without_touching_its_secret() {
         config_on_disk,
         "[auth]\n\
          [auth.clients.alice]\n\
-         secret = \"ALICEALICEALICEA\"\n\
+         secret = \"ALICEALICEALICEAALICEALICEALICEA\"\n\
          \n\
          [auth.clients.alice.devices.laptop]\n\
-         secret = \"LAPTOPLAPTOPLAPT\"\n",
+         secret = \"LAPTOPLAPTOPLAPTLAPTOPLAPTOPLAPT\"\n",
         "the configuration is the operator's file and is not the server's to rewrite"
     );
 }
@@ -1218,9 +1221,10 @@ async fn a_reload_that_finds_an_enrollment_has_overtaken_it_reads_again() {
     let path = dir.path().join("config.toml");
     let path_str = path.to_str().expect("utf-8 path").to_string();
 
-    std::fs::write(&path, file_with("old", "OLDOLDOLDOLDOLDO")).expect("write the first file");
+    std::fs::write(&path, file_with("old", "OLDOLDOLDOLDOLDOOLDOLDOLDOLDOLDO"))
+        .expect("write the first file");
     let state = AuthState::new(
-        config_with(&[("old", client("OLDOLDOLDOLDOLDO"))]),
+        config_with(&[("old", client("OLDOLDOLDOLDOLDOOLDOLDOLDOLDOLDO"))]),
         path_str.clone(),
     );
 
@@ -1249,8 +1253,11 @@ async fn a_reload_that_finds_an_enrollment_has_overtaken_it_reads_again() {
         // the epoch moves after it, under the same lock. A bump before the
         // write would let the reload sample the new epoch and still read
         // the old file.
-        std::fs::write(&path_for_task, file_with("new", "NEWNEWNEWNEWNEWN"))
-            .expect("write the second file");
+        std::fs::write(
+            &path_for_task,
+            file_with("new", "NEWNEWNEWNEWNEWNNEWNEWNEWNEWNEWN"),
+        )
+        .expect("write the second file");
         enrolled.bump_enroll_epoch();
         tokio::time::sleep(Duration::from_millis(150)).await;
     });
@@ -1262,7 +1269,10 @@ async fn a_reload_that_finds_an_enrollment_has_overtaken_it_reads_again() {
     // before the enrollment.
     watcher
         .reload_auth(
-            Some(config_with(&[("old", client("OLDOLDOLDOLDOLDO"))])),
+            Some(config_with(&[(
+                "old",
+                client("OLDOLDOLDOLDOLDOOLDOLDOLDOLDOLDO"),
+            )])),
             epoch_before,
         )
         .await;
@@ -1298,13 +1308,13 @@ async fn a_reload_closes_the_connection_authenticated_as_a_removed_device() {
         let mut out = String::from(
             "[auth]\n\
              [auth.clients.alice]\n\
-             secret = \"ALICEALICEALICEA\"\n\
+             secret = \"ALICEALICEALICEAALICEALICEALICEA\"\n\
              created_at = \"1723756800\"\n",
         );
         for name in devices {
             out.push_str(&format!(
                 "\n[auth.clients.alice.devices.{name}]\n\
-                 secret = \"DEVICEDEVICEDEVIC\"\n\
+                 secret = \"DEVICEDEVICEDEVICDEVICEDEVICEDEV\"\n\
                  created_at = \"1723756800\"\n"
             ));
         }
@@ -1313,10 +1323,10 @@ async fn a_reload_closes_the_connection_authenticated_as_a_removed_device() {
 
     std::fs::write(&path, file(&["laptop", "phone"])).expect("write the config");
 
-    let mut alice = client("ALICEALICEALICEA");
+    let mut alice = client("ALICEALICEALICEAALICEALICEALICEA");
     alice.devices = ["laptop", "phone"]
         .into_iter()
-        .map(|name| (name.to_string(), device("DEVICEDEVICEDEVIC")))
+        .map(|name| (name.to_string(), device("DEVICEDEVICEDEVICDEVICEDEVICEDEV")))
         .collect();
     let state = AuthState::new(config_with(&[("alice", alice)]), path_str.clone());
 
@@ -1555,11 +1565,14 @@ async fn a_reload_that_tightens_a_client_closes_its_connections() {
     let path = dir.path().join("config.toml");
     let path_str = path.to_str().expect("utf-8 path").to_string();
 
-    std::fs::write(&path, file_for("alice", "ALICEALICEALICEA", &["a.test"]))
-        .expect("write the config");
+    std::fs::write(
+        &path,
+        file_for("alice", "ALICEALICEALICEAALICEALICEALICEA", &["a.test"]),
+    )
+    .expect("write the config");
 
     // The live client may reach both hosts.
-    let mut alice = client("ALICEALICEALICEA");
+    let mut alice = client("ALICEALICEALICEAALICEALICEALICEA");
     alice.allow_hosts = Some(vec!["a.test".to_string(), "b.test".to_string()]);
     let state = AuthState::new(config_with(&[("alice", alice)]), path_str.clone());
     let peers = Arc::new(PeerRegistry::new());
@@ -1595,12 +1608,16 @@ async fn a_reload_that_widens_a_client_leaves_its_connections_alone() {
 
     std::fs::write(
         &path,
-        file_for("alice", "ALICEALICEALICEA", &["a.test", "b.test"]),
+        file_for(
+            "alice",
+            "ALICEALICEALICEAALICEALICEALICEA",
+            &["a.test", "b.test"],
+        ),
     )
     .expect("write the config");
 
     // The live client may reach one host only.
-    let mut alice = client("ALICEALICEALICEA");
+    let mut alice = client("ALICEALICEALICEAALICEALICEALICEA");
     alice.allow_hosts = Some(vec!["a.test".to_string()]);
     let state = AuthState::new(config_with(&[("alice", alice)]), path_str.clone());
     let peers = Arc::new(PeerRegistry::new());
@@ -1638,7 +1655,7 @@ async fn a_reload_that_removes_a_client_closes_its_connections() {
     std::fs::write(&path, "[auth]\n").expect("write the config");
 
     let state = AuthState::new(
-        config_with(&[("alice", client("ALICEALICEALICEA"))]),
+        config_with(&[("alice", client("ALICEALICEALICEAALICEALICEALICEA"))]),
         path_str.clone(),
     );
     let peers = Arc::new(PeerRegistry::new());

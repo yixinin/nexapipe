@@ -302,7 +302,7 @@ fn revoking_a_device_does_not_hint_at_a_credential_that_is_already_gone() {
          enabled = true\n\
          \n\
          [auth.clients.acme]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          unnamed_device_allowed = false\n\
          \n\
          [auth.clients.acme.devices.laptop]\n\
@@ -386,11 +386,11 @@ fn revoking_survives_a_config_that_no_longer_loads() {
          enabled = true\n\
          \n\
          [auth.clients.acme]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          allow_hosts = \"example.com\"\n\
          \n\
          [auth.clients.acme.devices.laptop]\n\
-         secret = \"MFRGGZDFMZTWQ2LK\"\n",
+         secret = \"MFRGGZDFMZTWQ2LKMFRGGZDFMZTWQ2LK\"\n",
     );
 
     // The premise: this is a config the typed load rejects. Without it the
@@ -461,11 +461,11 @@ fn the_port_acl_is_visible_in_the_client_list() {
          enabled = true\n\
          \n\
          [auth.clients.acme]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          allow_ports = [443, 8443]\n\
          \n\
          [auth.clients.strict]\n\
-         secret = \"MFRGGZDFMZTWQ2LK\"\n\
+         secret = \"MFRGGZDFMZTWQ2LKMFRGGZDFMZTWQ2LK\"\n\
          allow_hosts = []\n\
          allow_ports = []\n\
          allow_ports_strict = true\n",

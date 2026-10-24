@@ -189,7 +189,7 @@ issuer = "NexaPipe"
 # existing device is never locked out. Rotating a secret stays explicit:
 # --generate-2fa client-001 --force.
 [auth.clients.client-001]
-secret = "JBSWY3DPEHPK3PXP" # Base32-encoded secret
+secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP" # Base32-encoded secret
 created_at = "1723756800"
 # Optional per-client host authorization. Patterns use the same spelling as a
 # route's host_pattern — an exact name or a "*.suffix" wildcard,
@@ -287,7 +287,7 @@ created_at = "1723756800"
 # Left out, or true, the client answers as it always has. Turning it off before
 # every device is enrolled locks out the ones that never named themselves.
 [auth.clients.client-001.devices.laptop]
-secret = "LAPTOPSECRET"     # Base32-encoded TOTP seed, issued at enrollment
+secret = "LAPTOPSECRETLAPTOPSECRETLAPTOPSE"     # Base32-encoded TOTP seed, issued at enrollment
 created_at = "1723756800"
 
 # The same table, one device later, carrying the other kind of credential:
@@ -296,7 +296,7 @@ created_at = "1723756800"
 # created_at = "1723756800"
 
 [auth.clients.client-002]
-secret = "KBSWY3DPEHPK3PXQ"
+secret = "KBSWY3DPEHPK3PXQKBSWY3DPEHPK3PXQ"
 created_at = "1723756800"
 
 # ===== Routes =====
@@ -380,7 +380,7 @@ domains = ["example.com", "api.example.com"]
 [local_proxy.two_factor]
 enabled = true
 client_id = "client-001"
-secret = "JBSWY3DPEHPK3PXP"
+secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 algorithm = "sha1"
 
 # Rotating log files under ./logs next to the console output are on by default

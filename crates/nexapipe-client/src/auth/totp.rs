@@ -192,6 +192,24 @@ pub(super) fn decode_base32(secret_base32: &str) -> Result<SecretBytes, ClientEr
     )
     .map(SecretBytes::new)
     .ok_or_else(|| ClientError::InvalidConfig("Invalid Base32 secret".to_string()))
+    .and_then(|decoded| {
+        // A seed that decodes to less than 128 bits is a challenge anybody can
+        // brute force, and the TOTP library refuses it when the validator is
+        // built — at the first handshake, with an error about a secret length
+        // that says nothing about what to do. The floor is the same one the
+        // server applies, and it is applied here so a secret that cannot work
+        // is refused where it is configured.
+        let length = decoded.expose_secret().len();
+        if length < super::MIN_SECRET_BYTES {
+            return Err(ClientError::InvalidConfig(format!(
+                "the 2FA secret decodes to {} byte{}; a TOTP secret is at least {} bytes",
+                length,
+                if length == 1 { "" } else { "s" },
+                super::MIN_SECRET_BYTES
+            )));
+        }
+        Ok(decoded)
+    })
 }
 
 /// Generate a new secret for client setup

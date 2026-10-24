@@ -430,7 +430,7 @@ pub struct LocalProxyConfig {
     ///   [local_proxy.two_factor]
     ///   enabled = true
     ///   client_id = "client-001"
-    ///   secret = "JBSWY3DPEHPK3PXP"
+    ///   secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
     ///   algorithm = "sha1"
     pub two_factor: Option<LocalProxyTwoFactorConfig>,
 }

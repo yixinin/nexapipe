@@ -600,7 +600,7 @@ domains = ["app.example.com"]
 # [local_proxy.two_factor]
 # enabled = true
 # client_id = "client-001"
-# secret = "JBSWY3DPEHPK3PXP"
+# secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 # algorithm = "sha1"
 
 # ============================================================
@@ -670,7 +670,7 @@ enabled = true
 # lockout_duration = 300
 #
 # [auth.clients.client-001]
-# secret = "JBSWY3DPEHPK3PXP"
+# secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 # created_at = "1723756800"
 # allow_hosts = ["app.example.com", "*.db.example.com"]   # unset = every route
 # allow_ports = [443, 8443]                                # unset = every port

@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// A 160-bit Base32 secret, the length `--generate-2fa` hands out. The
 /// example configs carry an 80-bit one for brevity, but `totp-rs` refuses to
 /// build a validator from anything shorter than 128 bits.
-const SECRET: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+const SECRET: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
 
 /// Two more of the same length, for the devices under that client. Distinct
 /// from `SECRET` on purpose: a device that could authenticate with the
@@ -322,10 +322,10 @@ fn persists_lockout_counters_across_a_reload() {
          [auth]\n\
          enabled = true\n\
          [auth.clients.client-001]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          created_at = \"1723756800\"\n\
          [auth.clients.client-002]\n\
-         secret = \"KBSWY3DPEHPK3PXQ\"\n\
+         secret = \"KBSWY3DPEHPK3PXQKBSWY3DPEHPK3PXQ\"\n\
          created_at = \"1723756800\"\n";
     std::fs::write(&path, source).unwrap();
 
@@ -350,7 +350,7 @@ fn persists_lockout_counters_across_a_reload() {
     assert!(state.contains("failed_attempts = 2"), "{state}");
     assert!(state.contains("last_used = 1700000000"), "{state}");
     assert!(
-        !state.contains("JBSWY3DPEHPK3PXP"),
+        !state.contains("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"),
         "a credential has no business in the state file: {state}"
     );
 
@@ -393,7 +393,7 @@ fn the_enrollment_counter_survives_a_reload() {
     let source = "[auth]\n\
          enabled = true\n\
          [auth.clients.client-001]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          created_at = \"1723756800\"\n\
          pending_enrollment = \"0123456789abcdef\"\n";
     std::fs::write(&path, source).unwrap();
@@ -449,7 +449,7 @@ fn does_not_resurrect_a_client_removed_from_disk() {
         "[auth]\n\
          enabled = true\n\
          [auth.clients.client-001]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n",
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n",
     )
     .unwrap();
 
@@ -458,7 +458,9 @@ fn does_not_resurrect_a_client_removed_from_disk() {
     auth.clients.insert(
         "client-002".to_string(),
         ClientAuth {
-            secret: nexapipe_proto::secret::SecretString::new("KBSWY3DPEHPK3PXQ".to_string()),
+            secret: nexapipe_proto::secret::SecretString::new(
+                "KBSWY3DPEHPK3PXQKBSWY3DPEHPK3PXQ".to_string(),
+            ),
             created_at: "0".to_string(),
             allow_hosts: None,
             allow_ports: None,
@@ -697,7 +699,7 @@ fn keeps_the_device_table_when_it_writes_counters() {
          [auth]\n\
          enabled = true\n\
          [auth.clients.client-001]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          created_at = \"1723756800\"\n\
          [auth.clients.client-001.devices.laptop]\n\
          secret = \"KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP\"\n\

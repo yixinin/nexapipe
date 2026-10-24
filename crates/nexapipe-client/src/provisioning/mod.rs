@@ -6,7 +6,7 @@
 //! ```text
 //! nexapipe://endpoint/<node-id>?v=1&name=Home&domains=a.example,b.example
 //!     &relay=https%3A%2F%2Frelay.example
-//!     &client=client-001&issuer=NexaPipe&secret=JBSWY3DPEHPK3PXP
+//!     &client=client-001&issuer=NexaPipe&secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP
 //!     &algorithm=SHA1&digits=6&period=30
 //!
 //! nexapipe://ticket/<endpoint-ticket>?v=1&domains=a.example

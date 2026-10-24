@@ -113,7 +113,7 @@ fn a_credential_in_a_readable_file_is_warned_about() {
 enabled = true
 
 [clients.client-001]
-secret = "JBSWY3DPEHPK3PXP"
+secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 "#,
     )
     .expect("the auth config parses");
@@ -185,7 +185,7 @@ fn a_group_readable_file_is_warned_about() {
 enabled = true
 
 [clients.client-001]
-secret = "JBSWY3DPEHPK3PXP"
+secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 "#,
     )
     .expect("the auth config parses");
@@ -238,7 +238,7 @@ enabled = true
 secret = ""
 
 [clients.client-001.devices.laptop]
-secret = "JBSWY3DPEHPK3PXP"
+secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 "#,
     )
     .expect("the auth config parses");
@@ -262,16 +262,16 @@ fn the_port_rule_is_read_at_the_top_level() {
          enabled = true\n\
          \n\
          [auth.clients.named]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          allow_ports = [443]\n\
          \n\
          [auth.clients.strict]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          allow_ports = [443]\n\
          allow_ports_strict = true\n\
          \n\
          [auth.clients.unlimited]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n",
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n",
     );
 
     let rules = config.auth.expect("the [auth] section was read");
@@ -295,14 +295,14 @@ fn the_port_rule_summary_holds_no_credential() {
          enabled = true\n\
          \n\
          [auth.clients.client-001]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          allow_ports = [443]\n",
     );
 
     let rules = config.auth.expect("the [auth] section was read");
     let debug = format!("{rules:?}");
     assert!(
-        !debug.contains("JBSWY3DPEHPK3PXP"),
+        !debug.contains("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"),
         "the seed was copied into the configuration: {debug}"
     );
 }
@@ -1026,7 +1026,7 @@ fn the_algorithm_names_that_worked_still_work() {
 /// A config with an algorithm the server cannot read does not load.
 fn load_with_algorithm(algorithm: &str) -> anyhow::Result<crate::auth::AuthConfig> {
     let source = format!(
-        "[auth]\nenabled = true\nalgorithm = \"{algorithm}\"\n\n[auth.clients.client-001]\nsecret = \"JBSWY3DPEHPK3PXP\"\n"
+        "[auth]\nenabled = true\nalgorithm = \"{algorithm}\"\n\n[auth.clients.client-001]\nsecret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n"
     );
     let dir = tempfile::tempdir().expect("a scratch directory");
     let path = dir.path().join("config.toml");
@@ -1327,7 +1327,7 @@ fn scratch_client_with_token() -> (tempfile::TempDir, String) {
 enabled = true
 
 [auth.clients.alice]
-secret = "CLIENTSECRET"
+secret = "CLIENTSECRETCLIENTSECRETCLIENTSE"
 pending_enrollment = "TOKEN"
 "#,
     )
@@ -1348,7 +1348,7 @@ fn enrolling_a_device_writes_its_entry_and_leaves_the_clients_secret() {
         &path,
         "alice",
         "laptop",
-        DeviceMaterial::Secret("LAPTOPSECRET"),
+        DeviceMaterial::Secret("LAPTOPSECRETLAPTOPSECRETLAPTOPSE"),
     )
     .expect("the device enrollment is saved");
 
@@ -1363,10 +1363,13 @@ fn enrolling_a_device_writes_its_entry_and_leaves_the_clients_secret() {
     let alice = &auth.clients["alice"];
     assert_eq!(
         alice.secret.as_str(),
-        "CLIENTSECRET",
+        "CLIENTSECRETCLIENTSECRETCLIENTSE",
         "the shared secret rotated"
     );
-    assert_eq!(alice.devices["laptop"].secret.as_str(), "LAPTOPSECRET");
+    assert_eq!(
+        alice.devices["laptop"].secret.as_str(),
+        "LAPTOPSECRETLAPTOPSECRETLAPTOPSE"
+    );
     assert!(
         !alice.devices["laptop"].created_at.is_empty(),
         "a device with no issued-at looks never issued"
@@ -1387,11 +1390,11 @@ fn a_client_can_stop_answering_devices_that_name_themselves_not_at_all() {
              enabled = true\n\
              \n\
              [auth.clients.alice]\n\
-             secret = \"CLIENTSECRET\"\n\
+             secret = \"CLIENTSECRETCLIENTSECRETCLIENTSE\"\n\
              {}\
              \n\
              [auth.clients.alice.devices.laptop]\n\
-             secret = \"LAPTOPSECRET\"\n",
+             secret = \"LAPTOPSECRETLAPTOPSECRETLAPTOPSE\"\n",
             flag.unwrap_or_default()
         )
     };
@@ -1422,14 +1425,14 @@ fn a_second_device_enrolling_leaves_the_first_one_alone() {
         &path,
         "alice",
         "laptop",
-        DeviceMaterial::Secret("LAPTOPSECRET"),
+        DeviceMaterial::Secret("LAPTOPSECRETLAPTOPSECRETLAPTOPSE"),
     )
     .expect("the first device enrolls");
     ProxyConfig::complete_device_enrollment(
         &path,
         "alice",
         "phone",
-        DeviceMaterial::Secret("PHONESECRET"),
+        DeviceMaterial::Secret("PHONESECRETPHONESECRETPHONESECRE"),
     )
     .expect("the second device enrolls");
 
@@ -1439,8 +1442,14 @@ fn a_second_device_enrolling_leaves_the_first_one_alone() {
     // The count, not the map: the map carries each device's secret, and a
     // failing assertion would render it into the CI log.
     assert_eq!(devices.len(), 2, "both devices are enrolled");
-    assert_eq!(devices["laptop"].secret.as_str(), "LAPTOPSECRET");
-    assert_eq!(devices["phone"].secret.as_str(), "PHONESECRET");
+    assert_eq!(
+        devices["laptop"].secret.as_str(),
+        "LAPTOPSECRETLAPTOPSECRETLAPTOPSE"
+    );
+    assert_eq!(
+        devices["phone"].secret.as_str(),
+        "PHONESECRETPHONESECRETPHONESECRE"
+    );
 }
 
 /// Neither writer may hand a device an empty secret.
@@ -1613,8 +1622,13 @@ fn client_secret_is_appended_without_rewriting_the_file() {
          backends = [\"http://127.0.0.1:8080\"]\n",
     );
 
-    let outcome = ProxyConfig::write_client_secret(&path, "client-001", "JBSWY3DPEHPK3PXP", false)
-        .expect("secret should be written");
+    let outcome = ProxyConfig::write_client_secret(
+        &path,
+        "client-001",
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+        false,
+    )
+    .expect("secret should be written");
     assert_eq!(outcome, ClientSecretWrite::Added);
 
     let written = fs::read_to_string(&path).expect("read back");
@@ -1624,7 +1638,7 @@ fn client_secret_is_appended_without_rewriting_the_file() {
     assert!(written.contains("[auth.clients.client-001]"));
     assert_eq!(
         secret_of(&path, "client-001").as_deref(),
-        Some("JBSWY3DPEHPK3PXP")
+        Some("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
     );
 }
 
@@ -1635,23 +1649,28 @@ fn client_secret_joins_an_existing_auth_section() {
          enabled = true\n\
          \n\
          [auth.clients.other]\n\
-         secret = \"AAAAAAAAAAAAAAAA\"\n",
+         secret = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n",
     );
 
-    let outcome = ProxyConfig::write_client_secret(&path, "client-002", "JBSWY3DPEHPK3PXP", false)
-        .expect("secret should be written");
+    let outcome = ProxyConfig::write_client_secret(
+        &path,
+        "client-002",
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+        false,
+    )
+    .expect("secret should be written");
     assert_eq!(outcome, ClientSecretWrite::Added);
 
     let written = fs::read_to_string(&path).expect("read back");
     assert!(written.contains("[auth.clients.other]"));
     assert_eq!(
         secret_of(&path, "other").as_deref(),
-        Some("AAAAAAAAAAAAAAAA"),
+        Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
         "the neighbouring client must not be touched"
     );
     assert_eq!(
         secret_of(&path, "client-002").as_deref(),
-        Some("JBSWY3DPEHPK3PXP")
+        Some("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
     );
     // 2FA was already on and stays on; enabling it is the operator's call.
     let (_, auth) = ProxyConfig::load_with_auth(&path).expect("config parses");
@@ -1665,23 +1684,33 @@ fn client_secret_needs_force_to_replace_one() {
          enabled = true\n\
          \n\
          [auth.clients.client-001]\n\
-         secret = \"OLDOLDOLDOLDOLD\"\n",
+         secret = \"OLDOLDOLDOLDOLDOLDOLDOLDOLDOLDOL\"\n",
     );
 
-    let err = ProxyConfig::write_client_secret(&path, "client-001", "JBSWY3DPEHPK3PXP", false)
-        .expect_err("an enrolled client must not lose its secret by accident");
+    let err = ProxyConfig::write_client_secret(
+        &path,
+        "client-001",
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+        false,
+    )
+    .expect_err("an enrolled client must not lose its secret by accident");
     assert!(err.to_string().contains("already has a secret"));
     assert_eq!(
         secret_of(&path, "client-001").as_deref(),
-        Some("OLDOLDOLDOLDOLD")
+        Some("OLDOLDOLDOLDOLDOLDOLDOLDOLDOLDOL")
     );
 
-    let outcome = ProxyConfig::write_client_secret(&path, "client-001", "JBSWY3DPEHPK3PXP", true)
-        .expect("force replaces it");
+    let outcome = ProxyConfig::write_client_secret(
+        &path,
+        "client-001",
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+        true,
+    )
+    .expect("force replaces it");
     assert_eq!(outcome, ClientSecretWrite::Replaced);
     assert_eq!(
         secret_of(&path, "client-001").as_deref(),
-        Some("JBSWY3DPEHPK3PXP")
+        Some("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
     );
 }
 
@@ -1691,8 +1720,13 @@ fn client_ids_that_are_not_bare_keys_are_quoted() {
     // quoted so it stays one key.
     let (_dir, path) = scratch_config("default_backend = \"http://127.0.0.1:15666\"\n");
 
-    ProxyConfig::write_client_secret(&path, "client.001", "JBSWY3DPEHPK3PXP", false)
-        .expect("secret should be written");
+    ProxyConfig::write_client_secret(
+        &path,
+        "client.001",
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+        false,
+    )
+    .expect("secret should be written");
 
     let written = fs::read_to_string(&path).expect("read back");
     assert!(
@@ -1701,7 +1735,7 @@ fn client_ids_that_are_not_bare_keys_are_quoted() {
     );
     assert_eq!(
         secret_of(&path, "client.001").as_deref(),
-        Some("JBSWY3DPEHPK3PXP")
+        Some("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
     );
 }
 
@@ -2091,7 +2125,7 @@ fn an_enrollment_token_is_recorded_then_spent() {
          enabled = true\n\
          \n\
          [auth.clients.client-001]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n",
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n",
     );
 
     ProxyConfig::write_pending_enrollment(&path, "client-001", "deadbeef")
@@ -2107,7 +2141,7 @@ fn an_enrollment_token_is_recorded_then_spent() {
     );
     assert_eq!(
         auth.clients["client-001"].secret.as_str(),
-        "JBSWY3DPEHPK3PXP"
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
     );
 
     // Issuing a second token replaces the first: that is how a link that
@@ -2123,11 +2157,11 @@ fn an_enrollment_token_is_recorded_then_spent() {
         Some("cafebabe")
     );
 
-    ProxyConfig::complete_enrollment(&path, "client-001", "NEWSECRETVALUE")
+    ProxyConfig::complete_enrollment(&path, "client-001", "NEWSECRETVALUENEWSECRETVALUENEWS")
         .expect("enrollment should be saved");
     let (_, auth) = ProxyConfig::load_with_auth(&path).expect("config still parses");
     let client = &auth.unwrap().clients["client-001"];
-    assert_eq!(client.secret.as_str(), "NEWSECRETVALUE");
+    assert_eq!(client.secret.as_str(), "NEWSECRETVALUENEWSECRETVALUENEWS");
     // The token has to go with it, or the same link enrolls a second device.
     assert_eq!(client.pending_enrollment, None);
 }
@@ -2149,7 +2183,7 @@ fn a_blank_enrollment_token_is_refused() {
          enabled = true\n\
          \n\
          [auth.clients.client-001]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          pending_enrollment = \"\"\n",
     );
 
@@ -2211,14 +2245,14 @@ fn a_device_secret_lands_under_the_clients_devices_table() {
          enabled = true\n\
          \n\
          [auth.clients.acme]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n",
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n",
     );
 
     let outcome = ProxyConfig::write_device_credential(
         &path,
         "acme",
         "laptop",
-        DeviceMaterial::Secret("MFRGGZDFMZTWQ2LK"),
+        DeviceMaterial::Secret("MFRGGZDFMZTWQ2LKMFRGGZDFMZTWQ2LK"),
         false,
     )
     .expect("the device secret should be written");
@@ -2231,13 +2265,13 @@ fn a_device_secret_lands_under_the_clients_devices_table() {
     );
     assert_eq!(
         secret_of(&path, "acme").as_deref(),
-        Some("JBSWY3DPEHPK3PXP"),
+        Some("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"),
         "the unnamed device keeps the credential it had"
     );
     let devices = devices_of(&path, "acme");
     assert_eq!(
         devices.get("laptop").map(|d| d.secret.as_str()),
-        Some("MFRGGZDFMZTWQ2LK")
+        Some("MFRGGZDFMZTWQ2LKMFRGGZDFMZTWQ2LK")
     );
 }
 
@@ -2250,17 +2284,17 @@ fn a_device_secret_needs_force_to_replace_one() {
          enabled = true\n\
          \n\
          [auth.clients.acme]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          \n\
          [auth.clients.acme.devices.laptop]\n\
-         secret = \"OLDOLDOLDOLDOLD\"\n",
+         secret = \"OLDOLDOLDOLDOLDOLDOLDOLDOLDOLDOL\"\n",
     );
 
     let err = ProxyConfig::write_device_credential(
         &path,
         "acme",
         "laptop",
-        DeviceMaterial::Secret("NEWNEWNEWNEWNEW"),
+        DeviceMaterial::Secret("NEWNEWNEWNEWNEWNEWNEWNEWNEWNEWNE"),
         false,
     )
     .expect_err("a device must not lose its credential by accident");
@@ -2272,14 +2306,14 @@ fn a_device_secret_needs_force_to_replace_one() {
         devices_of(&path, "acme")
             .get("laptop")
             .map(|d| d.secret.as_str()),
-        Some("OLDOLDOLDOLDOLD")
+        Some("OLDOLDOLDOLDOLDOLDOLDOLDOLDOLDOL")
     );
 
     let outcome = ProxyConfig::write_device_credential(
         &path,
         "acme",
         "laptop",
-        DeviceMaterial::Secret("NEWNEWNEWNEWNEW"),
+        DeviceMaterial::Secret("NEWNEWNEWNEWNEWNEWNEWNEWNEWNEWNE"),
         true,
     )
     .expect("with force the secret is replaced");
@@ -2288,7 +2322,7 @@ fn a_device_secret_needs_force_to_replace_one() {
         devices_of(&path, "acme")
             .get("laptop")
             .map(|d| d.secret.as_str()),
-        Some("NEWNEWNEWNEWNEW")
+        Some("NEWNEWNEWNEWNEWNEWNEWNEWNEWNEWNE")
     );
 }
 
@@ -2301,14 +2335,14 @@ fn a_device_secret_needs_a_client_with_a_secret() {
          enabled = true\n\
          \n\
          [auth.clients.other]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n",
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n",
     );
 
     let err = ProxyConfig::write_device_credential(
         &path,
         "ghost",
         "laptop",
-        DeviceMaterial::Secret("MFRGGZDFMZTWQ2LK"),
+        DeviceMaterial::Secret("MFRGGZDFMZTWQ2LKMFRGGZDFMZTWQ2LK"),
         false,
     )
     .expect_err("a device of a client that is not there must not be created");
@@ -2329,7 +2363,7 @@ fn an_unprintable_device_name_is_refused() {
          enabled = true\n\
          \n\
          [auth.clients.acme]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n",
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n",
     );
 
     for name in ["", "lap top", "laptop\nsecret = \"x\""] {
@@ -2337,7 +2371,7 @@ fn an_unprintable_device_name_is_refused() {
             &path,
             "acme",
             name,
-            DeviceMaterial::Secret("MFRGGZDFMZTWQ2LK"),
+            DeviceMaterial::Secret("MFRGGZDFMZTWQ2LKMFRGGZDFMZTWQ2LK"),
             false,
         )
         .expect_err("an unusable device name must not be written");
@@ -2357,7 +2391,7 @@ fn a_device_key_lands_under_the_clients_devices_table() {
          enabled = true\n\
          \n\
          [auth.clients.acme]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n",
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n",
     );
     let key = crate::auth::public_key_hex(&iroh::SecretKey::generate().public());
 
@@ -2382,7 +2416,7 @@ fn a_device_key_lands_under_the_clients_devices_table() {
     assert!(server.secret.expose_secret().is_empty(), "{server:?}");
     assert_eq!(
         secret_of(&path, "acme").as_deref(),
-        Some("JBSWY3DPEHPK3PXP"),
+        Some("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"),
         "the unnamed device keeps the credential it had"
     );
 }
@@ -2397,7 +2431,7 @@ fn a_public_key_that_is_not_a_key_is_refused_by_the_writer() {
          enabled = true\n\
          \n\
          [auth.clients.acme]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n",
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n",
     );
     let before = fs::read_to_string(&path).expect("read the config first");
 
@@ -2434,10 +2468,10 @@ fn a_key_replaces_a_secret_only_with_force() {
          enabled = true\n\
          \n\
          [auth.clients.acme]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          \n\
          [auth.clients.acme.devices.server]\n\
-         secret = \"OLDOLDOLDOLDOLD\"\n",
+         secret = \"OLDOLDOLDOLDOLDOLDOLDOLDOLDOLDOL\"\n",
     );
     let key = crate::auth::public_key_hex(&iroh::SecretKey::generate().public());
 
@@ -2482,13 +2516,13 @@ fn revoking_a_device_leaves_the_others_alone() {
          enabled = true\n\
          \n\
          [auth.clients.acme]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          \n\
          [auth.clients.acme.devices.laptop]\n\
-         secret = \"AAAAAAAAAAAAAAAA\"\n\
+         secret = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n\
          \n\
          [auth.clients.acme.devices.phone]\n\
-         secret = \"BBBBBBBBBBBBBBBB\"\n",
+         secret = \"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\"\n",
     );
 
     ProxyConfig::remove_device(&path, "acme", "laptop").expect("the device should be revoked");
@@ -2497,15 +2531,18 @@ fn revoking_a_device_leaves_the_others_alone() {
     assert_eq!(devices.len(), 1, "one device went, {devices:?}");
     assert_eq!(
         devices.get("phone").map(|d| d.secret.as_str()),
-        Some("BBBBBBBBBBBBBBBB")
+        Some("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")
     );
     assert_eq!(
         secret_of(&path, "acme").as_deref(),
-        Some("JBSWY3DPEHPK3PXP"),
+        Some("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"),
         "the client's own credential is not a device's to revoke"
     );
     let written = fs::read_to_string(&path).expect("read back");
-    assert!(!written.contains("AAAAAAAAAAAAAAAA"), "{written}");
+    assert!(
+        !written.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        "{written}"
+    );
 }
 
 /// Naming a device that is not there says which ones are, so a typo does not
@@ -2517,10 +2554,10 @@ fn revoking_a_device_that_is_not_there_says_which_ones_are() {
          enabled = true\n\
          \n\
          [auth.clients.acme]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          \n\
          [auth.clients.acme.devices.laptop]\n\
-         secret = \"AAAAAAAAAAAAAAAA\"\n",
+         secret = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n",
     );
 
     let err = ProxyConfig::remove_device(&path, "acme", "tablet")
@@ -2539,23 +2576,26 @@ fn revoking_a_client_takes_its_devices_with_it() {
                   enabled = true\n\
                   \n\
                   [auth.clients.acme]\n\
-                  secret = \"JBSWY3DPEHPK3PXP\"\n\
+                  secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
                   \n\
                   [auth.clients.acme.devices.laptop]\n\
-                  secret = \"AAAAAAAAAAAAAAAA\"\n\
+                  secret = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n\
                   \n\
                   [auth.clients.other]\n\
-                  secret = \"CCCCCCCCCCCCCCCC\"\n";
+                  secret = \"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\"\n";
     let (_dir, path) = scratch_config(source);
 
     ProxyConfig::remove_client(&path, "acme").expect("the client should be revoked");
 
     let written = fs::read_to_string(&path).expect("read back");
     assert!(!written.contains("acme"), "{written}");
-    assert!(!written.contains("AAAAAAAAAAAAAAAA"), "{written}");
+    assert!(
+        !written.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        "{written}"
+    );
     assert_eq!(
         secret_of(&path, "other").as_deref(),
-        Some("CCCCCCCCCCCCCCCC"),
+        Some("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"),
         "the neighbouring client is untouched"
     );
     let (_, auth) = ProxyConfig::load_with_auth(&path).expect("config still parses");
@@ -2569,7 +2609,7 @@ fn revoking_something_absent_leaves_the_file_alone() {
     let source = "default_backend = \"http://127.0.0.1:15666\"\n\
                   \n\
                   [auth.clients.acme]\n\
-                  secret = \"JBSWY3DPEHPK3PXP\"\n";
+                  secret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n";
     let (_dir, path) = scratch_config(source);
 
     let err = ProxyConfig::remove_client(&path, "ghost")
@@ -2701,7 +2741,7 @@ fn an_allow_hosts_wildcard_without_a_label_boundary_is_refused() {
 [auth]
 
 [auth.clients.device]
-secret = "JBSWY3DPEHPK3PXP"
+secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 allow_hosts = ["*iakl.top"]
 "#,
     )
@@ -2726,7 +2766,7 @@ fn a_pattern_that_folds_into_the_catch_all_is_refused() {
 [auth]
 
 [auth.clients.device]
-secret = "JBSWY3DPEHPK3PXP"
+secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 allow_hosts = ["*.."]
 "#,
     )
@@ -2779,22 +2819,25 @@ fn a_device_table_loads_without_disturbing_the_client() {
     let (_, auth) = load_from(
         r#"
 [auth.clients.client-001]
-secret = "CLIENTSECRET"
+secret = "CLIENTSECRETCLIENTSECRETCLIENTSE"
 
 [auth.clients.client-001.devices.laptop]
-secret = "LAPTOPSECRET"
+secret = "LAPTOPSECRETLAPTOPSECRETLAPTOPSE"
 
 [auth.clients.client-001.devices.phone]
-secret = "PHONESECRET"
+secret = "PHONESECRETPHONESECRETPHONESECRE"
 created_at = "1700000000"
 "#,
     )
     .expect("a device table loads");
 
     let client = &auth.expect("auth section present").clients["client-001"];
-    assert_eq!(client.secret.as_str(), "CLIENTSECRET");
+    assert_eq!(client.secret.as_str(), "CLIENTSECRETCLIENTSECRETCLIENTSE");
     assert_eq!(client.devices.len(), 2);
-    assert_eq!(client.devices["laptop"].secret.as_str(), "LAPTOPSECRET");
+    assert_eq!(
+        client.devices["laptop"].secret.as_str(),
+        "LAPTOPSECRETLAPTOPSECRETLAPTOPSE"
+    );
     assert_eq!(client.devices["phone"].created_at, "1700000000");
     assert!(
         !client.devices["laptop"].created_at.is_empty(),
@@ -2811,7 +2854,7 @@ fn an_empty_device_secret_is_refused() {
     let err = load_from(
         r#"
 [auth.clients.client-001]
-secret = "CLIENTSECRET"
+secret = "CLIENTSECRETCLIENTSECRETCLIENTSE"
 
 [auth.clients.client-001.devices.laptop]
 secret = ""
@@ -2832,7 +2875,7 @@ secret = ""
 fn a_device_entry_needs_exactly_one_credential() {
     let client = r#"
 [auth.clients.client-001]
-secret = "CLIENTSECRET"
+secret = "CLIENTSECRETCLIENTSECRETCLIENTSE"
 "#;
 
     let neither = load_from(&format!(
@@ -2845,7 +2888,7 @@ secret = "CLIENTSECRET"
 
     let key = crate::auth::public_key_hex(&iroh::SecretKey::generate().public());
     let both = load_from(&format!(
-        "{client}\n[auth.clients.client-001.devices.laptop]\nsecret = \"LAPTOPSECRET\"\n\
+        "{client}\n[auth.clients.client-001.devices.laptop]\nsecret = \"LAPTOPSECRETLAPTOPSECRETLAPTOPSE\"\n\
          public_key = \"{key}\"\n"
     ))
     .expect_err("two credentials must not load");
@@ -2860,7 +2903,7 @@ fn a_public_key_device_loads_where_a_secret_one_does() {
     let key = crate::auth::public_key_hex(&iroh::SecretKey::generate().public());
 
     let (_, auth) = load_from(&format!(
-        "[auth.clients.client-001]\nsecret = \"CLIENTSECRET\"\n\n\
+        "[auth.clients.client-001]\nsecret = \"CLIENTSECRETCLIENTSECRETCLIENTSE\"\n\n\
          [auth.clients.client-001.devices.server]\npublic_key = \"{key}\"\n"
     ))
     .expect("a key device loads");
@@ -2888,7 +2931,7 @@ fn a_public_key_that_is_not_a_key_is_refused_at_load() {
     let err = load_from(
         r#"
 [auth.clients.client-001]
-secret = "CLIENTSECRET"
+secret = "CLIENTSECRETCLIENTSECRETCLIENTSE"
 
 [auth.clients.client-001.devices.server]
 public_key = "not a key"
@@ -2908,10 +2951,10 @@ fn an_unknown_device_key_is_refused_rather_than_ignored() {
     let err = load_from(
         r#"
 [auth.clients.client-001]
-secret = "CLIENTSECRET"
+secret = "CLIENTSECRETCLIENTSECRETCLIENTSE"
 
 [auth.clients.client-001.devices.laptop]
-secrets = "LAPTOPSECRET"
+secrets = "LAPTOPSECRETLAPTOPSECRETLAPTOPSE"
 "#,
     )
     .expect_err("a typo must not leave a device without a credential");
@@ -2926,18 +2969,18 @@ secrets = "LAPTOPSECRET"
 fn a_device_name_is_refused_before_it_reaches_a_log_line() {
     let client = r#"
 [auth.clients.client-001]
-secret = "CLIENTSECRET"
+secret = "CLIENTSECRETCLIENTSECRETCLIENTSE"
 "#;
 
     let err = load_from(&format!(
-        "{client}\n[auth.clients.client-001.devices.\"\"]\nsecret = \"LAPTOPSECRET\"\n"
+        "{client}\n[auth.clients.client-001.devices.\"\"]\nsecret = \"LAPTOPSECRETLAPTOPSECRETLAPTOPSE\"\n"
     ))
     .expect_err("an unnamed device is not a device");
     assert!(err.to_string().contains("needs a name"), "{err}");
 
     let err = load_from(&format!(
         "{client}\n[auth.clients.client-001.devices.\"laptop\\r\\nINFO: connected\"]\n\
-         secret = \"LAPTOPSECRET\"\n"
+         secret = \"LAPTOPSECRETLAPTOPSECRETLAPTOPSE\"\n"
     ))
     .expect_err("a name that ends its own log line must not load");
     assert!(err.to_string().contains("printable ASCII"), "{err}");
