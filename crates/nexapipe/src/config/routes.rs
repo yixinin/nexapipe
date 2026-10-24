@@ -369,6 +369,30 @@ impl TryFrom<RouteSpec> for crate::routes::Route {
             );
         }
 
+        // And a bound that long never fires within a process lifetime, which
+        // is the failure a timeout exists to prevent — the same ceiling the
+        // server-wide `[timeouts]` bounds are held to, for the same reason.
+        //
+        // A route's own bound overrides the server-wide one, so without this
+        // ceiling a route could carry a century and make the flow
+        // effectively unbounded, which is not what a timeout is.
+        for (key, secs) in [
+            ("idle_timeout_secs", idle_timeout_secs),
+            ("flow_timeout_secs", flow_timeout_secs),
+        ] {
+            let Some(secs) = secs else {
+                continue;
+            };
+            if secs > crate::deadline::MAX_SECS {
+                anyhow::bail!(
+                    "{label}: {key} is {secs}s, past the {max}s ceiling: a bound that long never \
+                     fires within a process lifetime, which is the failure a timeout exists to \
+                     prevent",
+                    max = crate::deadline::MAX_SECS
+                );
+            }
+        }
+
         // Every declared mode has to be able to dial these backends, so each
         // one is checked: the `http` rules and the L4 rules disagree (a URL
         // to fetch versus an address to dial, and only the L4 one insists on
@@ -425,5 +449,67 @@ impl TryFrom<RouteSpec> for crate::routes::Route {
         .with_l4_options(l4_options)
         .with_modes(modes)
         .with_backend_protocol(backend_protocol))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(source: &str) -> ProxyConfig {
+        toml::from_str(source).expect("the config parses")
+    }
+
+    /// A route's own bound is held to the same ceiling as the server-wide one.
+    ///
+    /// The `[timeouts]` bounds are refused above `crate::deadline::MAX_SECS`
+    /// precisely because a bound that long never fires within a process
+    /// lifetime. A per-route bound overrides the server-wide one, so without
+    /// the same ceiling a route could carry `flow_timeout_secs =
+    /// 315_360_000_000` — a century — and silently make the flow unbounded.
+    #[test]
+    fn a_route_bound_past_the_ceiling_is_refused() {
+        for key in ["idle_timeout_secs", "flow_timeout_secs"] {
+            let config = parse(&format!(
+                r#"
+[[routes]]
+host_pattern = "db.example.com"
+mode = "tcp"
+backends = ["10.0.0.5:5432"]
+{key} = 315_360_000_000
+"#
+            ));
+
+            let error = config.build_routes().unwrap_err().to_string();
+            assert!(
+                error.contains(key),
+                "the error does not name {key}: {error}"
+            );
+            assert!(
+                error.contains(&crate::deadline::MAX_SECS.to_string()),
+                "the error does not name the ceiling: {error}"
+            );
+        }
+    }
+
+    /// The ceiling itself is allowed: a day is a long flow, and refusing it
+    /// would refuse the case the key exists for.
+    #[test]
+    fn a_route_bound_at_the_ceiling_is_accepted() {
+        let config = parse(&format!(
+            r#"
+[[routes]]
+host_pattern = "db.example.com"
+mode = "tcp"
+backends = ["10.0.0.5:5432"]
+idle_timeout_secs = {}
+flow_timeout_secs = {}
+"#,
+            crate::deadline::MAX_SECS,
+            crate::deadline::MAX_SECS
+        ));
+
+        let routes = config.build_routes().expect("the route is built");
+        assert_eq!(routes.len(), 1);
     }
 }
