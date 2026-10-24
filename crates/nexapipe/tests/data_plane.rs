@@ -866,6 +866,14 @@ fn status_of(reply: &[u8]) -> String {
         .to_string()
 }
 
+/// The value a header of the reply carries, if it carries one.
+fn header_of(reply: &[u8], name: &str) -> Option<String> {
+    String::from_utf8_lossy(reply).lines().find_map(|line| {
+        let (header, value) = line.split_once(':')?;
+        (header.trim().eq_ignore_ascii_case(name)).then(|| value.trim().to_string())
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1448,6 +1456,202 @@ async fn a_websocket_whose_two_sides_went_quiet_ends() {
     assert!(
         ended.is_ok(),
         "the session should have ended once both sides went quiet"
+    );
+}
+
+/// A backend that refuses the upgrade says why in its body, and the client
+/// gets to read it.
+///
+/// A refusal is an ordinary response: the status, the headers and the body
+/// are the backend's answer, and the body is where the reason usually is.
+/// The body used to be dropped on the way — the client was given the status
+/// and nothing else, so a `403` with a JSON explanation arrived as a `403`
+/// with an empty body and the client could not tell what had gone wrong.
+#[tokio::test]
+async fn a_refused_upgrade_carries_the_backends_body() {
+    let backend = spawn_backend_answering(
+        "HTTP/1.1 403 Forbidden\r\n\
+         content-type: application/json\r\n\
+         content-length: 25\r\n\r\n\
+         {\"error\":\"token expired\"}",
+    )
+    .await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tokio::time::timeout(
+        Duration::from_secs(10),
+        tunnel.exchange(
+            b"GET /x HTTP/1.1\r\n\
+              Host: app.test\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\r\n",
+        ),
+    )
+    .await
+    .expect("the refusal came back in time");
+
+    assert!(
+        status_of(&reply).starts_with("HTTP/1.1 403"),
+        "expected the backend's refusal, got {:?}",
+        String::from_utf8_lossy(&reply)
+    );
+    assert_eq!(
+        reply_body(&reply),
+        "{\"error\":\"token expired\"}",
+        "the backend's explanation did not reach the client"
+    );
+}
+
+/// The chunks are how the backend sent the body; the client gets the body.
+///
+/// The framing is the backend's own hop and says nothing about this one, so
+/// what arrives at the client is the body and not the chunks it was sent in.
+#[tokio::test]
+async fn a_refused_upgrade_carries_the_body_of_a_chunked_answer() {
+    let backend = spawn_backend_answering(
+        "HTTP/1.1 403 Forbidden\r\n\
+         content-type: application/json\r\n\
+         transfer-encoding: chunked\r\n\r\n\
+         9\r\n{\"error\":\r\n\
+         10\r\n\"token expired\"}\r\n\
+         0\r\n\r\n",
+    )
+    .await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tokio::time::timeout(
+        Duration::from_secs(10),
+        tunnel.exchange(
+            b"GET /x HTTP/1.1\r\n\
+              Host: app.test\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\r\n",
+        ),
+    )
+    .await
+    .expect("the refusal came back in time");
+
+    assert!(
+        status_of(&reply).starts_with("HTTP/1.1 403"),
+        "expected the backend's refusal, got {:?}",
+        String::from_utf8_lossy(&reply)
+    );
+    assert_eq!(
+        reply_body(&reply),
+        "{\"error\":\"token expired\"}",
+        "the body did not reach the client without the chunks it was sent in"
+    );
+}
+
+/// A refusal with no body at all is still a refusal, and it is answered at
+/// once rather than after a wait for a body that is not coming.
+#[tokio::test]
+async fn a_refused_upgrade_with_no_body_is_answered_at_once() {
+    let backend =
+        spawn_backend_answering("HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n").await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tokio::time::timeout(
+        Duration::from_secs(10),
+        tunnel.exchange(
+            b"GET /x HTTP/1.1\r\n\
+              Host: app.test\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\r\n",
+        ),
+    )
+    .await
+    .expect("the refusal came back in time");
+
+    assert!(
+        status_of(&reply).starts_with("HTTP/1.1 403"),
+        "expected the backend's refusal, got {:?}",
+        String::from_utf8_lossy(&reply)
+    );
+    assert_eq!(
+        reply_body(&reply),
+        "",
+        "a refusal with no body must not carry one"
+    );
+}
+
+/// A body without a length ends where the connection ends, and the bytes are
+/// the client's.
+#[tokio::test]
+async fn a_refused_upgrade_without_framing_carries_the_body_to_the_end() {
+    let backend = spawn_backend_answering("HTTP/1.1 403 Forbidden\r\n\r\nplain text").await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tokio::time::timeout(
+        Duration::from_secs(10),
+        tunnel.exchange(
+            b"GET /x HTTP/1.1\r\n\
+              Host: app.test\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\r\n",
+        ),
+    )
+    .await
+    .expect("the refusal came back in time");
+
+    assert!(
+        status_of(&reply).starts_with("HTTP/1.1 403"),
+        "expected the backend's refusal, got {:?}",
+        String::from_utf8_lossy(&reply)
+    );
+    assert_eq!(
+        reply_body(&reply),
+        "plain text",
+        "the body that ended with the connection did not reach the client"
+    );
+}
+
+/// A backend that promises more than it sends does not get to lie about it.
+///
+/// The bytes it did send are still the reason the upgrade was refused, so
+/// they go to the client — with the length they really have, rather than the
+/// one the backend claimed.
+#[tokio::test]
+async fn a_refused_upgrade_with_a_short_body_is_answered_with_what_arrived() {
+    let backend = spawn_backend_answering(
+        "HTTP/1.1 403 Forbidden\r\n\
+         content-length: 100\r\n\r\n\
+         {\"error\":\"token expired\"}",
+    )
+    .await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tokio::time::timeout(
+        Duration::from_secs(10),
+        tunnel.exchange(
+            b"GET /x HTTP/1.1\r\n\
+              Host: app.test\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\r\n",
+        ),
+    )
+    .await
+    .expect("the refusal came back in time");
+
+    assert!(
+        status_of(&reply).starts_with("HTTP/1.1 403"),
+        "expected the backend's refusal, got {:?}",
+        String::from_utf8_lossy(&reply)
+    );
+    assert_eq!(
+        reply_body(&reply),
+        "{\"error\":\"token expired\"}",
+        "what the backend did send is the reason, and it has to reach the client"
+    );
+    assert_eq!(
+        header_of(&reply, "content-length").as_deref(),
+        Some("25"),
+        "the client must not be told a length the body does not have"
     );
 }
 
