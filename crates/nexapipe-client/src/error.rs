@@ -25,6 +25,18 @@ pub enum ClientError {
     ReceiveError(String),
     TimeoutError,
     InvalidConfig(String),
+    /// The pool has no room for another connection of this protocol.
+    ///
+    /// **A fact about this client, not about the backend.** The backend
+    /// answered; this process ran out of its own slots. A caller that keeps
+    /// a health table must not read this as evidence about the backend.
+    PoolFull(String),
+    /// The credential was replaced while the connection was being made.
+    ///
+    /// **A fact about this client, not about the backend.** The connection
+    /// was authenticated as an identity that has been rotated away, and the
+    /// handshake raced the rotation. The backend did nothing wrong.
+    CredentialReplaced(String),
     IoError(Arc<std::io::Error>),
     Other(String),
 }
@@ -40,6 +52,8 @@ impl fmt::Display for ClientError {
             ClientError::ReceiveError(msg) => write!(f, "Receive error: {}", msg),
             ClientError::TimeoutError => write!(f, "Operation timed out"),
             ClientError::InvalidConfig(msg) => write!(f, "Invalid config: {}", msg),
+            ClientError::PoolFull(msg) => write!(f, "Connection pool full: {}", msg),
+            ClientError::CredentialReplaced(msg) => write!(f, "Credential replaced: {}", msg),
             ClientError::IoError(e) => write!(f, "IO error: {}", e),
             ClientError::Other(msg) => write!(f, "Error: {}", msg),
         }

@@ -142,11 +142,22 @@ impl DomainPools {
         // connects and authenticates too, from the same pool, so nothing here
         // can mark a backend down that the next probe then marks back up.
         //
-        // Not `InvalidConfig`, which is the only way this pool reports the
-        // endpoint being gone: that is this process having let go of its own
-        // side, which every pool says at once on shutdown and which is news
-        // about nobody's backend. Calling it "down" would paint the whole node
-        // list unreachable each time a tunnel stops.
+        // **A refusal this client made is not a verdict about the backend.**
+        // Three of the failures this pool reports are about this process and
+        // not about anybody's backend: `InvalidConfig` is this process having
+        // let go of its own side, `PoolFull` is this process having run out
+        // of its own connection slots, and `CredentialReplaced` is this
+        // process having rotated a credential under a dial that was already
+        // running. The backend answered the handshake in every one of them.
+        //
+        // Calling any of the three "down" would paint the whole node list
+        // unreachable each time a tunnel stops, would flip `any_reachable()`
+        // off for a backend that is up, and — with a domain that has several
+        // backends — would steer every later request to the other backends
+        // until the next probe round, 30 to 35 seconds away.
+        //
+        // The verdict is written only by evidence that the *backend* failed:
+        // a dial or handshake that did not come about, or a probe.
         match pool.get_connection(protocol).await {
             Ok(borrowed) => Ok(PooledConnection::tracked(
                 borrowed.conn,
@@ -156,7 +167,11 @@ impl DomainPools {
                 self.flows.clone(),
                 borrowed.borrow,
             )),
-            Err(e @ ClientError::InvalidConfig(_)) => Err(e),
+            Err(
+                e @ (ClientError::InvalidConfig(_)
+                | ClientError::PoolFull(_)
+                | ClientError::CredentialReplaced(_)),
+            ) => Err(e),
             Err(e) => {
                 record_outcome(&self.health, backend_id, false);
                 Err(e)
