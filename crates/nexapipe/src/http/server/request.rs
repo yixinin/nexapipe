@@ -293,7 +293,9 @@ async fn upgrade(
             head.uri().path(),
             handshake.status,
             started.elapsed().as_millis() as u64,
-            0,
+            // The body of the refusal goes to the client with the status, so
+            // the log says how many bytes it carried.
+            handshake.refusal_body_len(),
             Some(&ctx.who),
         );
         return handshake.refusal_response();
