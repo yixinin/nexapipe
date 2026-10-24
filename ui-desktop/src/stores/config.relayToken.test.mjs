@@ -1,11 +1,11 @@
 /**
  * The rule that keeps a relay's token with the relay it was issued for.
  *
- * The desktop frontend has no test runner: the CI job for it runs `vue-tsc`,
- * `vite build` and the two lint scripts, and nothing else. This file is
- * therefore a plain Node test, run through Vite's own SSR build — the only
- * bundler the tree has, and the one that already resolves this tree's
- * extensionless imports:
+ * The desktop frontend has no test runner, so this file is a plain Node
+ * test, run through Vite's own SSR build — the only bundler the tree has,
+ * and the one that already resolves this tree's extensionless imports. The
+ * desktop CI job runs it (`npm run test:stores`), which builds each of the
+ * store's test files and runs it:
  *
  *   cd ui-desktop
  *   npx vite build --ssr src/stores/config.relayToken.test.mjs --outDir dist-ssr

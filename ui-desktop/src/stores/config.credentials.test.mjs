@@ -12,11 +12,11 @@
  * have deleted the seed the invite had just filed, and the node would have
  * started with no credential at all.
  *
- * The desktop frontend has no test runner: the CI job for it runs `vue-tsc`,
- * `vite build` and the two lint scripts, and nothing else. This file is
- * therefore a plain Node test, run through Vite's own SSR build — the only
- * bundler the tree has, and the one that already resolves this tree's
- * extensionless imports:
+ * The desktop frontend has no test runner, so this file is a plain Node
+ * test, run through Vite's own SSR build — the only bundler the tree has,
+ * and the one that already resolves this tree's extensionless imports. The
+ * desktop CI job runs it (`npm run test:stores`), which builds each of the
+ * store's test files and runs it:
  *
  *   cd ui-desktop
  *   npx vite build --ssr src/stores/config.credentials.test.mjs --outDir dist-ssr
