@@ -761,8 +761,11 @@ async function refreshServiceRunning(): Promise<void> {
       return false;
     }),
     invoke<'not_installed' | 'stopped' | 'running'>('get_service_status').catch(() => {
-      // The service manager is unavailable; treat the service as absent for install controls.
-      return 'not_installed' as const;
+      // The service manager is unavailable. That is not the same as the service being absent:
+      // the answer is unknown, and an unknown answer is not evidence either way. The install
+      // controls still need a state, so they get "not installed" below — but the certainty
+      // that the service is gone is not taken from a read that failed.
+      return undefined;
     }),
     // Which build the service says it is. `null` is an answer too: a service that will not say
     // which build it is, whether because it is gone or because it speaks another protocol.
@@ -775,10 +778,20 @@ async function refreshServiceRunning(): Promise<void> {
   // Nothing answered on the IPC port this time. Whether the service is *gone* is a different
   // question, and one missed deadline does not answer it, so the answer is only believed once it
   // has been repeated. Every read that answered clears the count.
+  //
+  // The service manager's answer is the one exception, because it is read locally and it has no
+  // deadline a busy machine can miss: it talks to the platform's own service database, not to the
+  // service over the IPC port. A service it says is not installed is gone for certain, and
+  // waiting for the IPC to miss several deadlines to admit it would leave a TUN request standing
+  // for a service that is not there — the exact thing rule 3 exists to prevent.
   if (running) {
     serviceReadFailures = 0;
     serviceRunning.value = true;
     serviceUnanswered.value = false;
+  } else if (state === 'not_installed') {
+    serviceReadFailures = 0;
+    serviceRunning.value = false;
+    serviceUnanswered.value = true;
   } else {
     serviceReadFailures += 1;
     if (serviceReadFailures >= SERVICE_FAILURES_BEFORE_TRUST) {
@@ -804,7 +817,10 @@ async function refreshServiceRunning(): Promise<void> {
   // unit exists, while TUN stays gated on the IPC connection actually being usable. Which of
   // the two says "running" is kept as well, because the service manager saying "running" while
   // nothing answers is what an upgrade leaves behind.
-  serviceState.value = state;
+  //
+  // A status read that failed leaves the state unknown; the install controls need a state, and
+  // "not installed" is the one they treat as "offer to install".
+  serviceState.value = state ?? 'not_installed';
 
   // TUN cannot run without the service, so an uninstalled service must not leave a latent
   // request behind (rule 3): the toggle flips back off and says why. Only once the reads have
