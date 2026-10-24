@@ -1525,3 +1525,73 @@ async fn a_body_that_is_given_up_on_hands_its_reservation_back() {
         "the body that was given up on hands its reservation back"
     );
 }
+
+/// The plaintext path does not hand the client a length that describes
+/// another body.
+///
+/// A backend that sends both a `Transfer-Encoding` and a `Content-Length` has
+/// its length overridden by the encoding (RFC 9112 §6.1, rule 3), and the
+/// received `Content-Length` has to be removed before the answer is
+/// forwarded. The `Transfer-Encoding` is dropped as a hop-by-hop header, so a
+/// length left behind describes a framing the forwarded body does not have —
+/// and the client is served the body cut to that length.
+#[tokio::test]
+async fn the_plaintext_path_drops_a_length_that_the_encoding_overrode() {
+    let port = backend_answering(
+        "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ncontent-length: 3\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+    )
+    .await;
+    let backend = format!("http://127.0.0.1:{port}");
+    let config = route_table(vec![backend], 1);
+    let clients =
+        BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+    let response = proxy_request(&clients, get_request("retry.test"), config)
+        .await
+        .expect("the backend answers");
+
+    assert!(
+        response.headers().get("content-length").is_none(),
+        "the stale length was forwarded: {:?}",
+        response.headers()
+    );
+    assert!(
+        response.headers().get("transfer-encoding").is_none(),
+        "the hop header was forwarded: {:?}",
+        response.headers()
+    );
+
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("the body")
+        .to_bytes();
+    assert_eq!(body.as_ref(), b"hello", "the body was cut");
+}
+
+/// A backend that sends a length and nothing else keeps it.
+///
+/// The rule above is about a message that was framed by an encoding. A
+/// message framed by its length is forwarded with that length.
+#[tokio::test]
+async fn the_plaintext_path_keeps_a_length_that_framed_the_body() {
+    let port = backend_answering("HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello").await;
+    let backend = format!("http://127.0.0.1:{port}");
+    let config = route_table(vec![backend], 1);
+    let clients =
+        BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+    let response = proxy_request(&clients, get_request("retry.test"), config)
+        .await
+        .expect("the backend answers");
+
+    assert_eq!(
+        response
+            .headers()
+            .get("content-length")
+            .map(|value| value.to_str().unwrap()),
+        Some("5"),
+        "the length was dropped"
+    );
+}
