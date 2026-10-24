@@ -2,6 +2,7 @@ use crate::config::BackendProtocol;
 use crate::http::BackendClients;
 use crate::lb::BackendPool;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,9 +78,10 @@ pub struct HealthChecker {
     /// switched while the process runs: a probe already spawned outlives the
     /// reload that would otherwise have to cancel it, so it is paused instead.
     enabled: Arc<AtomicBool>,
-    /// Consecutive failed probes per backend, kept here because a `BackendPool`
-    /// only stores the outcome. A backend leaves the pool once this reaches
-    /// `failure_threshold` and returns on the first probe that succeeds.
+    /// Consecutive failed rounds per backend, kept here because a
+    /// `BackendPool` only stores the outcome. A backend leaves the pool once
+    /// this reaches `failure_threshold` and returns on the first probe that
+    /// succeeds.
     failures: Mutex<HashMap<String, usize>>,
 }
 
@@ -157,9 +159,25 @@ impl HealthChecker {
             .into_iter()
             .collect();
 
+        // The backends this round has already charged a failure for.
+        //
+        // A pool is allowed to name the same backend twice, so a round probes
+        // it twice — and the threshold counts rounds, not probes. Charging
+        // every probe made one round worth two failures, which turned a
+        // threshold of three into a threshold of two for a backend that
+        // happens to be listed twice. The set is what says a round has
+        // already spoken for a backend: a run of failures inside one round
+        // counts once, and the failures after it are the same failure seen
+        // again.
+        //
+        // It belongs to the round and not to the checker: the next round is
+        // another round, and a backend that fails in it has to be charged for
+        // it as well.
+        let mut charged: HashSet<String> = HashSet::new();
+
         for url in backends {
             let is_healthy = self.check_backend(&url).await;
-            let failures = self.record_result(&url, is_healthy);
+            let failures = self.record_result(&url, is_healthy, &mut charged);
             let current_healthy = statuses.get(&url).copied();
 
             if is_healthy {
@@ -198,7 +216,23 @@ impl HealthChecker {
     /// Counts consecutive failures for one backend and returns the new count.
     /// A success resets it, so a backend that flaps once is not punished for a
     /// failure that happened an hour ago.
-    fn record_result(&self, url: &str, healthy: bool) -> usize {
+    ///
+    /// The count is the number of **rounds** a backend has failed in, so a
+    /// round charges a backend for one failure however many probes of it the
+    /// round made. `charged` is the round's set of the backends it has
+    /// charged already: a backend in it has had its one failure for this
+    /// round, and the count is reported as it stands rather than counted
+    /// again.
+    ///
+    /// A success clears the count **and** the charge, and that is what keeps
+    /// the last probe of a round the one that counts. A backend that
+    /// recovers and fails again inside one round has to end that round
+    /// marked unhealthy, and a backend the pool names three times has two
+    /// runs of failures in it — the one before the recovery and the one
+    /// after it. The recovery is what tells them apart: it clears the charge
+    /// as well as the count, so the failure after it is a new failure and not
+    /// the one the round had already spent.
+    fn record_result(&self, url: &str, healthy: bool, charged: &mut HashSet<String>) -> usize {
         let mut failures = self
             .failures
             .lock()
@@ -206,12 +240,26 @@ impl HealthChecker {
 
         if healthy {
             failures.remove(url);
-            0
-        } else {
-            let count = failures.get(url).copied().unwrap_or(0) + 1;
-            failures.insert(url.to_string(), count);
-            count
+            // The charge goes as well as the count: the backend answered, and
+            // the next failure of it in this round is a new failure rather
+            // than the one the round has already spent. That is what keeps
+            // the last probe of a round the one that counts — a backend named
+            // three times has two runs of failures in one round, and the
+            // recovery between them is what tells the runs apart.
+            charged.remove(url);
+            return 0;
         }
+
+        // Already charged in this round: the count is the one this round
+        // arrived at, and charging it again would make a round worth as many
+        // failures as the pool has names for the backend.
+        if !charged.insert(url.to_string()) {
+            return failures.get(url).copied().unwrap_or(0);
+        }
+
+        let count = failures.get(url).copied().unwrap_or(0) + 1;
+        failures.insert(url.to_string(), count);
+        count
     }
 
     async fn check_backend(&self, url: &str) -> bool {
@@ -613,13 +661,16 @@ mod tests {
         );
     }
 
-    /// A backend that answers the first request and fails the second, so that
-    /// a round which probes it twice sees it change state under its own feet.
+    /// A backend that answers with the given statuses, one per request, and
+    /// keeps answering with the last of them afterwards.
     ///
-    /// The answers are counted, not timed: the first request is answered with
-    /// a 200 and every one after it with a 500, so which probe sees which
-    /// answer does not depend on how fast the machine is.
-    async fn flapping_backend() -> (String, tokio::task::JoinHandle<()>) {
+    /// The answers are counted, not timed: which probe sees which answer does
+    /// not depend on how fast the machine is. Every request is answered on a
+    /// connection of its own, and the connection is closed afterwards, so one
+    /// request is one answer and no probe can be given two of them.
+    async fn backend_answering(
+        statuses: &'static [&'static str],
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("binding a local port needs no network");
@@ -632,12 +683,11 @@ mod tests {
                     Ok(pair) => pair,
                     Err(_) => break,
                 };
+                let status = statuses
+                    .get(answered as usize)
+                    .copied()
+                    .unwrap_or(statuses[statuses.len() - 1]);
                 answered += 1;
-                let status = if answered == 1 {
-                    "200 OK"
-                } else {
-                    "500 Internal Server Error"
-                };
 
                 // The request is read before the answer is written: a client
                 // that is still writing when the answer arrives would see a
@@ -651,6 +701,12 @@ mod tests {
         });
 
         (url, server)
+    }
+
+    /// A backend that answers the first request and fails the second, so that
+    /// a round which probes it twice sees it change state under its own feet.
+    async fn flapping_backend() -> (String, tokio::task::JoinHandle<()>) {
+        backend_answering(&["200 OK", "500 Internal Server Error"]).await
     }
 
     /// A pool is allowed to name the same backend twice, so one round probes
@@ -710,6 +766,78 @@ mod tests {
             pool.backend_failures(&backend).await,
             Some(1),
             "one backend is marked unhealthy once per round, not once per probe of it"
+        );
+    }
+
+    /// A backend the pool names twice is still one backend, so a round that
+    /// finds it down is worth one failure and not two.
+    ///
+    /// The threshold counts rounds, not probes: a backend listed twice in a
+    /// route's backend list is probed twice in every round, and charging it
+    /// for both made a threshold of three empty the pool after two rounds
+    /// instead of three.
+    #[tokio::test]
+    async fn a_backend_named_twice_is_charged_one_failure_per_round() {
+        let backend = DEAD_BACKEND.to_string();
+        let pool = Arc::new(BackendPool::new(
+            vec![backend.clone(), backend.clone()],
+            LoadBalancingStrategy::RoundRobin,
+        ));
+        let checker = checker(pool.clone(), 3, Arc::new(AtomicBool::new(true)));
+
+        checker.check_all_backends().await;
+        assert!(
+            healthy(&pool, &backend).await,
+            "one round of two failed probes is one failure, not two"
+        );
+
+        checker.check_all_backends().await;
+        assert!(
+            healthy(&pool, &backend).await,
+            "two rounds of two failed probes are two failures, still below the threshold"
+        );
+
+        checker.check_all_backends().await;
+        assert!(
+            !healthy(&pool, &backend).await,
+            "three rounds of failed probes reached the threshold"
+        );
+    }
+
+    /// A backend the pool names three times is probed three times, and the
+    /// round is settled by its last probe.
+    ///
+    /// The three probes answer fail, success, fail — two runs of failures
+    /// with a recovery in between them. Each run is one failure, so the
+    /// round ends with one failure counted and the backend marked unhealthy:
+    /// a backend that recovers and fails again inside one round has to end
+    /// that round marked unhealthy, because the last probe is the one that
+    /// counts.
+    ///
+    /// The recovery is what tells the two runs apart, so it has to clear the
+    /// round's charge of the first failure as well as the count it left
+    /// behind. If it only cleared the count, the last failure would be taken
+    /// for the one the round had already spent and the backend would end the
+    /// round marked healthy.
+    #[tokio::test]
+    async fn a_backend_named_three_times_is_settled_by_its_last_probe() {
+        let (backend, _server) = backend_answering(&[
+            "500 Internal Server Error",
+            "200 OK",
+            "500 Internal Server Error",
+        ])
+        .await;
+        let pool = Arc::new(BackendPool::new(
+            vec![backend.clone(), backend.clone(), backend.clone()],
+            LoadBalancingStrategy::RoundRobin,
+        ));
+
+        let checker = checker(pool.clone(), 1, Arc::new(AtomicBool::new(true)));
+        checker.check_all_backends().await;
+
+        assert!(
+            !healthy(&pool, &backend).await,
+            "the last probe failed, so the backend ends the round marked unhealthy"
         );
     }
 
