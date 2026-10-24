@@ -84,9 +84,21 @@ pub(super) fn forwards_response_header(name: &str, connection: &ConnectionNamed)
 /// is a header whose presence depends on the path the request took.
 pub(super) fn forwarded_response_headers(headers: &::http::HeaderMap) -> ::http::HeaderMap {
     let connection = ConnectionNamed::of(headers);
+    // A message that arrives with both a `Transfer-Encoding` and a
+    // `Content-Length` has its length overridden by the encoding, and the
+    // sender has to remove the received `Content-Length` before forwarding it
+    // (RFC 9112 §6.1, rule 3). The `Transfer-Encoding` is dropped below as a
+    // hop-by-hop header, so the length goes with it: what the client is told
+    // has to describe the body that is actually sent. Left in place, it
+    // describes the length the backend claimed for a body that was framed
+    // another way, and the client is served a body cut to that length.
+    let framed_by_encoding = headers.contains_key(::http::header::TRANSFER_ENCODING);
     let mut forwarded = ::http::HeaderMap::new();
     for (name, value) in headers.iter() {
         if !forwards_response_header(name.as_str(), &connection) {
+            continue;
+        }
+        if framed_by_encoding && name == ::http::header::CONTENT_LENGTH {
             continue;
         }
         forwarded.append(name.clone(), value.clone());
