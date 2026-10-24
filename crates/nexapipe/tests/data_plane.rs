@@ -2777,3 +2777,65 @@ async fn a_connection_that_named_nothing_is_served_the_way_it_always_was() {
     );
     assert_eq!(reply_body(&reply), "hello from the backend");
 }
+
+// ---------------------------------------------------------------------------
+// PROBE (scratch worktree only): a backend that sends both a length and a
+// chunked body must not get to truncate the answer.
+// ---------------------------------------------------------------------------
+
+/// A backend that sends both `Transfer-Encoding` and `Content-Length` does not
+/// get to decide how much of the answer the client sees.
+///
+/// RFC 9112 §6.1 rule 3: a message received with both headers has the length
+/// overridden by the encoding, and a sender MUST remove the received
+/// `Content-Length` before forwarding it. The proxy drops the
+/// `Transfer-Encoding` as a hop-by-hop header and used to keep the
+/// `Content-Length`, which then described a framing the forwarded body did not
+/// have — and the client was served the body cut to that length.
+#[tokio::test]
+async fn a_backend_that_sends_both_a_length_and_a_chunked_body_is_not_truncated() {
+    let backend = spawn_backend_answering(
+        "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ncontent-length: 3\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+    )
+    .await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tunnel
+        .exchange(b"GET /x HTTP/1.1\r\nHost: app.test\r\n\r\n")
+        .await;
+    let text = String::from_utf8_lossy(&reply).to_string();
+
+    assert!(
+        !text.to_lowercase().contains("content-length"),
+        "the stale length was forwarded: {text}"
+    );
+    assert!(
+        reply_body(&reply).contains("hello"),
+        "the answer was cut to the backend's stale content-length: {text}"
+    );
+}
+
+/// A backend that sends a length and nothing else keeps its length.
+///
+/// The rule above is about a message that was framed by an encoding. A
+/// message that was framed by its length is forwarded with that length, and
+/// the client reads exactly what the backend said it would.
+#[tokio::test]
+async fn a_backend_that_sends_only_a_length_keeps_it() {
+    let backend =
+        spawn_backend_answering("HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello").await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tunnel
+        .exchange(b"GET /x HTTP/1.1\r\nHost: app.test\r\n\r\n")
+        .await;
+    let text = String::from_utf8_lossy(&reply).to_string();
+
+    assert!(
+        text.to_lowercase().contains("content-length: 5"),
+        "the length was dropped: {text}"
+    );
+    assert_eq!(reply_body(&reply), "hello", "the body was changed: {text}");
+}
