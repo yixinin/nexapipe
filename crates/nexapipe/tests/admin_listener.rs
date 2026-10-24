@@ -396,7 +396,7 @@ async fn routes_are_listed_with_their_modes_and_backends() {
 /// surface that leaks those turns a read-only endpoint into a credential store.
 #[tokio::test]
 async fn clients_are_listed_without_their_secrets() {
-    let secret = "JBSWY3DPEHPK3PXP";
+    let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
     let admin = spawn_admin_with_clients(
         Vec::new(),
         false,
@@ -446,7 +446,7 @@ async fn the_port_acl_is_listed_with_the_clients() {
     let path = dir.path().join("config.toml");
     std::fs::write(
         &path,
-        "[auth]\nenabled = true\n\n[auth.clients.alice]\nsecret = \"JBSWY3DPEHPK3PXP\"\n\
+        "[auth]\nenabled = true\n\n[auth.clients.alice]\nsecret = \"JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\"\n\
          created_at = \"2026-09-29T00:00:00Z\"\nallow_ports = [443, 8443]\n\
          allow_ports_strict = true\n",
     )
@@ -615,4 +615,93 @@ fn a_non_loopback_address_is_refused() {
 
     let refusal = admin::non_loopback_refusal(addr);
     assert!(refusal.contains("192.168.1.10:9090"), "{refusal}");
+}
+
+/// The status command does not send the admin token to an address the
+/// server itself would refuse to bind.
+///
+/// `nexapipe status` asks a running instance what it is doing, and it does
+/// so with the admin token in the `Authorization` header of every request.
+/// The server refuses to bind this listener off loopback, so a config naming
+/// a remote address describes an instance that could never have started — and
+/// a status run that reached it anyway would hand that address the routes,
+/// the client list, the peer identities and the backend inventory.
+///
+/// The refusal has to come *before* the token is read and before a socket is
+/// opened, so the test watches the socket: a stand-in for the instance is
+/// bound on the wildcard address, and the address under test is that
+/// stand-in's own, so a request that *was* made would arrive here and be
+/// seen — with the token in it.
+#[tokio::test]
+async fn the_status_command_refuses_a_non_loopback_address_without_calling_it() {
+    let listener = TcpListener::bind("0.0.0.0:0")
+        .await
+        .expect("bind a stand-in on the wildcard address");
+    let addr = listener.local_addr().expect("the stand-in address");
+
+    // The stand-in answers what it is asked and counts what arrived, so a
+    // status run that reached it finishes instead of waiting for a response
+    // that never comes.
+    let (arrived, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+    let stand_in = tokio::spawn(async move {
+        loop {
+            // A deadline rather than a bare accept: the stand-in has to end
+            // even when nothing ever asks it anything.
+            let accepted =
+                tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await;
+            let Ok(Ok((mut stream, _))) = accepted else {
+                break;
+            };
+            let _ = arrived.send(());
+            let mut request = vec![0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                )
+                .await;
+            let _ = stream.flush().await;
+        }
+    });
+
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, format!("[admin]\nlisten_addr = \"{addr}\"\n"))
+        .expect("write the config");
+
+    // The token has to be there, and readable only by this account: the
+    // refusal has to be about the address, not about a missing credential.
+    let config_str = config_path.to_str().expect("a path");
+    let token_path = admin::token::token_file_path(config_str);
+    std::fs::write(&token_path, "a token nobody has to see\n").expect("write the token");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))
+            .expect("make the token private");
+    }
+
+    let refusal = match nexapipe::status::status(config_str, false).await {
+        Ok(()) => panic!(
+            "the status command answered a non-loopback address instead of refusing it, so the \
+             admin token was sent to {addr}"
+        ),
+        Err(reason) => reason.to_string(),
+    };
+    assert!(
+        refusal.contains(&addr.to_string()),
+        "the refusal names the address: {refusal}"
+    );
+    assert!(
+        refusal.contains("loopback"),
+        "the refusal says what to do instead: {refusal}"
+    );
+
+    // And nothing was sent: the address was refused before a socket was
+    // opened, so the token never left the machine.
+    stand_in.await.expect("the stand-in finished");
+    assert!(
+        arrivals.try_recv().is_err(),
+        "the status command opened a connection to {addr} and sent the token there"
+    );
 }

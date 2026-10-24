@@ -13,7 +13,7 @@
 //! can be found is the file the server wrote. This command never creates one:
 //! a `status` run is not a start, and a token minted by it would be a token the
 //! server does not know about.
-use crate::admin::token;
+use crate::admin::{self, token};
 use crate::config::ProxyConfig;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -57,6 +57,19 @@ pub async fn status(config_path: &str, json: bool) -> anyhow::Result<()> {
     let bound: SocketAddr = listen_addr
         .parse()
         .map_err(|_| anyhow::anyhow!("[admin] listen_addr is not an address: {listen_addr}"))?;
+
+    // The server refuses to bind this listener off loopback, so a config that
+    // names a remote address describes an instance that could never have
+    // started. The same rule applies here, and it applies *before* the token
+    // is read: the token is the only credential the management surface has,
+    // and every one of the five requests below carries it in the clear, so
+    // asking a remote address for the status of this instance hands that
+    // address the routes, the client list, the peer identities and the
+    // backend inventory of the server.
+    if !admin::may_bind_admin(bound) {
+        anyhow::bail!(admin::non_loopback_refusal(bound));
+    }
+
     let base = format!("http://{bound}");
 
     let token = token::load_existing(config_path).ok_or_else(|| {
