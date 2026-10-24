@@ -1698,3 +1698,110 @@ async fn a_client_that_refuses_gzip_is_answered_without_it() {
         .to_bytes();
     assert_eq!(body.as_ref(), b"hello", "the body was changed");
 }
+
+/// The same route table, with a body deadline a test can wait out.
+fn route_table_with_body_deadline(
+    backends: Vec<String>,
+    attempts: u32,
+    body: std::time::Duration,
+) -> Arc<crate::routes::RoutingTable> {
+    let deadlines = crate::deadline::Deadlines {
+        body,
+        ..crate::deadline::Deadlines::default()
+    };
+    let timeouts = crate::config::Timeouts {
+        connect: std::time::Duration::from_secs(1),
+        response: std::time::Duration::from_secs(1),
+        deadlines,
+    };
+    let route = crate::routes::Route::new(
+        "retry.test",
+        "/",
+        true,
+        backends,
+        crate::lb::LoadBalancingStrategy::RoundRobin,
+        crate::config::RouteMode::Http,
+        None,
+    );
+    Arc::new(crate::routes::RoutingTable::with_settings(
+        vec![route],
+        timeouts,
+        crate::config::Retry {
+            attempts,
+            backoff: std::time::Duration::ZERO,
+        },
+    ))
+}
+
+/// A body over the limit is refused with 413, not with a 502.
+///
+/// The request never reached a backend, so there is no backend to blame: a
+/// 502 says the far end is down, and a client that reads it that way may
+/// send the same body again. The tunnel path answers the same failure with
+/// 413, and the two paths are the same proxy.
+#[tokio::test]
+async fn a_body_over_the_limit_is_refused_with_413() {
+    let port = hello_backend().await;
+    let backend = format!("http://127.0.0.1:{port}");
+    let config = route_table(vec![backend], 1);
+    let clients =
+        BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("http://retry.test/")
+        .header("host", "retry.test")
+        .body(Full::new(bytes::Bytes::from(vec![
+            0u8;
+            super::body::MAX_REQUEST_BODY
+                + 1
+        ])))
+        .expect("a request");
+
+    let response = proxy_request(&clients, request, config)
+        .await
+        .expect("the request is answered");
+
+    assert_eq!(
+        response.status(),
+        413,
+        "a body over the limit was not refused as too large"
+    );
+}
+
+/// A body that does not arrive in time is refused with 408, not with a 502.
+///
+/// The same request, the same reasoning: the backend was never asked, so it
+/// is not the one that failed.
+#[tokio::test]
+async fn a_body_that_does_not_arrive_in_time_is_refused_with_408() {
+    let port = hello_backend().await;
+    let backend = format!("http://127.0.0.1:{port}");
+    let config =
+        route_table_with_body_deadline(vec![backend], 1, std::time::Duration::from_millis(50));
+    let clients =
+        BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+    // A body that never yields and never ends: the read waits for it until
+    // the deadline is over.
+    let body = http_body_util::StreamBody::new(futures_util::stream::pending::<
+        Result<hyper::body::Frame<bytes::Bytes>, std::convert::Infallible>,
+    >());
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("http://retry.test/")
+        .header("host", "retry.test")
+        .body(body)
+        .expect("a request");
+
+    let response = proxy_request(&clients, request, config)
+        .await
+        .expect("the request is answered");
+
+    assert_eq!(
+        response.status(),
+        408,
+        "a body that did not arrive was not refused as a timeout"
+    );
+}

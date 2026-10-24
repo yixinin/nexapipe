@@ -97,12 +97,41 @@ where
     // Held for as long as the buffered body is alive — see `read_body_limited`.
     // Dropping it here rather than at the end of the function is deliberate and
     // is what makes the budget mean what it says.
-    let (body, _body_reservation) = read_body_limited(
+    let (body, _body_reservation) = match read_body_limited(
         req.into_body(),
         MAX_REQUEST_BODY,
         config.timeouts().deadlines.body,
     )
-    .await?;
+    .await
+    {
+        Ok(read) => read,
+        // **Answered, not raised.** The request never went anywhere: there is
+        // no backend to blame and no answer to give but the refusal. The
+        // caller maps an `Err` from here to a 502, and a 502 blames the
+        // *backend* — so a client that sent too much was told the far end was
+        // down, and a client that cannot read that as "shrink the upload" may
+        // send it again.
+        //
+        // The statuses are the ones the tunnel path answers the same three
+        // failures with (`http::server::body`): a body over the limit is 413,
+        // one that did not arrive in time is 408, one that could not be read
+        // is 400. The client is told the same thing on either path.
+        Err(failure) => {
+            let (status, message) = match &failure {
+                crate::http::body::BodyReadError::TooLarge { .. } => {
+                    (StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large")
+                }
+                crate::http::body::BodyReadError::TimedOut { .. } => {
+                    (StatusCode::REQUEST_TIMEOUT, "408 Request Timeout")
+                }
+                crate::http::body::BodyReadError::Failed(_) => {
+                    (StatusCode::BAD_REQUEST, "400 Bad Request")
+                }
+            };
+            tracing::warn!("Could not read the request body: {failure}");
+            return Ok(create_error_response(status, message));
+        }
+    };
 
     let attempts = config.retry().attempts;
     let backoff = config.retry().backoff;
