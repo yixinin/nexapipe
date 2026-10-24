@@ -13,11 +13,11 @@
  * configuration without notifying anything, so the page keeps rendering the
  * list it had. An import that worked and was not shown was exactly that.
  *
- * The desktop frontend has no test runner: the CI job for it runs `vue-tsc`,
- * `vite build` and the two lint scripts, and nothing else. This file is
- * therefore a plain Node test, run through Vite's own SSR build — the only
- * bundler the tree has, and the one that already resolves this tree's
- * extensionless imports:
+ * The desktop frontend has no test runner, so this file is a plain Node
+ * test, run through Vite's own SSR build — the only bundler the tree has,
+ * and the one that already resolves this tree's extensionless imports. The
+ * desktop CI job runs it (`npm run test:stores`), which builds each of the
+ * store's test files and runs it:
  *
  *   cd ui-desktop
  *   npx vite build --ssr src/stores/config.invite.test.mjs --outDir dist-ssr
@@ -61,6 +61,13 @@ globalThis.window = {
   __TAURI_INTERNALS__: {
     invoke: async (cmd, args) => {
       calls.push({ cmd, args });
+      // The answer comes on a macrotask, not in the microtask a promise that
+      // is already resolved would resume in. An `await invoke(...)` has to
+      // yield to the event loop for the store's own work to be observable:
+      // with an immediate answer every command ran inside one microtask
+      // drain, and nothing else could happen in between — not the debounced
+      // save, and not a change made while the store was still working.
+      await new Promise((resolve) => setTimeout(resolve, 0));
       const answer = answers.get(cmd);
       if (typeof answer === 'function') return await answer(args);
       return answer === undefined ? null : answer;
@@ -225,6 +232,57 @@ test('the imported node shows the credentials the invite brought', async () => {
   );
 });
 
+test('a change made while the invite is being imported does not take the credential out', async () => {
+  const store = freshStore();
+  existingNode(store, 'node-old', 'endpoint-old');
+
+  // Its own node id: the store is a singleton and the mirror of an earlier
+  // test is still finishing its work, so the ids of the other tests are not
+  // this test's business.
+  answers.set('accept_invite', {
+    ...acceptedInvite('node-imported'),
+    enrollment: { clientId: 'client-1' },
+    publicKey: 'bb'.repeat(32),
+  });
+  answers.set(
+    'take_invited_node_credentials',
+    storedCredentials({ endpoint: 'endpoint-imported', enrollment: 'token-imported' }),
+  );
+
+  const importing = store.applyInvite('nexapipe://invite');
+
+  // The import is in flight: the backend has not answered the invite yet.
+  // The change below lands between two of the import's awaits — the window
+  // in which a node that is in the configuration without a connection string
+  // looks exactly like a node whose credential was cleared, and a save
+  // started there would take the credential the invite had just filed out
+  // of the store. The store reads its credentials back *before* the node is
+  // in the configuration for exactly that reason.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(
+    store.config.nodes.some((candidate) => candidate.id === 'node-imported'),
+    false,
+    'the import is still in flight: the change did not land between two of its awaits',
+  );
+  store.config.nodes[0].endpointId = 'endpoint-edited';
+
+  await importing;
+
+  // The save the change scheduled runs a moment after the import.
+  await new Promise((resolve) => setTimeout(resolve, 700));
+
+  const deleted = calls
+    .filter((call) => call.cmd === 'delete_credential')
+    .filter((call) => call.args?.nodeId === 'node-imported')
+    .map((call) => call.args?.kind);
+
+  assert.deepEqual(
+    deleted.filter((kind) => kind === 'enrollment' || kind === 'endpoint' || kind === 'devicekey'),
+    [],
+    'the credential the invite filed is still in the store',
+  );
+});
+
 test('the credential the invite filed stays in the store', async () => {
   const store = freshStore();
   existingNode(store, 'node-old', 'endpoint-old');
@@ -262,5 +320,30 @@ test('the credential the invite filed stays in the store', async () => {
     deleted.filter((kind) => kind === 'enrollment' || kind === 'endpoint' || kind === 'devicekey'),
     [],
     'the credentials the invite filed are still in the store',
+  );
+
+  // And they are in the store because the mirror wrote them. "Nothing was
+  // deleted" is not enough on its own: a mirror that deleted nothing and
+  // wrote nothing either would leave the node with no credential at all, and
+  // the assertion above would not have noticed.
+  const written = calls
+    .filter((call) => call.cmd === 'put_credential')
+    .filter((call) => call.args?.nodeId === 'node-new')
+    .map((call) => ({ kind: call.args?.kind, value: call.args?.value }));
+
+  assert.ok(
+    written.some((entry) => entry.kind === 'enrollment' && entry.value === 'token-1'),
+    'the enrollment token the invite filed is in the store',
+  );
+  assert.ok(
+    written.some((entry) => entry.kind === 'endpoint' && entry.value === 'endpoint-new'),
+    'the connection string the invite filed is in the store',
+  );
+  // The device key is the backend's: the renderer writes it back never and
+  // takes it out never, so what is in the store is the one the invite filed.
+  assert.deepEqual(
+    written.filter((entry) => entry.kind === 'devicekey'),
+    [],
+    'the device key is the backend\'s: the renderer does not write it',
   );
 });

@@ -606,6 +606,15 @@ jobs:
         if: ${{ !cancelled() }}
         run: npm run lint:tokens
 
+      # The store tests: plain Node tests, run through Vite's SSR build
+      # because the tree has no test runner and the store's imports are
+      # extensionless. Nothing else ran them, so they read as coverage and
+      # enforced nothing: a regression in the credential mirror shipped green.
+      # A test that nothing runs is not a test.
+      - name: store tests
+        if: ${{ !cancelled() }}
+        run: npm run test:stores
+
   # The desktop crate on the two runners that are not Linux. Catch
   # cross-platform compile breakage early: development happens on one
   # machine, so anything inside #[cfg(target_os = "linux"/"macos"/"windows")]

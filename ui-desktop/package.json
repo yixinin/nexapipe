@@ -14,7 +14,8 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "lint:i18n": "node scripts/lint-i18n.mjs",
-    "lint:tokens": "node scripts/lint-tokens.mjs"
+    "lint:tokens": "node scripts/lint-tokens.mjs",
+    "test:stores": "node --input-type=module -e \"import { execFileSync } from 'node:child_process'; import { readdirSync } from 'node:fs'; const files = readdirSync('src/stores').filter((f) => f.endsWith('.test.mjs')).sort(); for (const file of files) { execFileSync(process.execPath, ['node_modules/vite/bin/vite.js', 'build', '--ssr', 'src/stores/' + file, '--outDir', 'dist-ssr', '--logLevel', 'error'], { stdio: 'inherit' }); execFileSync(process.execPath, ['dist-ssr/' + file.slice(0, -'.test.mjs'.length) + '.test.js'], { stdio: 'inherit' }); }\""
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",
