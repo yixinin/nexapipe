@@ -50,6 +50,16 @@ const calls = [];
 const payloads = new Map();
 
 /**
+ * Every write the store made, in order.
+ *
+ * The seed below goes into the map directly, so it is not in here. That is the
+ * difference between "the payload holds no token" and "the payload holds no
+ * token because nothing was written at all": a test that reads the seed proves
+ * nothing about what the store does.
+ */
+const writes = [];
+
+/**
  * The browser globals the store expects.
  *
  * `localStorage` holds the configuration payload, and `window.__TAURI_INTERNALS__`
@@ -60,6 +70,7 @@ const payloads = new Map();
 globalThis.localStorage = {
   getItem: (key) => payloads.get(key) ?? null,
   setItem: (key, value) => {
+    writes.push({ key, value });
     payloads.set(key, value);
   },
   removeItem: (key) => {
@@ -199,11 +210,39 @@ test('the enrollment token the backend filed reaches the node the proxy is given
 });
 
 test('the persisted payload holds no token', async () => {
+  const store = freshStore();
+
+  // Let the save the test before this one scheduled land, and forget it:
+  // what is asserted below has to be a write *this* test caused.
+  await new Promise((resolve) => setTimeout(resolve, 700));
+  writes.length = 0;
+
+  // A node that holds a token in memory. The payload is the *shape* of the
+  // configuration: the token itself belongs in the credential store, and a
+  // payload that carried it would be a copy of it in the clear.
+  store.config.nodes.push({
+    id: 'node-token',
+    connectionType: 'endpoint_id',
+    ticket: '',
+    endpointId: '',
+    domains: [],
+    enrollment: { clientId: 'client-token', token: 'token-secret', device: 'device-1' },
+  });
+
   // The save is debounced, so the mirror that writes the payload runs a
   // moment after the configuration changed.
   await new Promise((resolve) => setTimeout(resolve, 700));
 
-  const payload = JSON.parse(payloads.get('nexapipe.config') ?? '{}');
+  assert.ok(writes.length > 0, 'the store wrote a payload');
+
+  // The payload the store wrote, not the one this file seeded: a seed is
+  // read back as "no token" whatever the store does.
+  const payload = JSON.parse(writes[writes.length - 1].value);
+  assert.ok(
+    payload.nodes?.some((node) => node.id === 'node-token'),
+    'the node is in the payload the store wrote',
+  );
+
   for (const node of payload.nodes ?? []) {
     assert.equal(
       node.enrollment?.token ?? '',

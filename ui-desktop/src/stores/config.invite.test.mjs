@@ -263,4 +263,29 @@ test('the credential the invite filed stays in the store', async () => {
     [],
     'the credentials the invite filed are still in the store',
   );
+
+  // And they are in the store because the mirror wrote them. "Nothing was
+  // deleted" is not enough on its own: a mirror that deleted nothing and
+  // wrote nothing either would leave the node with no credential at all, and
+  // the assertion above would not have noticed.
+  const written = calls
+    .filter((call) => call.cmd === 'put_credential')
+    .filter((call) => call.args?.nodeId === 'node-new')
+    .map((call) => ({ kind: call.args?.kind, value: call.args?.value }));
+
+  assert.ok(
+    written.some((entry) => entry.kind === 'enrollment' && entry.value === 'token-1'),
+    'the enrollment token the invite filed is in the store',
+  );
+  assert.ok(
+    written.some((entry) => entry.kind === 'endpoint' && entry.value === 'endpoint-new'),
+    'the connection string the invite filed is in the store',
+  );
+  // The device key is the backend's: the renderer writes it back never and
+  // takes it out never, so what is in the store is the one the invite filed.
+  assert.deepEqual(
+    written.filter((entry) => entry.kind === 'devicekey'),
+    [],
+    'the device key is the backend\'s: the renderer does not write it',
+  );
 });
