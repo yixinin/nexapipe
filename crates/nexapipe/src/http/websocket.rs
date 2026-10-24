@@ -305,12 +305,23 @@ pub async fn handshake(
     // only place that speaks HTTP/1 to a backend by hand: the framing the
     // backend used has to be followed here, and what comes out of it is the
     // body the client gets.
+    //
+    // The budget is the **response** one. What is read here is the backend's
+    // answer, and the answer's budget is the budget of the direction it
+    // travels in — the same one every other place that reads a backend's
+    // response body uses. The request body budget belongs to the other
+    // direction: it says how long a *client* may take to send an upload, and
+    // it says nothing about how long a backend may take to explain a refusal.
+    // An operator who lowered it because their clients upload small bodies
+    // would otherwise find the refusal cut short, and one who left it at the
+    // default would find a stalled refusal hold the client's handshake for
+    // five minutes.
     let refusal = read_refusal_body(
         status,
         &mut backend_stream,
         &headers,
         trailing,
-        timeouts.deadlines.body,
+        timeouts.deadlines.response_idle,
     )
     .await;
     if refusal.truncated {
