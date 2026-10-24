@@ -28,7 +28,7 @@ use hyper::{Request, Response, StatusCode};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::conn::{find_headers_end, now_millis};
-use crate::http::body::{ProxyBody, ProxyFailure, Retryability};
+use crate::http::body::{ConnectionNamed, ProxyBody, ProxyFailure, Retryability};
 use crate::http::client::{BackendClients, BackendStream};
 use crate::routes::BackendInfo;
 
@@ -528,6 +528,10 @@ fn build_upgrade_request(
 
     let request_line = format!("{} {} HTTP/1.1\r\n", request.method(), path);
 
+    // The names the request's own `Connection` header gives are hop-by-hop for
+    // this message (RFC 9110 §7.6.1), so they do not go on to the backend.
+    let connection = ConnectionNamed::of(request.headers());
+
     let original_host = request
         .headers()
         .get("host")
@@ -545,7 +549,7 @@ fn build_upgrade_request(
         if name.as_str().eq_ignore_ascii_case("host") {
             continue;
         }
-        if !forwards_upgrade_header(name.as_str()) {
+        if !forwards_upgrade_header(name.as_str(), &connection) {
             continue;
         }
         request_buf.extend_from_slice(name.as_str().as_bytes());
@@ -558,11 +562,18 @@ fn build_upgrade_request(
     request_buf
 }
 
-/// Whether a header may be forwarded in an upgrade request.
+/// Whether a header of the upgrade request may be forwarded to the backend.
 ///
-/// The same rule as the HTTP path's, and for the same reason: a hop-by-hop
-/// header describes one connection, not the message.
-fn forwards_upgrade_header(name: &str) -> bool {
+/// The hop-by-hop headers describe one connection, not the message, and the
+/// names the request's own `Connection` header gives are hop-by-hop for this
+/// message too (RFC 9110 §7.6.1) — the ordinary request path drops those
+/// already, and a header that one path drops and the other forwards is a
+/// header whose presence depends on the path the request took.
+///
+/// `Connection` and `Upgrade` are the two that stay: the upgrade is what the
+/// request is for, and a backend that does not see them does not switch
+/// protocols.
+fn forwards_upgrade_header(name: &str, connection: &ConnectionNamed) -> bool {
     ![
         "proxy-connection",
         "proxy-authenticate",
@@ -575,6 +586,9 @@ fn forwards_upgrade_header(name: &str) -> bool {
     ]
     .iter()
     .any(|hop| name.eq_ignore_ascii_case(hop))
+        && !(connection.names(name)
+            && !name.eq_ignore_ascii_case("upgrade")
+            && !name.eq_ignore_ascii_case("connection"))
 }
 #[cfg(test)]
 mod tests {
@@ -698,6 +712,55 @@ mod tests {
                 "{leaked} reached the backend:\n{sent}"
             );
         }
+    }
+
+    /// A header the client named in its own `Connection` header does not reach
+    /// the backend.
+    ///
+    /// RFC 9110 §7.6.1: the `Connection` header lists the names that are
+    /// hop-by-hop for this message, so `Connection: X-Internal` means
+    /// `X-Internal` is for this hop only. The ordinary request path drops
+    /// those already, and the client's own local proxy drops them too — a
+    /// header that one path drops and another forwards is a header whose
+    /// presence depends on the path the request took.
+    ///
+    /// The upgrade itself is the exception: `Connection: Upgrade` and
+    /// `Upgrade: websocket` are what the request is for, and a backend that
+    /// does not see them does not switch protocols.
+    #[tokio::test]
+    async fn a_websocket_upgrade_does_not_carry_a_header_the_client_nominated() {
+        let config = route_table_with_rewrite("/api", "/v2{}");
+
+        let backend_info = config
+            .get_backend_with_acl("rewrite.test", "/api/socket", None, None)
+            .await
+            .backend()
+            .expect("a route for the host");
+
+        let request = ::http::Request::builder()
+            .method("GET")
+            .uri("http://rewrite.test/api/socket")
+            .header("host", "rewrite.test")
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade, X-Internal-Token")
+            .header("x-internal-token", "secret")
+            .header("x-kept", "yes")
+            .body(())
+            .expect("a request");
+
+        let request_buf = build_upgrade_request(&request, &backend_info, "127.0.0.1");
+        let sent = String::from_utf8_lossy(&request_buf).to_ascii_lowercase();
+
+        assert!(
+            !sent.contains("x-internal-token:"),
+            "the header the client nominated reached the backend:\n{sent}"
+        );
+        assert!(
+            sent.contains("x-kept: yes"),
+            "a header the client did not nominate was dropped:\n{sent}"
+        );
+        assert!(sent.contains("upgrade: websocket"), "{sent}");
+        assert!(sent.contains("connection: upgrade"), "{sent}");
     }
 
     /// A half-closed client still receives the backend's Close frame.
