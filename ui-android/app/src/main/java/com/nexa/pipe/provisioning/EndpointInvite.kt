@@ -2,6 +2,9 @@ package com.nexa.pipe.provisioning
 
 import java.io.ByteArrayOutputStream
 import java.net.URI
+import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
 import java.util.Locale
 
 /**
@@ -112,6 +115,15 @@ sealed interface InviteParseResult {
  * parameters are ignored so newer servers can extend the format, and a repeated
  * parameter keeps its first occurrence.
  *
+ * A parameter's *name* is matched without its case, so a code that carries a
+ * credential under a differently-cased name keeps it: an unmatched name is an
+ * unknown parameter, and unknown parameters are dropped.
+ *
+ * A malformed escape sequence, bytes that are not UTF-8, a parameter with no
+ * name and a code past the hard limit are all refused. The Rust parser
+ * refuses them too, and the two halves have to accept and reject the same
+ * codes — one of them writes what the other reads.
+ *
  * `v=2` is the enrollment form: it carries `enroll=<token>` instead of the
  * `secret=` block, and is a version of its own so that a v=1 reader refuses it
  * rather than importing it as an endpoint with no credentials.
@@ -142,6 +154,15 @@ object EndpointInviteCodec {
     const val MIN_DIGITS = 6
     const val MAX_DIGITS = 8
 
+    /**
+     * The hard limit on an invite code, in bytes.
+     *
+     * The same limit the Rust client's `MAX_URI_LEN` applies: past roughly
+     * this length a code is not one anybody will read, and parsing it is work
+     * an attacker gets for free.
+     */
+    const val MAX_URI_LEN = 4 * 1024
+
     private const val BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
     private val SUPPORTED_ALGORITHMS = listOf("sha1", "sha256", "sha512")
     private val NODE_ID_PATTERN = Regex("[0-9a-fA-F]{64}")
@@ -152,6 +173,14 @@ object EndpointInviteCodec {
     /** Parses a scanned or pasted invite. Never throws. */
     fun parse(raw: String): InviteParseResult {
         val trimmed = raw.trim()
+        // A code past the hard limit is not a code anybody will read, and
+        // parsing it is work an attacker gets for free. The Rust parser
+        // refuses one too, and the two have to agree — so this counts bytes,
+        // not characters.
+        val bytes = trimmed.toByteArray(Charsets.UTF_8).size
+        if (bytes > MAX_URI_LEN) {
+            return failure("The invite code is $bytes bytes, past the $MAX_URI_LEN byte limit")
+        }
         val prefix = "$SCHEME://"
         if (!trimmed.startsWith(prefix, ignoreCase = true)) {
             return failure("Not a $SCHEME:// invite code")
@@ -167,7 +196,7 @@ object EndpointInviteCodec {
         val rawValue = if (slash >= 0) path.substring(slash + 1) else ""
         // One empty segment is tolerated: links typed into a browser-like field
         // often come back as `.../<node-id>/?v=1`.
-        val value = percentDecode(rawValue.trimEnd('/'))
+        val value = percentDecode(rawValue.trimEnd('/')).getOrElse { return failure(it.message.orEmpty()) }
 
         val target = when {
             host.equals(NODE_ID_HOST, ignoreCase = true) -> {
@@ -183,7 +212,7 @@ object EndpointInviteCodec {
             else -> return failure("Unknown invite kind \"$host\"; expected endpoint or ticket")
         }
 
-        val params = parseQuery(query)
+        val params = parseQuery(query).getOrElse { return failure(it.message.orEmpty()) }
         val version = params["v"]?.trim()?.toIntOrNull()
         if (params["v"] != null && version == null) {
             return failure("Invite version \"${params["v"]}\" is not a number")
@@ -373,7 +402,7 @@ object EndpointInviteCodec {
 
         // `otpauth://totp/Issuer:client?...` — the type segment sits in front
         // of the label.
-        val label = percentDecode(path.substringAfterLast('/'))
+        val label = percentDecode(path.substringAfterLast('/')).getOrElse { return Result.failure(it) }
         val (labelIssuer, clientId) = label.indexOf(':').let { colon ->
             if (colon >= 0) {
                 label.substring(0, colon).trim() to label.substring(colon + 1).trim()
@@ -385,7 +414,7 @@ object EndpointInviteCodec {
             return Result.failure(invalid("The embedded otpauth:// URI does not contain a client id"))
         }
 
-        val params = parseQuery(query)
+        val params = parseQuery(query).getOrElse { return Result.failure(it) }
         val secret = params["secret"]
             ?: return Result.failure(invalid("The embedded otpauth:// URI carries no secret"))
         return parseTotp(
@@ -456,20 +485,30 @@ object EndpointInviteCodec {
         return if (parsed > 0) parsed else null
     }
 
-    private fun parseQuery(query: String): Map<String, String> {
-        if (query.isEmpty()) return emptyMap()
+    private fun parseQuery(query: String): Result<Map<String, String>> {
+        if (query.isEmpty()) return Result.success(emptyMap())
         val params = mutableMapOf<String, String>()
         for (part in query.split('&')) {
             if (part.isEmpty()) continue
             val equals = part.indexOf('=')
             val key = percentDecode(if (equals >= 0) part.substring(0, equals) else part)
+                .getOrElse { return Result.failure(it) }
                 .lowercase(Locale.ROOT)
-            if (key.isEmpty()) continue
-            val value = if (equals >= 0) percentDecode(part.substring(equals + 1)) else ""
+            // A parameter with no name is a malformed one, and the Rust parser
+            // refuses the whole code over it. Silently dropping it here is how
+            // the two parsers came to disagree about the same code.
+            if (key.isEmpty()) {
+                return Result.failure(invalid("The invite code has a malformed parameter"))
+            }
+            val value = if (equals >= 0) {
+                percentDecode(part.substring(equals + 1)).getOrElse { return Result.failure(it) }
+            } else {
+                ""
+            }
             // First occurrence wins, as in the Rust parser.
             if (!params.containsKey(key)) params[key] = value
         }
-        return params
+        return Result.success(params)
     }
 
     /** Keeps the unreserved characters plus the list separator readable. */
@@ -484,25 +523,47 @@ object EndpointInviteCodec {
         return out.toString()
     }
 
-    /** The inverse of [percentEncode]; `+` stays literal. */
-    private fun percentDecode(value: String): String {
+    /**
+     * The inverse of [percentEncode]; `+` stays literal.
+     *
+     * A malformed escape and a byte sequence that is not UTF-8 are both
+     * refused, because the Rust parser refuses them and the two halves have to
+     * agree about which codes are codes. Keeping a broken escape as a literal
+     * `%` used to be what this did, and it made a code the desktop app
+     * rejected import here as an endpoint with a name of `%ZZ` in it.
+     */
+    private fun percentDecode(value: String): Result<String> {
         val bytes = ByteArrayOutputStream(value.length)
         var index = 0
         while (index < value.length) {
             val char = value[index]
-            if (char == '%' && index + 3 <= value.length) {
-                val code = value.substring(index + 1, index + 3).toIntOrNull(16)
-                if (code != null) {
-                    bytes.write(code)
-                    index += 3
-                    continue
+            if (char == '%') {
+                val hex = if (index + 3 <= value.length) {
+                    value.substring(index + 1, index + 3)
+                } else {
+                    return Result.failure(invalid("The invite code has a truncated escape sequence"))
                 }
+                val code = hex.toIntOrNull(16)
+                    ?: return Result.failure(invalid("The invite code has a malformed escape sequence"))
+                bytes.write(code)
+                index += 3
+                continue
             }
             val encoded = char.toString().toByteArray(Charsets.UTF_8)
             bytes.write(encoded, 0, encoded.size)
             index++
         }
-        return String(bytes.toByteArray(), Charsets.UTF_8)
+        // Decoded strictly: a byte sequence that is not UTF-8 is refused
+        // rather than turned into replacement characters, which is what
+        // `String(bytes, UTF_8)` does and what the Rust parser does not do.
+        return try {
+            val decoder = Charsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+            Result.success(decoder.decode(ByteBuffer.wrap(bytes.toByteArray())).toString())
+        } catch (e: CharacterCodingException) {
+            Result.failure(invalid("The invite code is not valid UTF-8"))
+        }
     }
 
     private fun failure(message: String) = InviteParseResult.Failure(message)

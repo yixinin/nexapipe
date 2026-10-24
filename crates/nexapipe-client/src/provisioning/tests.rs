@@ -637,3 +637,58 @@ fn debug_of_a_whole_invite_redacts_the_credential_it_carries() {
     assert!(!format!("{with_token:?}").contains("tok-abc"));
     assert!(with_token.to_uri().contains("enroll=tok-abc"));
 }
+
+/// A parameter's *name* is matched without its case.
+///
+/// The name is what decides whether a parameter is read at all, and a
+/// parameter that is not read is an unknown one — and unknown parameters are
+/// dropped. So `Secret=…` used to be dropped whole: the code imported as an
+/// endpoint with no second factor at all, while the app that reads the same
+/// code kept the credential and authenticated with it. The Android codec
+/// folds the name too, and the two have to agree about which codes are codes.
+#[test]
+fn a_parameter_name_is_matched_without_its_case() {
+    let bare = EndpointInvite::new(EndpointTarget::NodeId(node_id().to_string()), &[]).unwrap();
+    let uri = format!(
+        "{}&Secret=JBSWY3DPEHPK3PXP&client=client-001",
+        bare.to_uri()
+    );
+    let parsed = EndpointInvite::from_uri(&uri).expect("the code carries a credential");
+    let totp = parsed.totp.expect("the credential is not dropped");
+    assert_eq!(totp.client_id, "client-001");
+    assert_eq!(totp.secret.as_str(), "JBSWY3DPEHPK3PXP");
+}
+
+/// A malformed escape sequence is refused rather than kept as a literal `%`.
+///
+/// The Android codec used to keep it, so a code the desktop app refused
+/// imported there as an endpoint with a name of `%ZZ` in it.
+#[test]
+fn a_malformed_escape_sequence_is_refused() {
+    let uri = format!("{}&name=%ZZ", invite().to_uri());
+    let error = EndpointInvite::from_uri(&uri).expect_err("the escape is malformed");
+    assert!(error.to_string().contains("escape sequence"), "{error}");
+}
+
+/// Bytes that are not UTF-8 are refused rather than turned into replacement
+/// characters.
+///
+/// The Android codec used to substitute them, so the same code named an
+/// endpoint here and named something else there.
+#[test]
+fn a_code_that_is_not_utf8_is_refused() {
+    let uri = format!("{}&name=%C3%28", invite().to_uri());
+    let error = EndpointInvite::from_uri(&uri).expect_err("the bytes are not UTF-8");
+    assert!(error.to_string().contains("UTF-8"), "{error}");
+}
+
+/// A parameter with no name is a malformed one, and the code is refused.
+///
+/// The Android codec used to drop it and read the rest, so the two halves
+/// disagreed about which codes are codes.
+#[test]
+fn a_parameter_with_no_name_is_refused() {
+    let uri = format!("{}&=x", invite().to_uri());
+    let error = EndpointInvite::from_uri(&uri).expect_err("the parameter has no name");
+    assert!(error.to_string().contains("malformed parameter"), "{error}");
+}

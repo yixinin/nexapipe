@@ -100,7 +100,16 @@ pub(super) fn parse_query(query: &str) -> Result<QueryParams> {
             bail!("malformed parameter {pair:?} in the invite code");
         }
         out.push((
-            percent_decode(key)?,
+            // The *name* of a parameter is folded to lower case; its value is
+            // not, because a value is a credential and a credential's case is
+            // part of it. Folding the name is what keeps a code that carries
+            // a credential under a differently-cased name from losing it: an
+            // unmatched name is an unknown parameter, and unknown parameters
+            // are dropped — so `Secret=…` would have been dropped and the
+            // invite would have imported as an endpoint with no second
+            // factor at all, while the app that reads the same code kept the
+            // credential and authenticated with it.
+            percent_decode(key)?.to_ascii_lowercase(),
             // The decoded value is a copy of what the link carried, and for
             // two of the parameters it is a credential — so it goes into the
             // wrapper rather than into a `String` that is dropped unwiped.

@@ -296,4 +296,71 @@ class EndpointInviteTest {
         assertEquals(2, odd.warnings().size)
         assertTrue(odd.warnings().first().contains("8 digits"))
     }
+
+    /**
+     * A parameter's *name* is matched without its case.
+     *
+     * The name decides whether a parameter is read at all, and a parameter
+     * that is not read is an unknown one — and unknown parameters are
+     * dropped. So `Secret=…` used to be dropped whole: the code imported as
+     * an endpoint with no second factor, while the desktop app reading the
+     * same code kept the credential and authenticated with it. The Rust
+     * parser folds the name too, and the two have to agree.
+     */
+    @Test
+    fun a_parameter_name_is_matched_without_its_case() {
+        val uri = "${bare()}&Secret=JBSWY3DPEHPK3PXP&client=client-001"
+        val invite = success(uri)
+        assertEquals("client-001", invite.totp?.clientId)
+        assertEquals("JBSWY3DPEHPK3PXP", invite.totp?.secret)
+    }
+
+    /**
+     * A malformed escape sequence is refused rather than kept as a literal
+     * `%`.
+     *
+     * It used to be kept, so a code the desktop app refused imported here as
+     * an endpoint with a name of `%ZZ` in it.
+     */
+    @Test
+    fun refuses_a_malformed_escape_sequence() {
+        val message = failure("${bare()}&name=%ZZ")
+        assertTrue(message, message.contains("escape sequence"))
+    }
+
+    /**
+     * Bytes that are not UTF-8 are refused rather than turned into
+     * replacement characters.
+     *
+     * They used to be substituted, so the same code named an endpoint on the
+     * desktop and named something else here.
+     */
+    @Test
+    fun refuses_a_code_that_is_not_utf8() {
+        val message = failure("${bare()}&name=%C3%28")
+        assertTrue(message, message.contains("UTF-8"))
+    }
+
+    /** A parameter with no name is a malformed one, and the code is refused. */
+    @Test
+    fun refuses_a_parameter_with_no_name() {
+        val message = failure("${bare()}&=x")
+        assertTrue(message, message.contains("malformed parameter"))
+    }
+
+    /**
+     * A code past the hard limit is refused rather than parsed.
+     *
+     * The Rust parser refuses one too, and parsing it is work an attacker
+     * gets for free.
+     */
+    @Test
+    fun refuses_a_code_past_the_hard_limit() {
+        val uri = "${bare()}&name=${"a".repeat(5000)}"
+        val message = failure(uri)
+        assertTrue(message, message.contains("past the"))
+    }
+
+    /** A bare invite, with no optional fields set. */
+    private fun bare(): String = "nexapipe://endpoint/$nodeId?v=1"
 }
