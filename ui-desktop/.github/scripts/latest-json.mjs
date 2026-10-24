@@ -26,7 +26,18 @@ const tag = process.env.TAG_NAME ?? process.env.GITHUB_REF_NAME ?? "";
 const outDir = "release-artifact";
 
 if (!updaterFile) {
-  console.log("No updater payload, skipping latest.json generation.");
+  // No payload for this platform. Whether that is a defect or a
+  // configuration depends on the signing key: with a key configured, every
+  // platform has to publish an update payload, so a platform without one is
+  // a broken release. Without a key there is no auto-update at all, which is
+  // a configuration somebody chose.
+  if ((process.env.TAURI_SIGNING_PRIVATE_KEY ?? "").trim()) {
+    console.error(
+      `::error::no updater payload was staged for ${os}-${arch}, but the updater signing key is configured: this platform would get no update.`,
+    );
+    process.exit(1);
+  }
+  console.log("No updater payload and no updater signing key configured: this release has no auto-update.");
   process.exit(0);
 }
 

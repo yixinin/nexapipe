@@ -163,6 +163,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
         with:
           ref: ${{ inputs.tag || github.ref }}
+          # The tag object itself, not just the commit it points at: the tag
+          # check below tells an annotated tag from a lightweight one.
+          fetch-tags: true
 
       - name: Resolve version
         shell: bash
@@ -180,15 +183,48 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "Building tag: $TAG (version=$VERSION)"
 
-      # Warning only, does not block the release: the tag does not match the version in Cargo.toml
-      - name: Warn on version mismatch
+      # The tag has to name the version this tree builds, and it has to be an
+      # annotated tag. Both are failures, not warnings: a release published
+      # under a tag that does not match the version carries server binaries
+      # that report a different version than the release they were downloaded
+      # from, and nobody notices until a user compares `nexapipe --version`
+      # with the release page.
+      #
+      # The annotated requirement is the same in every job: a lightweight tag
+      # is a bare ref to a commit, and anybody with push access can move it,
+      # while the release is signed and published against the tag.
+      - name: Verify the release tag
         shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          CARGO_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
-          if [ -n "$CARGO_VERSION" ] && [ "$CARGO_VERSION" != "$VERSION" ]; then
-            echo "::warning::tag ${TAG_NAME} does not match workspace version ${CARGO_VERSION} in Cargo.toml"
+          TAG="${INPUT_TAG:-$REF_NAME}"
+          VERSION="${TAG#v}"
+
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag '$TAG' is not a valid v<major>.<minor>.<patch>"
+            exit 1
           fi
+
+          WORKSPACE_VERSION="$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version[[:space:]]*=/{line=$0; sub(/^[^=]*=[[:space:]]*/,"",line); gsub(/["[:space:]]/,"",line); print line; exit}' Cargo.toml)"
+          if [ -z "$WORKSPACE_VERSION" ]; then
+            echo "::error::could not read the workspace version out of Cargo.toml"
+            exit 1
+          fi
+          if [ "$WORKSPACE_VERSION" != "$VERSION" ]; then
+            echo "::error::tag ${TAG} does not match the workspace version ${WORKSPACE_VERSION} in Cargo.toml: this release would carry binaries that report a different version"
+            exit 1
+          fi
+
+          TAG_TYPE="$(git cat-file -t "refs/tags/$TAG" 2>/dev/null || echo missing)"
+          if [ "$TAG_TYPE" != "tag" ]; then
+            echo "::error::the tag ${TAG} is not an annotated tag (git says '${TAG_TYPE}'): a lightweight tag is a bare ref that anybody with push access can move, and the release is published and signed against the tag. Create it with 'git tag -a ${TAG} -m \"...\"'."
+            exit 1
+          fi
+
+          echo "tag ${TAG} is an annotated tag and matches the workspace version ${WORKSPACE_VERSION}"
 
       - name: Install Rust target
         if: ${{ !matrix.cross }}
@@ -346,6 +382,13 @@ jobs:
     if: ${{ inputs.signing_only != true }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
+    # The publishing jobs run in an environment, so the repository can put
+    # an approval rule in front of them: a job that runs the tagged tree's
+    # own code while holding the signing keys, the release keystore and
+    # write access to the package registry is a job that deserves a second
+    # pair of eyes. The environment is created by the first run that uses
+    # it; the rules are the repository's to set.
+    environment: release
     strategy:
       fail-fast: false
       matrix:
@@ -410,6 +453,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
         with:
           ref: ${{ inputs.tag || github.ref }}
+          # The tag object itself, not just the commit it points at: the tag
+          # check tells an annotated tag from a lightweight one.
+          fetch-tags: true
 
       # The signing gate. It runs before anything is built, so a repository
       # without the signing material fails in seconds instead of after a full
@@ -679,6 +725,51 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "release version: $version"
 
+      # The tag has to name the version this tree builds, and it has to be an
+      # annotated tag. Both are failures, not warnings: the desktop version is
+      # forced to the tag below, so a tag that does not match the version
+      # publishes an app that calls itself one thing while the server it
+      # talks to calls itself another.
+      #
+      # The annotated requirement is the same in every job: a lightweight tag
+      # is a bare ref to a commit, and anybody with push access can move it,
+      # while the release is signed and published against the tag.
+      - name: Verify the release tag
+        shell: bash
+        # The job's default working directory is ui-desktop; the workspace
+        # version lives in the Cargo.toml of the repository root.
+        working-directory: ${{ github.workspace }}
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-$REF_NAME}"
+          VERSION="${TAG#v}"
+
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag '$TAG' is not a valid v<major>.<minor>.<patch>"
+            exit 1
+          fi
+
+          WORKSPACE_VERSION="$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version[[:space:]]*=/{line=$0; sub(/^[^=]*=[[:space:]]*/,"",line); gsub(/["[:space:]]/,"",line); print line; exit}' Cargo.toml)"
+          if [ -z "$WORKSPACE_VERSION" ]; then
+            echo "::error::could not read the workspace version out of Cargo.toml"
+            exit 1
+          fi
+          if [ "$WORKSPACE_VERSION" != "$VERSION" ]; then
+            echo "::error::tag ${TAG} does not match the workspace version ${WORKSPACE_VERSION} in Cargo.toml: this release would carry binaries that report a different version"
+            exit 1
+          fi
+
+          TAG_TYPE="$(git cat-file -t "refs/tags/$TAG" 2>/dev/null || echo missing)"
+          if [ "$TAG_TYPE" != "tag" ]; then
+            echo "::error::the tag ${TAG} is not an annotated tag (git says '${TAG_TYPE}'): a lightweight tag is a bare ref that anybody with push access can move, and the release is published and signed against the tag. Create it with 'git tag -a ${TAG} -m \"...\"'."
+            exit 1
+          fi
+
+          echo "tag ${TAG} is an annotated tag and matches the workspace version ${WORKSPACE_VERSION}"
+
       - name: Sync version into tauri.conf.json
         shell: bash
         env:
@@ -931,6 +1022,13 @@ jobs:
     # NDK, no Rust, no Gradle, no APK.
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # The publishing jobs run in an environment, so the repository can put
+    # an approval rule in front of them: a job that runs the tagged tree's
+    # own code while holding the signing keys, the release keystore and
+    # write access to the package registry is a job that deserves a second
+    # pair of eyes. The environment is created by the first run that uses
+    # it; the rules are the repository's to set.
+    environment: release
     outputs:
       skip_rust: ${{ steps.opts.outputs.skip_rust }}
 
@@ -951,6 +1049,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
         with:
           ref: ${{ inputs.tag || github.ref }}
+          # The tag object itself, not just the commit it points at: the tag
+          # check tells an annotated tag from a lightweight one.
+          fetch-tags: true
 
       - name: Resolve build inputs
         id: opts
@@ -997,6 +1098,52 @@ jobs:
             echo "| ABIs | \`${ANDROID_ABI_PAIRS}\` |"
             echo "| Pre-release | \`${PRERELEASE}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # The tag has to name the version this tree builds, and it has to be an
+      # annotated tag. Both are failures, not warnings: the APK's versionName
+      # comes from the tag, so a tag that does not match the version ships an
+      # app that calls itself one thing while the server it talks to calls
+      # itself another.
+      #
+      # The annotated requirement is the same in every job: a lightweight tag
+      # is a bare ref to a commit, and anybody with push access can move it,
+      # while the release is signed and published against the tag.
+      #
+      # A signing_only run is about the keystore, not about the tag, so the
+      # check waits for a run that actually builds.
+      - name: Verify the release tag
+        if: steps.opts.outputs.skip_rust != 'true'
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-$REF_NAME}"
+          VERSION="${TAG#v}"
+
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag '$TAG' is not a valid v<major>.<minor>.<patch>"
+            exit 1
+          fi
+
+          WORKSPACE_VERSION="$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version[[:space:]]*=/{line=$0; sub(/^[^=]*=[[:space:]]*/,"",line); gsub(/["[:space:]]/,"",line); print line; exit}' Cargo.toml)"
+          if [ -z "$WORKSPACE_VERSION" ]; then
+            echo "::error::could not read the workspace version out of Cargo.toml"
+            exit 1
+          fi
+          if [ "$WORKSPACE_VERSION" != "$VERSION" ]; then
+            echo "::error::tag ${TAG} does not match the workspace version ${WORKSPACE_VERSION} in Cargo.toml: this release would carry binaries that report a different version"
+            exit 1
+          fi
+
+          TAG_TYPE="$(git cat-file -t "refs/tags/$TAG" 2>/dev/null || echo missing)"
+          if [ "$TAG_TYPE" != "tag" ]; then
+            echo "::error::the tag ${TAG} is not an annotated tag (git says '${TAG_TYPE}'): a lightweight tag is a bare ref that anybody with push access can move, and the release is published and signed against the tag. Create it with 'git tag -a ${TAG} -m \"...\"'."
+            exit 1
+          fi
+
+          echo "tag ${TAG} is an annotated tag and matches the workspace version ${WORKSPACE_VERSION}"
 
       - name: Set up JDK 17
         uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6 @ 2026-10-14
@@ -1477,6 +1624,13 @@ jobs:
     if: ${{ inputs.signing_only != true }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    # The publishing jobs run in an environment, so the repository can put
+    # an approval rule in front of them: a job that runs the tagged tree's
+    # own code while holding the signing keys, the release keystore and
+    # write access to the package registry is a job that deserves a second
+    # pair of eyes. The environment is created by the first run that uses
+    # it; the rules are the repository's to set.
+    environment: release
     # The GHCR push. Elevated here and not in the workflow-level block, which
     # stays read-only for the whole build stage.
     permissions:
@@ -1572,6 +1726,17 @@ jobs:
     if: ${{ inputs.signing_only != true }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # The digest of the published manifest list, for the release job: it puts
+    # it in the release notes and moves the "latest" tag onto it.
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+    # The publishing jobs run in an environment, so the repository can put
+    # an approval rule in front of them: a job that runs the tagged tree's
+    # own code while holding the signing keys, the release keystore and
+    # write access to the package registry is a job that deserves a second
+    # pair of eyes. The environment is created by the first run that uses
+    # it; the rules are the repository's to set.
+    environment: release
     # Same elevation as build-image: imagetools writes the manifest list to GHCR
     permissions:
       contents: read
@@ -1620,11 +1785,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The version tag only. The "latest" tag is moved by the release
+          # job, once the GitHub Release exists: a user who pulls "latest"
+          # has to find the release that carries the server binaries of the
+          # same version, and a release that does not exist yet has none.
+          #
+          # The tag is applied to the manifest list that is created here, in
+          # one command, so "latest" and the version tag resolve to the same
+          # digest — and that digest is the one cosign signs below.
           tags=("ghcr.io/open-nexa/nexapipe:${VERSION}")
-          case "$VERSION" in
-            *-*) ;;
-            *)   tags+=("ghcr.io/open-nexa/nexapipe:latest") ;;
-          esac
 
           sources=()
           for f in /tmp/digests/*; do
@@ -1699,9 +1868,23 @@ jobs:
     if: ${{ inputs.signing_only != true && needs.build-apk.outputs.skip_rust != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # gh release needs write permission
+    # The publishing jobs run in an environment, so the repository can put
+    # an approval rule in front of them: a job that runs the tagged tree's
+    # own code while holding the signing keys, the release keystore and
+    # write access to the package registry is a job that deserves a second
+    # pair of eyes. The environment is created by the first run that uses
+    # it; the rules are the repository's to set.
+    environment: release
+    # gh release needs write permission; the package registry needs it for
+    # the "latest" tag that is moved onto the signed image below.
     permissions:
       contents: write
+      packages: write
+    env:
+      # The digest of the published image. The version tag is mutable — a
+      # re-run overwrites it — so the digest is what identifies the image
+      # this release published.
+      IMAGE_DIGEST: ${{ needs.publish-image.outputs.digest }}
     steps:
       # gh requires the working directory to be a git repo; fetch-depth: 0 keeps
       # --generate-notes able to diff against the previous tag
@@ -1724,6 +1907,15 @@ jobs:
           TAG="${INPUT_TAG:-$REF_NAME}"
           echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
           echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      # The release scripts and this workflow, checked before anything is
+      # published: a platform that quietly drops out of the updater manifest
+      # is a release that looks green and reaches half its users without an
+      # update. The self-test builds the bundles Tauri builds and checks what
+      # the scripts would publish.
+      - name: Check the release scripts
+        shell: bash
+        run: node ui-desktop/.github/scripts/selftest.mjs
 
       - name: Download server artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8 @ 2026-10-07
@@ -1777,6 +1969,34 @@ jobs:
           sha256sum -- * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      # The checksum file is signed with the updater key, the same key every
+      # other artifact of the release is signed with.
+      #
+      # Without a signature the checksum file is only as trustworthy as the
+      # download that carried it: anybody who can replace an artifact can
+      # replace the list of checksums that says the artifact is intact. The
+      # signature is what makes the two independent.
+      - name: Sign the checksum file
+        shell: bash
+        working-directory: ui-desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::warning::no updater signing key is configured: SHA256SUMS.txt is published unsigned"
+            exit 0
+          fi
+          # The same lockfile-pinned Tauri CLI that signs the bundles signs
+          # the checksum file, so the signature is the same kind of signature.
+          npm ci --no-audit --no-fund
+          npx tauri --version
+          rm -f ../dist/SHA256SUMS.txt.sig
+          npx tauri signer sign --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ../dist/SHA256SUMS.txt
+          test -f ../dist/SHA256SUMS.txt.sig
+          echo "signed: SHA256SUMS.txt"
+
       - name: Publish release
         shell: bash
         env:
@@ -1794,6 +2014,25 @@ jobs:
           esac
           echo "TAG_NAME=$TAG_NAME VERSION=$VERSION PRERELEASE_FLAG=$PRERELEASE_FLAG"
 
+          # The index files and the payloads are uploaded in two steps, and the
+          # index files go last.
+          #
+          # latest.json names the payload of every platform, and
+          # SHA256SUMS.txt lists every asset: they are only true once the
+          # assets they name are there. Uploading them together means that
+          # for as long as the ~750 MB of payloads are on their way,
+          # "releases/latest/download/latest.json" is live and points at
+          # assets that answer 404 — and the updater downloads them.
+          PAYLOAD_FILES=()
+          INDEX_FILES=()
+          for f in dist/*; do
+            case "$(basename "$f")" in
+              latest.json|SHA256SUMS.txt|SHA256SUMS.txt.sig) INDEX_FILES+=("$f") ;;
+              *) PAYLOAD_FILES+=("$f") ;;
+            esac
+          done
+          echo "payloads: ${#PAYLOAD_FILES[@]}, index files: ${#INDEX_FILES[@]}"
+
           # The note that says, in the release notes, that some of the artifacts
           # are unsigned. The opt-out is deliberate and has to be visible to
           # the person who installs the app, not only to the person who ran
@@ -1805,7 +2044,7 @@ jobs:
             for platform in ${ALLOW_UNSIGNED//,/ }; do
               case "$platform" in
                 macos)
-                  items+=$'> - `macos` — the `.dmg` and the `.app` inside it carry no Developer ID signature and are not notarized. macOS Gatekeeper refuses them until the user allows them by hand.\n'
+                  items+=$'> - `macos` — the `.dmg` and the `.app` inside it carry no Developer ID signature and are not notarized. macOS Gatekeeper refuses them until the user allows it by hand.\n'
                   ;;
                 windows)
                   items+=$'> - `windows` — the NSIS installer (`-setup.exe`) carries no Authenticode signature. Windows SmartScreen refuses it until the user allows it by hand.\n'
@@ -1821,36 +2060,134 @@ jobs:
             UNSIGNED_NOTE+=$'>\n> macOS Gatekeeper and Windows SmartScreen refuse such an artifact until the user allows it by hand.\n'
           fi
 
+          # The digest of the published image. The version tag is mutable — a
+          # re-run overwrites it — and the digest appears nowhere else a user
+          # looks, so the release notes carry it.
+          IMAGE_NOTE=""
+          if [ -n "${IMAGE_DIGEST:-}" ]; then
+            IMAGE_NOTE="$(printf '> [!NOTE]\n> **Container image.** This release publishes %s.\n>\n> The version tag is mutable; this digest is not.\n' "\`ghcr.io/open-nexa/nexapipe@${IMAGE_DIGEST}\`")"
+          fi
+
+          NOTES="${UNSIGNED_NOTE}${IMAGE_NOTE}"
+
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
             echo "Release $TAG_NAME already exists, overwriting the uploaded artifacts"
-            gh release upload "$TAG_NAME" dist/* --clobber
+            # The same order as the create path: the payloads first, the
+            # index files last.
+            if [ "${#PAYLOAD_FILES[@]}" -gt 0 ]; then
+              gh release upload "$TAG_NAME" "${PAYLOAD_FILES[@]}" --clobber
+            fi
+            if [ "${#INDEX_FILES[@]}" -gt 0 ]; then
+              gh release upload "$TAG_NAME" "${INDEX_FILES[@]}" --clobber
+            fi
             # `gh release upload` cannot flip the flag, so keep an already
             # published release (e.g. a re-run) in sync with the rule as well.
             gh release edit "$TAG_NAME" "$PRERELEASE_FLAG"
-            if [ -n "$UNSIGNED_NOTE" ]; then
-              # An existing release keeps the notes it has, so the warning is
-              # prepended to them here.
-              BODY="$(gh release view "$TAG_NAME" --json body --jq .body)"
-              if printf '%s' "$BODY" | grep -qF "This release contains unsigned artifacts"; then
-                echo "the unsigned-artifact warning is already in the release notes"
-              else
-                { printf '%s\n\n' "$UNSIGNED_NOTE"; printf '%s' "$BODY"; } > "$RUNNER_TEMP/release-notes.md"
-                gh release edit "$TAG_NAME" --notes-file "$RUNNER_TEMP/release-notes.md"
+            # An existing release keeps the notes it has, so the notes this
+            # run adds are prepended to them.
+            BODY="$(gh release view "$TAG_NAME" --json body --jq .body)"
+            {
+              if [ -n "$UNSIGNED_NOTE" ] && ! printf '%s' "$BODY" | grep -qF "This release contains unsigned artifacts"; then
+                printf '%s\n\n' "$UNSIGNED_NOTE"
               fi
-            fi
-          elif [ -n "$UNSIGNED_NOTE" ]; then
-            # `--notes` is prepended to the generated notes, so the warning
-            # comes first.
-            gh release create "$TAG_NAME" dist/* \
-              --title "$TAG_NAME" \
-              --generate-notes \
-              --notes "$UNSIGNED_NOTE" \
-              --verify-tag \
-              "$PRERELEASE_FLAG"
+              if [ -n "$IMAGE_NOTE" ] && ! printf '%s' "$BODY" | grep -qF "$IMAGE_DIGEST"; then
+                printf '%s\n\n' "$IMAGE_NOTE"
+              fi
+              printf '%s' "$BODY"
+            } > "$RUNNER_TEMP/release-notes.md"
+            gh release edit "$TAG_NAME" --notes-file "$RUNNER_TEMP/release-notes.md"
           else
-            gh release create "$TAG_NAME" dist/* \
-              --title "$TAG_NAME" \
-              --generate-notes \
-              --verify-tag \
-              "$PRERELEASE_FLAG"
+            # `--notes` is prepended to the generated notes, so the warnings
+            # come first.
+            if [ "${#PAYLOAD_FILES[@]}" -gt 0 ]; then
+              gh release create "$TAG_NAME" "${PAYLOAD_FILES[@]}" \
+                --title "$TAG_NAME" \
+                --generate-notes \
+                --notes "$NOTES" \
+                --verify-tag \
+                "$PRERELEASE_FLAG"
+            else
+              gh release create "$TAG_NAME" \
+                --title "$TAG_NAME" \
+                --generate-notes \
+                --notes "$NOTES" \
+                --verify-tag \
+                "$PRERELEASE_FLAG"
+            fi
+            # The index files go up once every asset they name is there.
+            if [ "${#INDEX_FILES[@]}" -gt 0 ]; then
+              gh release upload "$TAG_NAME" "${INDEX_FILES[@]}"
+            fi
           fi
+
+      # The "latest" tag of the container image is moved here, and not in the
+      # publish-image job: a user who pulls "latest" has to find the release
+      # that carries the server binaries of the same version, and that
+      # release exists only once the step above has created it.
+      #
+      # The manifest is copied byte for byte, so the digest does not change.
+      # The cosign signature is bound to that digest, and the command the
+      # README gives — "cosign verify ghcr.io/open-nexa/nexapipe:latest" —
+      # has to resolve the tag to exactly the manifest that was signed.
+      # Rebuilding the manifest list instead would produce a different digest
+      # and leave the tag unsigned.
+      - name: Move the image's latest tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_USER: ${{ github.actor }}
+          IMAGE_DIGEST: ${{ needs.publish-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          # A pre-release never takes "latest" away from a stable one.
+          case "$VERSION" in
+            *-*) echo "a pre-release does not move the latest tag"; exit 0 ;;
+          esac
+
+          REGISTRY="ghcr.io"
+          REPOSITORY="open-nexa/nexapipe"
+          ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json"
+
+          TOKEN="$(curl -fsS -u "${GH_USER}:${GH_TOKEN}" \
+            "https://${REGISTRY}/token?service=${REGISTRY}&scope=repository:${REPOSITORY}:pull,push" \
+            | jq -r .token)"
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::could not get a registry token for ${REGISTRY}"
+            exit 1
+          fi
+
+          MANIFEST="$RUNNER_TEMP/manifest.json"
+          curl -fsS -D "$RUNNER_TEMP/manifest.headers" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: ${ACCEPT}" \
+            "https://${REGISTRY}/v2/${REPOSITORY}/manifests/${IMAGE_DIGEST}" \
+            -o "$MANIFEST"
+          MEDIA_TYPE="$(grep -i '^content-type:' "$RUNNER_TEMP/manifest.headers" | tail -n1 | tr -d '\r' | cut -d' ' -f2)"
+          if [ -z "$MEDIA_TYPE" ]; then
+            echo "::error::the registry did not say which media type the manifest has"
+            exit 1
+          fi
+
+          STATUS="$(curl -fsS -o /dev/null -w '%{http_code}' -X PUT \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: ${MEDIA_TYPE}" \
+            --data-binary "@${MANIFEST}" \
+            "https://${REGISTRY}/v2/${REPOSITORY}/manifests/latest")"
+          if [ "$STATUS" != "201" ] && [ "$STATUS" != "200" ]; then
+            echo "::error::the registry refused to move the latest tag (HTTP ${STATUS})"
+            exit 1
+          fi
+
+          # The tag has to resolve to the manifest that was signed.
+          curl -fsS -D "$RUNNER_TEMP/latest.headers" -o /dev/null \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: ${ACCEPT}" \
+            "https://${REGISTRY}/v2/${REPOSITORY}/manifests/latest"
+          ACTUAL="$(grep -i '^docker-content-digest:' "$RUNNER_TEMP/latest.headers" | tr -d '\r' | cut -d' ' -f2)"
+          if [ "$ACTUAL" != "$IMAGE_DIGEST" ]; then
+            echo "::error::the latest tag resolves to ${ACTUAL}, not to the signed ${IMAGE_DIGEST}"
+            exit 1
+          fi
+
+          echo "ghcr.io/${REPOSITORY}:latest now points at ${IMAGE_DIGEST}"

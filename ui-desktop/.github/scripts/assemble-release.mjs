@@ -88,12 +88,24 @@ if (manifests.length > 0) {
     console.log(`  ${entry ? "✓" : "✗"} ${key}${entry ? `  -> ${path.basename(entry.url)}` : ""}`);
   }
   if (missing.length > 0) {
-    // Do not fail outright: if the signing key is missing or one arch failed to build,
-    // the remaining platforms are still worth publishing.
-    console.log(`::warning::latest.json is missing platforms: ${missing.join(", ")}`);
+    // A partial updater manifest is not a partial release: it is a release
+    // in which the missing platforms get no update at all, and nothing in
+    // the published artifacts says so. Linux lost its updater in v1.0.0
+    // exactly this way, and the release went out green because a missing
+    // platform was only a warning.
+    console.error(
+      `::error::latest.json is missing platforms: ${missing.join(", ")}. The release is not published: the missing platforms would get no update, and no artifact says so.`,
+    );
+    process.exit(1);
   }
 } else {
-  console.log("No updater manifest found; this release has no latest.json (auto update unavailable).");
+  // No platform published a manifest. That is what a release without an
+  // updater signing key looks like, and it is a configuration rather than a
+  // defect — but it means the desktop app cannot update itself, so it is
+  // worth a line in the log.
+  console.log(
+    "::warning::no updater manifest found: this release has no latest.json, so the desktop app cannot update itself.",
+  );
 }
 
 // ------------------------------------------------------------ SHA256SUMS

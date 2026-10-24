@@ -36,6 +36,11 @@ const version = process.env.VERSION ?? "";
 const targetDir = process.env.TARGET_DIR ?? "src-tauri/target";
 const outDir = "release-artifact";
 
+// The updater signing key, as the workflow hands it to this job. It decides
+// what a missing payload means: without a key there is no auto-update at all
+// (a configuration), with a key every platform has to have one (a defect).
+const signingKeyConfigured = Boolean((process.env.TAURI_SIGNING_PRIVATE_KEY ?? "").trim());
+
 if (!os || !arch || !version) {
   console.error("::error::missing MATRIX_OS / MATRIX_ARCH / VERSION environment variables");
   process.exit(1);
@@ -146,7 +151,9 @@ const PUBLISHABLE = [
   /-setup\.exe(\.sig)?$/,
   /\.deb$/,
   /\.rpm$/,
-  /\.AppImage$/,
+  // The AppImage and its signature: the AppImage is the updater payload on
+  // Linux (see below), so the signature has to travel with it.
+  /\.AppImage(\.sig)?$/,
   /\.AppImage\.tar\.gz(\.sig)?$/,
 ];
 const isPublishable = (name) => PUBLISHABLE.some((re) => re.test(name));
@@ -160,15 +167,21 @@ if (filteredOut.length > 0) {
 //   windows  the NSIS `*-setup.exe` is itself the update bundle (`*.nsis.zip` in
 //            v1Compatible mode)
 //   macos    `<productName>.app.tar.gz`
-//   linux    `*.AppImage.tar.gz`
+//   linux    the `*.AppImage` itself
 // Note: every regex is anchored with $ so `xxx.sig` is never matched by mistake.
+//
+// The Linux payload is the AppImage, not an archive of it: Tauri v2 signs the
+// AppImage and the updater replaces that file, and a bundle that has no
+// `.AppImage.tar.gz` (the v1-era form) still has to publish an update for
+// Linux. The archive is still accepted when it is there, because a builder
+// that produces it knows what it is doing.
 let updaterSource = null;
 if (os === "windows") {
   updaterSource = byName(/\.nsis\.zip$/)[0] ?? byName(/-setup\.exe$/)[0] ?? null;
 } else if (os === "macos") {
   updaterSource = byName(/\.app\.tar\.gz$/)[0] ?? null;
 } else if (os === "linux") {
-  updaterSource = byName(/\.AppImage\.tar\.gz$/)[0] ?? null;
+  updaterSource = byName(/\.AppImage\.tar\.gz$/)[0] ?? byName(/\.AppImage$/)[0] ?? null;
 }
 
 // The payload gets the canonical name too. Tauri's macOS payload has no arch at all
@@ -231,11 +244,30 @@ if (updaterSource) {
   const hasSig = fs.existsSync(path.join(outDir, `${updaterName}.sig`));
   console.log(`\nupdater payload: ${updaterName} (signature ${hasSig ? "generated" : "missing"})`);
   if (!hasSig) {
-    console.log("::warning::updater signature file not found, latest.json will not be generated.");
+    if (signingKeyConfigured) {
+      // The key is configured, so the artifact was supposed to be signed. It
+      // was not, and an unsigned payload is an update nobody can install:
+      // the updater refuses a file whose signature does not verify.
+      console.error(
+        `::error::the updater payload ${updaterName} carries no signature, but the updater signing key is configured: this platform would get no update.`,
+      );
+      process.exit(1);
+    }
+    console.log(
+      "::warning::no updater signature was produced and no updater signing key is configured: this release has no auto-update for this platform.",
+    );
   }
   setOutput("updater_file", hasSig ? updaterName : "");
 } else {
-  console.log("\nNo updater payload found for this platform (usually TAURI_SIGNING_PRIVATE_KEY is not configured).");
+  if (signingKeyConfigured) {
+    console.error(
+      "::error::no updater payload was found for this platform, but the updater signing key is configured: this platform would get no update.",
+    );
+    process.exit(1);
+  }
+  console.log(
+    "\nNo updater payload and no updater signing key configured: this release has no auto-update for this platform.",
+  );
   setOutput("updater_file", "");
 }
 
