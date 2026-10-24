@@ -448,7 +448,13 @@ impl IrohConnectionPool {
             // The pool is full, so the connection was closed on the spot.
             // Handing it out would be handing out a connection that is
             // already closed.
-            Err(PoolRefusal::Full) => Err(ClientError::ConnectionFailed(
+            //
+            // **Its own variant, because it says nothing about the backend.**
+            // The backend answered the handshake and is holding the
+            // connections it already has; it is this process that ran out of
+            // its own slots. A caller that keeps a health table must not
+            // read this as the backend being down.
+            Err(PoolRefusal::Full) => Err(ClientError::PoolFull(
                 "the connection pool is full for this protocol".to_string(),
             )),
             Err(PoolRefusal::Closed) => Err(ClientError::ConnectionFailed(
@@ -457,7 +463,11 @@ impl IrohConnectionPool {
             // The credential was replaced while the handshake was running:
             // the connection is authenticated as an identity that is gone,
             // and it was closed rather than pooled.
-            Err(PoolRefusal::Replaced) => Err(ClientError::ConnectionFailed(
+            //
+            // **Its own variant, because it says nothing about the backend.**
+            // A rotation on this side raced the dial; the backend did what
+            // it was asked to do.
+            Err(PoolRefusal::Replaced) => Err(ClientError::CredentialReplaced(
                 "the credential was replaced while the connection was being made".to_string(),
             )),
         }
