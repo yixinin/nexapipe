@@ -1,7 +1,10 @@
 package com.nexa.pipe
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.Base64
 
 /**
  * The plaintext fallback is deliberate — refusing to store a credential would
@@ -42,10 +45,6 @@ class SecretStoreTest {
     /**
      * A value without the marker is the plaintext an older version wrote, and
      * it is the user's only copy, so it is handed back as it stands.
-     *
-     * Only the marked path is skipped here: decoding one needs `Base64`, which
-     * is a stub returning null on the host, so what it does with a damaged
-     * value is not something a host test can say.
      */
     @Test
     fun an_unmarked_value_is_read_as_the_plaintext_it_is() {
@@ -54,5 +53,57 @@ class SecretStoreTest {
         assertEquals("JBSWY3DPEHPK3PXP", store.unseal("JBSWY3DPEHPK3PXP"))
         assertEquals("", store.unseal(null))
         assertEquals("", store.unseal(""))
+    }
+
+    /**
+     * A value that carries the marker but is not ciphertext is plaintext that
+     * happens to start with it — the legacy client id did.
+     *
+     * It used to be taken for ciphertext: the length check failed, the value
+     * was handed back as absent, and the credential was lost with nothing
+     * but a warning. The migration skipped it as well, because the migration
+     * skipped everything that carries the marker, so the value stayed in the
+     * clear in the secrets file for good.
+     *
+     * It is handed back now, so the migration seals it.
+     */
+    @Test
+    fun a_plaintext_value_that_carries_the_marker_is_not_lost() {
+        val store = SecretStore()
+        val plain = "v1:client-001"
+
+        assertEquals(
+            "the credential is the user's only copy, so it is handed back",
+            plain,
+            store.unseal(plain)
+        )
+    }
+
+    /**
+     * A value is ciphertext only when it has the shape of ciphertext: the
+     * marker, a strict Base64 body, and enough bytes for the nonce and the
+     * GCM tag.
+     *
+     * The marker alone is not a shape: a plaintext credential that starts
+     * with it would be taken for ciphertext and lost.
+     */
+    @Test
+    fun a_value_is_sealed_only_when_it_has_the_shape_of_one() {
+        val store = SecretStore()
+
+        assertFalse(store.isSealed(null))
+        assertFalse(store.isSealed("JBSWY3DPEHPK3PXP"))
+        assertFalse(store.isSealed("v1:"))
+        assertFalse(store.isSealed("v1:client-001"))
+        assertFalse(store.isSealed("v1:not base64 at all"))
+        // The nonce, the tag and one byte of ciphertext: the shortest value
+        // this class can have written.
+        assertTrue(
+            store.isSealed("v1:" + Base64.getEncoder().encodeToString(ByteArray(29)))
+        )
+        assertFalse(
+            "one byte short of the nonce and the tag",
+            store.isSealed("v1:" + Base64.getEncoder().encodeToString(ByteArray(28)))
+        )
     }
 }

@@ -842,12 +842,23 @@ class VpnViewModel : ViewModel() {
             addLog("Enrollment answered with a credential this app cannot read")
             return
         }
-        val node = nodes.value.firstOrNull { it.enrollment?.clientId == issued.clientId }
-            ?: nodes.value.firstOrNull { it.enrollment != null }
+        // The credential names the client it was issued for, and that is the
+        // only thing that says which endpoint it belongs to: the order of the
+        // node list says nothing at all.
+        //
+        // An endpoint that is enrolling with a different client id is a
+        // different enrollment. Filing this credential under it hands that
+        // endpoint a credential the server never issued to it — while the
+        // endpoint the credential was issued for keeps a token the server
+        // has already spent. Both fail closed then, and both have to enrol
+        // again.
+        val node = endpointForIssuedCredential(nodes.value, issued.clientId)
         if (node == null) {
             // Dropping a secret is the safe outcome, but doing it silently is
             // not: the endpoint will never connect and nothing will say why.
-            addLog("A credential was issued but no endpoint is enrolling")
+            // The client id is not in this line: it is half of the 2FA
+            // credential pair.
+            addLog("A credential was issued but no endpoint is enrolling with that client id")
             return
         }
         val twoFactor = NodeTwoFactor(
@@ -1425,7 +1436,7 @@ class VpnViewModel : ViewModel() {
 
         nodes.value = nodes.value + NodeConfig(id)
         saveSettings()
-        addLog("Added node: $id")
+        addLog("Added node: ${id.take(8)}")
         return null
     }
 
@@ -1437,7 +1448,7 @@ class VpnViewModel : ViewModel() {
         if (isIrohStarted.value) {
             IrohProxy.nativeRemoveNode(nodeId)
         }
-        addLog("Removed node: $nodeId")
+        addLog("Removed node: ${nodeId.take(8)}")
     }
 
     /**
@@ -1473,11 +1484,11 @@ class VpnViewModel : ViewModel() {
             IrohProxy.nativeRemoveNode(oldNodeId)
             for (domain in node.domains) {
                 if (IrohProxy.nativeAddDomainMapping(domain, newId) != 0) {
-                    addLog("Failed to re-map domain '$domain' to new node: $newId")
+                    addLog("Failed to re-map domain '$domain' to new node: ${newId.take(8)}")
                 }
             }
         }
-        addLog("Renamed node: $oldNodeId -> $newId")
+        addLog("Renamed node: ${oldNodeId.take(8)} -> ${newId.take(8)}")
         return null
     }
 
@@ -1558,3 +1569,22 @@ class VpnViewModel : ViewModel() {
         }
     }
 }
+
+/**
+ * The endpoint an issued credential belongs to.
+ *
+ * The credential carries the client id of the endpoint it was issued for —
+ * the client refuses an answer that names a different one — and the client
+ * id is what the endpoint's own enrollment is filed under. So the client id
+ * is the whole of the match.
+ *
+ * A pure function so the rule can be pinned by a test: an endpoint that is
+ * enrolling with a *different* client id is a different enrollment, and a
+ * credential filed under it is a credential the server never issued to that
+ * endpoint. The endpoints then both fail closed and both have to enrol
+ * again, which is a far worse outcome than dropping the credential.
+ */
+internal fun endpointForIssuedCredential(
+    nodes: List<NodeConfig>,
+    issuedClientId: String
+): NodeConfig? = nodes.firstOrNull { it.enrollment?.clientId == issuedClientId }

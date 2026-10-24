@@ -409,7 +409,7 @@ class ProxyConnector(private val log: ConnectionLog) {
         for (node in nodes) {
             if (node.domains.isNotEmpty()) {
                 for (domain in node.domains) {
-                    log.log("Adding domain mapping: '$domain' -> nodeId: ${node.nodeId}")
+                    log.log("Adding domain mapping: '$domain' -> nodeId: ${node.nodeId.take(8)}")
                     val result = IrohProxy.nativeAddDomainMapping(domain, node.nodeId)
                     if (result != 0) {
                         log.log("Failed to add domain mapping: $domain")

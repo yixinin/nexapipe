@@ -31,7 +31,7 @@ internal fun applyInviteImport(
         viewModel.addNode(nodeId)?.let { return it }
     }
     if (invite.domains.isEmpty()) {
-        viewModel.addLog("Invite for $nodeId carried no domains")
+        viewModel.addLog("Invite for ${nodeId.take(8)} carried no domains")
     }
     invite.domains.forEach { viewModel.addDomainToNode(nodeId, it) }
     // The relay is global, so an invite only proposes one: it says how
@@ -89,7 +89,7 @@ internal fun applyInviteImport(
         else -> "none"
     }
     viewModel.addLog(
-        "Imported invite: node=$nodeId domains=${invite.domains.size} 2FA=$credential"
+        "Imported invite: node=${nodeId.take(8)} domains=${invite.domains.size} 2FA=$credential"
     )
     Toast.makeText(
         context,

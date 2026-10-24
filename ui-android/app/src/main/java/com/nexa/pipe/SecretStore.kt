@@ -2,11 +2,11 @@ package com.nexa.pipe
 
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
-import android.util.Base64
 import android.util.Log
 import java.security.GeneralSecurityException
 import java.security.KeyStore
 import java.security.ProviderException
+import java.util.Base64
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -41,8 +41,23 @@ class SecretStore {
          * Marks a value as sealed. Anything without it is plaintext: either a
          * value an older version wrote, or one that could not be sealed at the
          * time it was saved.
+         *
+         * The marker on its own does not say that a value is sealed — see
+         * [isSealed] — it says that the value was *meant* to be sealed.
          */
         const val MARKER = "v1:"
+
+        /** The GCM authentication tag, in bytes: 128 bits. */
+        private const val TAG_BYTES = TAG_BITS / 8
+
+        /**
+         * The body of a sealed value: Base64 in the standard alphabet, with
+         * the padding a strict encoder writes and nothing else in it.
+         *
+         * A plaintext credential cannot produce this shape by accident, which
+         * is what [isSealed] leans on.
+         */
+        private val SEALED_BODY = Regex("^[A-Za-z0-9+/]+={0,2}$")
 
         /** Sealed and thrown away by [canSeal]. Never stored. */
         private const val PROBE = "probe"
@@ -171,7 +186,7 @@ class SecretStore {
             // Recorded on the way out, so a device whose keystore came back is
             // not reported as unprotected by one failure from last week.
             lastProtection = Protection.Sealed
-            MARKER + Base64.encodeToString(nonce + body, Base64.NO_WRAP)
+            MARKER + Base64.getEncoder().encodeToString(nonce + body)
         } catch (e: GeneralSecurityException) {
             Log.e(TAG, "Could not seal a credential", e)
             lastProtection = Protection.SealFailed
@@ -189,26 +204,65 @@ class SecretStore {
     }
 
     /**
+     * Whether [stored] is a value this class sealed.
+     *
+     * The marker alone does not say so. A plaintext credential that happens to
+     * start with "v1:" — the legacy client id did — would be taken for
+     * ciphertext, fail the length check and be handed back as absent: the
+     * credential is lost, and the value stays in the clear in the secrets
+     * file, because the migration skips everything that carries the marker.
+     *
+     * So a value is ciphertext only when it also has the *shape* of
+     * ciphertext: the marker, then a strict Base64 body, then enough bytes
+     * for the nonce and the GCM tag. A plaintext value does not produce that
+     * shape by accident, and one that fails it is plaintext to be migrated
+     * rather than a credential to be lost.
+     */
+    fun isSealed(stored: String?): Boolean {
+        val value = stored ?: ""
+        if (!value.startsWith(MARKER)) return false
+        val body = value.removePrefix(MARKER)
+        if (!SEALED_BODY.matches(body)) return false
+        // The Base64 of a whole number of groups: the padding is part of it.
+        if (body.length % 4 != 0) return false
+        val packed = try {
+            Base64.getDecoder().decode(body)
+        } catch (e: IllegalArgumentException) {
+            return false
+        }
+        // The nonce, the ciphertext and the GCM tag, and at least one byte of
+        // what was sealed: a shorter value is not a sealed one.
+        return packed.size > NONCE_BYTES + TAG_BYTES
+    }
+
+    /**
      * Reads back a value written by [seal], or "" if it cannot be read.
      *
      * A value without the marker is returned as it stands. Those are the
      * plaintext credentials older versions left behind, and they are the user's
      * only copy: treating them as absent would lock them out of their
      * endpoints, which is worse than leaving them readable until they are next
-     * saved. A sealed value that does not open is treated as absent — the key
-     * is gone or the record was damaged, and in both cases there is no
+     * saved. The same goes for a value that carries the marker but does not
+     * have the shape of a sealed value: it is plaintext that starts with the
+     * marker, and it is handed back for the migration to seal.
+     *
+     * A sealed value that does not open is treated as absent — the key is
+     * gone or the record was damaged, and in both cases there is no
      * credential to be had.
      */
     fun unseal(stored: String?): String {
         val value = stored ?: ""
         if (!value.startsWith(MARKER)) return value
+        if (!isSealed(value)) {
+            // The marker, but not the shape of a sealed value. Handing this
+            // back as "" would lose the credential and leave it in the clear
+            // where it was, so it is returned as the plaintext it is.
+            Log.w(TAG, "A value carries the sealed marker but is not ciphertext, treating it as plaintext")
+            return value
+        }
         val key = key() ?: return ""
         return try {
-            val packed = Base64.decode(value.removePrefix(MARKER), Base64.DEFAULT)
-            if (packed.size <= NONCE_BYTES) {
-                Log.w(TAG, "A sealed credential is truncated, treating it as unset")
-                return ""
-            }
+            val packed = Base64.getDecoder().decode(value.removePrefix(MARKER))
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(
                 Cipher.DECRYPT_MODE,

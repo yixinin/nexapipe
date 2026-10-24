@@ -585,7 +585,11 @@ class SettingsManager internal constructor(
         for (key in keys) {
             if (!isCredentialKey(key)) continue
             val plain = secretPrefs.getString(key, "") ?: ""
-            if (plain.isEmpty() || plain.startsWith(SecretStore.MARKER)) continue
+            // A value that carries the marker but is not ciphertext is
+            // plaintext that happens to start with it: it is sealed here
+            // rather than skipped, which is what takes it off the disk in
+            // the clear. Skipping it would leave it there forever.
+            if (plain.isEmpty() || secrets.isSealed(plain)) continue
             val written = secrets.seal(plain)
             // `seal` hands the value back untouched when it has no key, so
             // this is both the "nothing was encrypted" and the "no key" case.
