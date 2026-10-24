@@ -38,6 +38,14 @@ import assert from 'node:assert/strict';
 const calls = [];
 
 /**
+ * What the backend answers for each command.
+ *
+ * The credential store is read once, at start-up, and the answer is a bundle
+ * of every credential the app runs on.
+ */
+const answers = new Map();
+
+/**
  * The browser globals the store expects.
  *
  * `localStorage` holds the configuration payload, and `window.__TAURI_INTERNALS__`
@@ -55,12 +63,23 @@ globalThis.window = {
   __TAURI_INTERNALS__: {
     invoke: async (cmd, args) => {
       calls.push({ cmd, args });
-      return null;
+      // The answer comes on a macrotask, not in the microtask a promise that
+      // is already resolved would resume in. An `await invoke(...)` has to
+      // yield to the event loop for the store's own work to be observable:
+      // with an immediate answer every command ran inside one microtask
+      // drain, and nothing else could happen in between — not the debounced
+      // save, and not a change made while the store was still working.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const answer = answers.get(cmd);
+      if (typeof answer === 'function') return await answer(args);
+      return answer === undefined ? null : answer;
     },
   },
 };
 
-const { markCredentialsHydrated, persistCredentials } = await import('./config/credentials');
+const { hydrateCredentials, markCredentialsHydrated, persistCredentials } = await import(
+  './config/credentials'
+);
 
 /**
  * The mirror only runs once the store has answered.
@@ -179,4 +198,63 @@ test('a node that has no key of its own leaves none behind', async () => {
 
   assert.deepEqual(deleted('devicekey'), ['node-1']);
   assert.deepEqual(written('totp'), ['node-1'], 'the secret is written back');
+});
+
+test('the read fills a copy, not the configuration it was given', async () => {
+  calls.length = 0;
+
+  answers.set('take_runtime_credentials', {
+    relay: null,
+    nodes: {
+      'node-1': {
+        totp: null,
+        enrollment: null,
+        deviceKey: null,
+        publicKey: null,
+        ticket: null,
+        endpoint: 'endpoint-1',
+      },
+      'node-2': {
+        totp: null,
+        enrollment: null,
+        deviceKey: null,
+        publicKey: null,
+        ticket: null,
+        endpoint: 'endpoint-2',
+      },
+    },
+  });
+
+  // The configuration the app runs on: two nodes whose credentials are in the
+  // store and not in the configuration, which is what a version-3 payload
+  // holds.
+  const source = configWith([
+    node({ id: 'node-1', endpointId: '', deviceKey: 'ab'.repeat(32) }),
+    node({ id: 'node-2', endpointId: '' }),
+  ]);
+
+  const hydration = hydrateCredentials(source);
+
+  // The read is in flight: the backend has answered, and the store is still
+  // being read node by node. Nothing else could happen in this window before,
+  // because the answer used to come back inside the same microtask the
+  // command was sent in.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const hydrated = await hydration;
+
+  // The configuration the app runs on was not filled in place. A node-by-node
+  // fill would expose a configuration whose first node has been read and
+  // whose second has not, and a save started there would take the second
+  // node's credentials out of the store as if the user had cleared them.
+  assert.deepEqual(
+    source.nodes.map((candidate) => candidate.endpointId),
+    ['', ''],
+    'the configuration was filled in place while the store was being read',
+  );
+  assert.deepEqual(
+    hydrated.nodes.map((candidate) => candidate.endpointId),
+    ['endpoint-1', 'endpoint-2'],
+    'the copy carries the credentials the store answered with',
+  );
 });

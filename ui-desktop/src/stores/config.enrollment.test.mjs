@@ -82,6 +82,13 @@ globalThis.window = {
   __TAURI_INTERNALS__: {
     invoke: async (cmd, args) => {
       calls.push({ cmd, args });
+      // The answer comes on a macrotask, not in the microtask a promise that
+      // is already resolved would resume in. An `await invoke(...)` has to
+      // yield to the event loop for the store's own work to be observable:
+      // with an immediate answer every command ran inside one microtask
+      // drain, and nothing else could happen in between — not the debounced
+      // save, and not a change made while the store was still working.
+      await new Promise((resolve) => setTimeout(resolve, 0));
       const answer = answers.get(cmd);
       if (typeof answer === 'function') return await answer(args);
       return answer === undefined ? null : answer;
