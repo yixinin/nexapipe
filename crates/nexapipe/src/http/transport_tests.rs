@@ -1537,3 +1537,59 @@ async fn a_body_that_is_given_up_on_hands_its_reservation_back() {
         "the body that was given up on hands its reservation back"
     );
 }
+
+/// A partial answer is not compressed.
+///
+/// The `Content-Range` names bytes of the representation, and a content
+/// coding is a property of the whole representation: the gzip stream of one
+/// range is not the encoding of the representation, and two ranges cannot be
+/// put back together afterwards. The range would also describe bytes the
+/// client never receives, because what it receives is the encoding of them
+/// rather than them.
+#[tokio::test]
+async fn a_partial_answer_is_not_compressed() {
+    let port = backend_answering(
+        "HTTP/1.1 206 Partial Content\r\ncontent-type: text/plain\r\ncontent-range: bytes 0-4/10\r\ncontent-length: 5\r\n\r\nhello",
+    )
+    .await;
+    let backend = format!("http://127.0.0.1:{port}");
+    let config = route_table(vec![backend], 1);
+    let clients =
+        BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("http://retry.test/")
+        .header("host", "retry.test")
+        .header("accept-encoding", "gzip")
+        .header("range", "bytes=0-4")
+        .body(Full::new(bytes::Bytes::new()))
+        .expect("a request");
+
+    let response = proxy_request(&clients, request, config)
+        .await
+        .expect("the backend answers");
+
+    assert_eq!(response.status(), 206, "the backend's own status is kept");
+    assert!(
+        response.headers().get("content-encoding").is_none(),
+        "a partial answer was compressed: {:?}",
+        response.headers()
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("content-range")
+            .map(|value| value.to_str().unwrap()),
+        Some("bytes 0-4/10"),
+        "the range still names the bytes it did before"
+    );
+
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("the body")
+        .to_bytes();
+    assert_eq!(body.as_ref(), b"hello", "the body was changed");
+}

@@ -176,6 +176,20 @@ where
             .get("content-type")
             .and_then(|h| h.to_str().ok());
 
+        // **A partial answer is not compressed.** The `Content-Range` names
+        // bytes of the representation, and a content coding is a property of
+        // the whole representation: the gzip stream of one range is not the
+        // encoding of the representation, and two ranges cannot be put back
+        // together afterwards. The range would also be describing bytes the
+        // client never receives, because what it receives is the encoding of
+        // them rather than them.
+        //
+        // A backend that answers a range request with the whole thing (a
+        // `200`, no `Content-Range`) is not a partial answer and is
+        // compressed like any other.
+        let is_partial = response.status() == StatusCode::PARTIAL_CONTENT
+            || response.headers().contains_key("content-range");
+
         // The idle deadline covers the body as well as the head: a backend that
         // answers and then goes silent must not hold this request open. The
         // streaming path has always bounded this; the plaintext listener had no
@@ -190,6 +204,7 @@ where
         let lease = backend_info.take_lease();
 
         if content_encoding.is_none()
+            && !is_partial
             && should_compress(content_type)
             && let Some(encodings) = accept_encoding
             && encodings.contains("gzip")
