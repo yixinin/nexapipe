@@ -97,12 +97,41 @@ where
     // Held for as long as the buffered body is alive — see `read_body_limited`.
     // Dropping it here rather than at the end of the function is deliberate and
     // is what makes the budget mean what it says.
-    let (body, _body_reservation) = read_body_limited(
+    let (body, _body_reservation) = match read_body_limited(
         req.into_body(),
         MAX_REQUEST_BODY,
         config.timeouts().deadlines.body,
     )
-    .await?;
+    .await
+    {
+        Ok(read) => read,
+        // **Answered, not raised.** The request never went anywhere: there is
+        // no backend to blame and no answer to give but the refusal. The
+        // caller maps an `Err` from here to a 502, and a 502 blames the
+        // *backend* — so a client that sent too much was told the far end was
+        // down, and a client that cannot read that as "shrink the upload" may
+        // send it again.
+        //
+        // The statuses are the ones the tunnel path answers the same three
+        // failures with (`http::server::body`): a body over the limit is 413,
+        // one that did not arrive in time is 408, one that could not be read
+        // is 400. The client is told the same thing on either path.
+        Err(failure) => {
+            let (status, message) = match &failure {
+                crate::http::body::BodyReadError::TooLarge { .. } => {
+                    (StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large")
+                }
+                crate::http::body::BodyReadError::TimedOut { .. } => {
+                    (StatusCode::REQUEST_TIMEOUT, "408 Request Timeout")
+                }
+                crate::http::body::BodyReadError::Failed(_) => {
+                    (StatusCode::BAD_REQUEST, "400 Bad Request")
+                }
+            };
+            tracing::warn!("Could not read the request body: {failure}");
+            return Ok(create_error_response(status, message));
+        }
+    };
 
     let attempts = config.retry().attempts;
     let backoff = config.retry().backoff;
@@ -176,6 +205,20 @@ where
             .get("content-type")
             .and_then(|h| h.to_str().ok());
 
+        // **A partial answer is not compressed.** The `Content-Range` names
+        // bytes of the representation, and a content coding is a property of
+        // the whole representation: the gzip stream of one range is not the
+        // encoding of the representation, and two ranges cannot be put back
+        // together afterwards. The range would also be describing bytes the
+        // client never receives, because what it receives is the encoding of
+        // them rather than them.
+        //
+        // A backend that answers a range request with the whole thing (a
+        // `200`, no `Content-Range`) is not a partial answer and is
+        // compressed like any other.
+        let is_partial = response.status() == StatusCode::PARTIAL_CONTENT
+            || response.headers().contains_key("content-range");
+
         // The idle deadline covers the body as well as the head: a backend that
         // answers and then goes silent must not hold this request open. The
         // streaming path has always bounded this; the plaintext listener had no
@@ -190,9 +233,9 @@ where
         let lease = backend_info.take_lease();
 
         if content_encoding.is_none()
+            && !is_partial
             && should_compress(content_type)
-            && let Some(encodings) = accept_encoding
-            && encodings.contains("gzip")
+            && accepts_gzip(accept_encoding.as_deref())
         {
             // The whole body is read and compressed here, so the backend is
             // done with it before the answer goes out: the lease goes back

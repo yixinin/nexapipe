@@ -494,3 +494,48 @@ async fn the_tunnel_path_lets_a_dripping_backend_stay_open() {
         );
     }
 }
+
+/// A client that names gzip is asked for it.
+///
+/// The header is a list of codings, and gzip is one of them.
+#[test]
+fn a_client_that_names_gzip_is_asked_for_it() {
+    assert!(accepts_gzip(Some("gzip")));
+    assert!(accepts_gzip(Some("gzip, deflate")));
+    assert!(accepts_gzip(Some("br, gzip")));
+    assert!(accepts_gzip(Some("GZIP")));
+    assert!(accepts_gzip(Some(" gzip ")));
+    assert!(accepts_gzip(Some("gzip;q=1")));
+    assert!(accepts_gzip(Some("gzip;q=0.5")));
+}
+
+/// A client that refuses gzip is not answered with it.
+///
+/// `gzip;q=0` is the client saying it cannot decode gzip, and a body it
+/// cannot read is a body it silently drops. The quality value is read as a
+/// number, so `q=0` and `q=0.0` are both a refusal, and a value that cannot
+/// be read is a refusal as well.
+#[test]
+fn a_client_that_refuses_gzip_is_not_asked_for_it() {
+    assert!(!accepts_gzip(Some("gzip;q=0")));
+    assert!(!accepts_gzip(Some("gzip;q=0.0")));
+    assert!(!accepts_gzip(Some("gzip;q=0.000")));
+    assert!(!accepts_gzip(Some("br, gzip;q=0")));
+    assert!(!accepts_gzip(Some("gzip; q=0")));
+    assert!(!accepts_gzip(Some("gzip;q=abc")));
+    assert!(!accepts_gzip(Some("gzip;q=")));
+}
+
+/// A client that asks for nothing in particular is not answered with gzip.
+///
+/// No header at all is a client that says nothing about the coding, and the
+/// answer goes out in the clear. A header that names other codings is the
+/// same: gzip is not among them.
+#[test]
+fn a_client_that_asks_for_nothing_is_not_asked_for_gzip() {
+    assert!(!accepts_gzip(None));
+    assert!(!accepts_gzip(Some("")));
+    assert!(!accepts_gzip(Some("deflate")));
+    assert!(!accepts_gzip(Some("br, zstd")));
+    assert!(!accepts_gzip(Some("identity")));
+}

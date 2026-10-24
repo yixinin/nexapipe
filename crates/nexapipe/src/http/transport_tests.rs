@@ -1537,3 +1537,327 @@ async fn a_body_that_is_given_up_on_hands_its_reservation_back() {
         "the body that was given up on hands its reservation back"
     );
 }
+
+/// The plaintext path does not hand the client a length that describes
+/// another body.
+///
+/// A backend that sends both a `Transfer-Encoding` and a `Content-Length` has
+/// its length overridden by the encoding (RFC 9112 §6.1, rule 3), and the
+/// received `Content-Length` has to be removed before the answer is
+/// forwarded. The `Transfer-Encoding` is dropped as a hop-by-hop header, so a
+/// length left behind describes a framing the forwarded body does not have —
+/// and the client is served the body cut to that length.
+#[tokio::test]
+async fn the_plaintext_path_drops_a_length_that_the_encoding_overrode() {
+    let port = backend_answering(
+        "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ncontent-length: 3\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+    )
+    .await;
+    let backend = format!("http://127.0.0.1:{port}");
+    let config = route_table(vec![backend], 1);
+    let clients =
+        BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+    let response = proxy_request(&clients, get_request("retry.test"), config)
+        .await
+        .expect("the backend answers");
+
+    assert!(
+        response.headers().get("content-length").is_none(),
+        "the stale length was forwarded: {:?}",
+        response.headers()
+    );
+    assert!(
+        response.headers().get("transfer-encoding").is_none(),
+        "the hop header was forwarded: {:?}",
+        response.headers()
+    );
+
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("the body")
+        .to_bytes();
+    assert_eq!(body.as_ref(), b"hello", "the body was cut");
+}
+
+/// A backend that sends a length and nothing else keeps it.
+///
+/// The rule above is about a message that was framed by an encoding. A
+/// message framed by its length is forwarded with that length.
+#[tokio::test]
+async fn the_plaintext_path_keeps_a_length_that_framed_the_body() {
+    let port = backend_answering("HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello").await;
+    let backend = format!("http://127.0.0.1:{port}");
+    let config = route_table(vec![backend], 1);
+    let clients =
+        BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+    let response = proxy_request(&clients, get_request("retry.test"), config)
+        .await
+        .expect("the backend answers");
+
+    assert_eq!(
+        response
+            .headers()
+            .get("content-length")
+            .map(|value| value.to_str().unwrap()),
+        Some("5"),
+        "the length was dropped"
+    );
+}
+
+/// A client that asks for gzip is answered with it.
+///
+/// The whole negotiation is here, end to end: the header the client sends,
+/// the header that goes back, and the bytes that come with it.
+#[tokio::test]
+async fn a_client_that_asks_for_gzip_is_answered_with_it() {
+    let port = backend_answering(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 5\r\n\r\nhello",
+    )
+    .await;
+    let backend = format!("http://127.0.0.1:{port}");
+    let config = route_table(vec![backend], 1);
+    let clients =
+        BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("http://retry.test/")
+        .header("host", "retry.test")
+        .header("accept-encoding", "gzip")
+        .body(Full::new(bytes::Bytes::new()))
+        .expect("a request");
+
+    let response = proxy_request(&clients, request, config)
+        .await
+        .expect("the backend answers");
+
+    assert_eq!(
+        response
+            .headers()
+            .get("content-encoding")
+            .map(|value| value.to_str().unwrap()),
+        Some("gzip"),
+        "the body was not compressed"
+    );
+
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("the body")
+        .to_bytes();
+    let mut decoded = String::new();
+    std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&body[..]), &mut decoded)
+        .expect("the body is gzip");
+    assert_eq!(decoded, "hello", "the body did not survive the round trip");
+}
+
+/// A client that refuses gzip is answered without it.
+///
+/// RFC 9110 §12.5.3: `gzip;q=0` is the client saying it cannot decode gzip.
+/// A body it cannot read is a body it silently drops, so the answer has to go
+/// out in the clear.
+#[tokio::test]
+async fn a_client_that_refuses_gzip_is_answered_without_it() {
+    let port = backend_answering(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 5\r\n\r\nhello",
+    )
+    .await;
+    let backend = format!("http://127.0.0.1:{port}");
+    let config = route_table(vec![backend], 1);
+    let clients =
+        BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("http://retry.test/")
+        .header("host", "retry.test")
+        .header("accept-encoding", "gzip;q=0")
+        .body(Full::new(bytes::Bytes::new()))
+        .expect("a request");
+
+    let response = proxy_request(&clients, request, config)
+        .await
+        .expect("the backend answers");
+
+    assert!(
+        response.headers().get("content-encoding").is_none(),
+        "the body was compressed anyway: {:?}",
+        response.headers()
+    );
+
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("the body")
+        .to_bytes();
+    assert_eq!(body.as_ref(), b"hello", "the body was changed");
+}
+
+/// The same route table, with a body deadline a test can wait out.
+fn route_table_with_body_deadline(
+    backends: Vec<String>,
+    attempts: u32,
+    body: std::time::Duration,
+) -> Arc<crate::routes::RoutingTable> {
+    let deadlines = crate::deadline::Deadlines {
+        body,
+        ..crate::deadline::Deadlines::default()
+    };
+    let timeouts = crate::config::Timeouts {
+        connect: std::time::Duration::from_secs(1),
+        response: std::time::Duration::from_secs(1),
+        deadlines,
+    };
+    let route = crate::routes::Route::new(
+        "retry.test",
+        "/",
+        true,
+        backends,
+        crate::lb::LoadBalancingStrategy::RoundRobin,
+        crate::config::RouteMode::Http,
+        None,
+    );
+    Arc::new(crate::routes::RoutingTable::with_settings(
+        vec![route],
+        timeouts,
+        crate::config::Retry {
+            attempts,
+            backoff: std::time::Duration::ZERO,
+        },
+    ))
+}
+
+/// A body over the limit is refused with 413, not with a 502.
+///
+/// The request never reached a backend, so there is no backend to blame: a
+/// 502 says the far end is down, and a client that reads it that way may
+/// send the same body again. The tunnel path answers the same failure with
+/// 413, and the two paths are the same proxy.
+#[tokio::test]
+async fn a_body_over_the_limit_is_refused_with_413() {
+    let port = hello_backend().await;
+    let backend = format!("http://127.0.0.1:{port}");
+    let config = route_table(vec![backend], 1);
+    let clients =
+        BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("http://retry.test/")
+        .header("host", "retry.test")
+        .body(Full::new(bytes::Bytes::from(vec![
+            0u8;
+            super::body::MAX_REQUEST_BODY
+                + 1
+        ])))
+        .expect("a request");
+
+    let response = proxy_request(&clients, request, config)
+        .await
+        .expect("the request is answered");
+
+    assert_eq!(
+        response.status(),
+        413,
+        "a body over the limit was not refused as too large"
+    );
+}
+
+/// A body that does not arrive in time is refused with 408, not with a 502.
+///
+/// The same request, the same reasoning: the backend was never asked, so it
+/// is not the one that failed.
+#[tokio::test]
+async fn a_body_that_does_not_arrive_in_time_is_refused_with_408() {
+    let port = hello_backend().await;
+    let backend = format!("http://127.0.0.1:{port}");
+    let config =
+        route_table_with_body_deadline(vec![backend], 1, std::time::Duration::from_millis(50));
+    let clients =
+        BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+    // A body that never yields and never ends: the read waits for it until
+    // the deadline is over.
+    let body = http_body_util::StreamBody::new(futures_util::stream::pending::<
+        Result<hyper::body::Frame<bytes::Bytes>, std::convert::Infallible>,
+    >());
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("http://retry.test/")
+        .header("host", "retry.test")
+        .body(body)
+        .expect("a request");
+
+    let response = proxy_request(&clients, request, config)
+        .await
+        .expect("the request is answered");
+
+    assert_eq!(
+        response.status(),
+        408,
+        "a body that did not arrive was not refused as a timeout"
+    );
+}
+
+/// A partial answer is not compressed.
+///
+/// The `Content-Range` names bytes of the representation, and a content
+/// coding is a property of the whole representation: the gzip stream of one
+/// range is not the encoding of the representation, and two ranges cannot be
+/// put back together afterwards. The range would also describe bytes the
+/// client never receives, because what it receives is the encoding of them
+/// rather than them.
+#[tokio::test]
+async fn a_partial_answer_is_not_compressed() {
+    let port = backend_answering(
+        "HTTP/1.1 206 Partial Content\r\ncontent-type: text/plain\r\ncontent-range: bytes 0-4/10\r\ncontent-length: 5\r\n\r\nhello",
+    )
+    .await;
+    let backend = format!("http://127.0.0.1:{port}");
+    let config = route_table(vec![backend], 1);
+    let clients =
+        BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("http://retry.test/")
+        .header("host", "retry.test")
+        .header("accept-encoding", "gzip")
+        .header("range", "bytes=0-4")
+        .body(Full::new(bytes::Bytes::new()))
+        .expect("a request");
+
+    let response = proxy_request(&clients, request, config)
+        .await
+        .expect("the backend answers");
+
+    assert_eq!(response.status(), 206, "the backend's own status is kept");
+    assert!(
+        response.headers().get("content-encoding").is_none(),
+        "a partial answer was compressed: {:?}",
+        response.headers()
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("content-range")
+            .map(|value| value.to_str().unwrap()),
+        Some("bytes 0-4/10"),
+        "the range still names the bytes it did before"
+    );
+
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("the body")
+        .to_bytes();
+    assert_eq!(body.as_ref(), b"hello", "the body was changed");
+}
