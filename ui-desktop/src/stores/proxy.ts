@@ -64,6 +64,16 @@ const FAILURES_BEFORE_BACKOFF = 3;
  */
 const SERVICE_POLL_MS = 10_000;
 
+/**
+ * How many consecutive service reads have to come back unanswered before the answer is believed.
+ *
+ * The IPC read has deadlines of its own — half a second to connect and five to be answered — and
+ * a busy machine misses them while the service is alive and well. One missed deadline is not a
+ * fact about the service: believing it turns TUN off, loses the setting across the next launch,
+ * and invites a reinstall of a service that was never broken. Several misses in a row are.
+ */
+const SERVICE_FAILURES_BEFORE_TRUST = 3;
+
 const status = ref<ProxyStatus>({ running: false, mode: 'stopped' });
 /**
  * The local Node ID, masked — `get_node_id_display` is what the poll reads.
@@ -76,6 +86,33 @@ const nodeId = ref('');
 const busy = ref(false);
 const startupError = ref<AppError | null>(null);
 const serviceRunning = ref(false);
+
+/**
+ * Whether the service has stopped answering, as far as the reads have shown.
+ *
+ * False while the answer is still unknown: the first read that misses its deadline says the
+ * service did not answer *then*, not that it is gone. Only several misses in a row are believed,
+ * and every read that answered clears the count.
+ */
+const serviceUnanswered = ref(false);
+
+/**
+ * Which build the service says it is.
+ *
+ * `null` when the service did not answer that question and something explains the silence: the
+ * IPC was up and the service refused it, or the service has stopped answering altogether. That
+ * is the drift a reinstall fixes. `undefined` while nothing is known yet — a read that timed out
+ * says the service did not answer *this time*, and nothing about the build, so nothing is
+ * claimed about it.
+ */
+const serviceVersion = ref<string | null | undefined>(undefined);
+
+/**
+ * Consecutive service reads that came back unanswered. Cleared by every read that answered.
+ *
+ * Not reactive state: it is a count, not an answer, and nothing on screen is drawn from it.
+ */
+let serviceReadFailures = 0;
 
 /**
  * What the service manager says about the service: not registered, registered and down, or
@@ -97,7 +134,7 @@ const serviceState = ref<'not_installed' | 'stopped' | 'running'>('not_installed
 const serviceInstalled = computed(() => serviceState.value !== 'not_installed');
 
 /**
- * The service manager says the service is running, and nothing is answering on the IPC.
+ * The service is registered and running but did not answer this build.
  *
  * The combination an upgrade leaves behind: the job is still there, running the build it
  * was started with, while the app beside it is a newer one that cannot talk to it. Nothing
@@ -105,10 +142,13 @@ const serviceInstalled = computed(() => serviceState.value !== 'not_installed');
  * invisible unless the two answers are compared.
  *
  * Not the same as "the service is not running": that is a service that is down, and this is
- * one that is up and speaking a language the app does not speak.
+ * one that is up and speaking a language the app does not speak. And not the same as a read
+ * that timed out either: that says the service did not answer *this time*, and nothing about
+ * the build, so it is no evidence of a drift and must not raise the banner that offers to
+ * reinstall the service.
  */
 const serviceStale = computed(
-  () => serviceState.value === 'running' && !serviceRunning.value,
+  () => serviceState.value === 'running' && serviceVersion.value === null,
 );
 
 /**
@@ -704,9 +744,18 @@ async function stop(): Promise<void> {
 /**
  * Whether the system service is answering. Polled rather than assumed: it gates the TUN toggle
  * (§5.12 rule 3), and the answer changes when the service is installed, uninstalled, or dies.
+ *
+ * Three answers are read together, because they only mean something next to each other: whether
+ * something is answering on the IPC port, what the service manager says about the service, and
+ * which build the service says it is.
+ *
+ * A read that comes back empty is a question that was not answered, not an answer. The IPC read
+ * has deadlines of its own, so one such read is not acted on: it would turn TUN off, lose the
+ * setting across the next launch, and invite a reinstall of a service that was never broken.
+ * Several of them in a row are.
  */
 async function refreshServiceRunning(): Promise<void> {
-  const [running, state] = await Promise.all([
+  const [running, state, version] = await Promise.all([
     invoke<boolean>('is_service_running').catch((error) => {
       console.error('[proxy] failed to query the service:', error);
       return false;
@@ -715,8 +764,42 @@ async function refreshServiceRunning(): Promise<void> {
       // The service manager is unavailable; treat the service as absent for install controls.
       return 'not_installed' as const;
     }),
+    // Which build the service says it is. `null` is an answer too: a service that will not say
+    // which build it is, whether because it is gone or because it speaks another protocol.
+    invoke<string | null>('get_service_version').catch((error) => {
+      console.debug('[proxy] the service did not report its version:', error);
+      return null;
+    }),
   ]);
-  serviceRunning.value = running;
+
+  // Nothing answered on the IPC port this time. Whether the service is *gone* is a different
+  // question, and one missed deadline does not answer it, so the answer is only believed once it
+  // has been repeated. Every read that answered clears the count.
+  if (running) {
+    serviceReadFailures = 0;
+    serviceRunning.value = true;
+    serviceUnanswered.value = false;
+  } else {
+    serviceReadFailures += 1;
+    if (serviceReadFailures >= SERVICE_FAILURES_BEFORE_TRUST) {
+      serviceRunning.value = false;
+      serviceUnanswered.value = true;
+    }
+    // Otherwise the state is unknown, and the last answer stands: the service is not known to be
+    // gone, and nothing is claimed about it.
+  }
+
+  // The same question about the build, and the same rule: a read that answers is believed at
+  // once. A read that does not is believed only when something else explains the silence —
+  // either the IPC worked in this same round trip, so the service refused the question, or the
+  // service has stopped answering altogether. A read that timed out while the IPC was up says
+  // nothing about the build, so nothing is claimed about it.
+  if (version !== null) {
+    serviceVersion.value = version;
+  } else if (running || serviceUnanswered.value) {
+    serviceVersion.value = null;
+  }
+
   // Installed and answering are different facts: the install button disappears as soon as the
   // unit exists, while TUN stays gated on the IPC connection actually being usable. Which of
   // the two says "running" is kept as well, because the service manager saying "running" while
@@ -724,8 +807,10 @@ async function refreshServiceRunning(): Promise<void> {
   serviceState.value = state;
 
   // TUN cannot run without the service, so an uninstalled service must not leave a latent
-  // request behind (rule 3): the toggle flips back off and says why.
-  if (!serviceRunning.value && config.useTun) {
+  // request behind (rule 3): the toggle flips back off and says why. Only once the reads have
+  // shown that the service has stopped answering, though — one missed deadline must not cost the
+  // user the setting.
+  if (serviceUnanswered.value && config.useTun) {
     updateConfig({ useTun: false });
     toast.warning(translate('connect.tunUnavailableServiceGone'));
   }
@@ -955,10 +1040,14 @@ export function useProxyStore() {
     busy,
     startupError,
     serviceRunning,
+    /** Whether the service has stopped answering, as far as the reads have shown. */
+    serviceUnanswered,
     /** What the service manager says: not registered, registered and down, registered and up. */
     serviceState,
     serviceInstalled,
-    /** The service manager says the service is running and nothing answers it — a drift. */
+    /** Which build the service says it is; `null` when it did not answer that question. */
+    serviceVersion,
+    /** The service is registered and running but did not answer this build — a drift. */
     serviceStale,
     /** How each node is currently reaching its backend. */
     endpointLinks,
