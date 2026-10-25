@@ -21,3 +21,6 @@ pub mod shutdown;
 pub mod status;
 pub mod stream_util;
 pub(crate) mod toml_zeroize;
+
+#[cfg(test)]
+mod probe_review;
