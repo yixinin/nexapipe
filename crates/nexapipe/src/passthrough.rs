@@ -625,3 +625,32 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod review_probe {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    /// A TLS record whose own length is four times the cap is accepted whole.
+    #[tokio::test]
+    async fn a_record_past_the_cap_is_accepted_whole() {
+        let mut record = vec![TLS_HANDSHAKE, 0x03, 0x01, 0xff, 0xff];
+        record.extend(std::iter::repeat_n(0u8, 0xffff));
+        let (mut writer, mut reader) = tokio::io::duplex(record.len() + 64);
+        let task = tokio::spawn(async move {
+            read_tls_record(&mut reader, Vec::new(), std::time::Duration::from_secs(5)).await
+        });
+        writer.write_all(&record).await.unwrap();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        // Falsified hypothesis: the record is NOT accepted. The cap is
+        // enforced on the record length even though the length check runs
+        // after the "already complete" check, because the reads are 4 KiB at
+        // a time and the record can never be complete before the check runs.
+        let err = out.expect_err("the oversized record must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(MAX_HANDSHAKE_LEN < 5 + 0xffff);
+    }
+}

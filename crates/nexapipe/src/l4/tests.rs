@@ -970,3 +970,116 @@ async fn a_udp_flow_does_not_use_a_stale_address() {
     assert!(outcome.is_ok());
     echo.await.unwrap();
 }
+
+/// A TCP flow and a UDP flow, side by side: the copy buffers of the first are
+/// charged to the process byte budget, the second's 64 KiB receive buffer is
+/// not.
+#[tokio::test]
+async fn a_udp_flow_holds_no_bytes_against_the_process_budget() {
+    let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = backend.local_addr().unwrap();
+    let echo = tokio::spawn(async move {
+        let (mut socket, _) = backend.accept().await.unwrap();
+        let mut buf = [0u8; 64];
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            socket.write_all(&buf[..n]).await.unwrap();
+        }
+    });
+    let udp_backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let udp_addr = udp_backend.local_addr().unwrap();
+    let udp_echo = tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        loop {
+            let Ok((n, from)) = udp_backend.recv_from(&mut buf).await else {
+                return;
+            };
+            udp_backend.send_to(&buf[..n], from).await.unwrap();
+        }
+    });
+
+    let budget = crate::conn::limits::body_budget();
+    let base = budget.held();
+
+    // --- a TCP flow ---
+    let config = RoutingTable::new(vec![tcp_route("db.test", &backend_addr.to_string())]);
+    let (client, server) = tokio::io::duplex(4096);
+    let task = tokio::spawn(async move {
+        serve_stream(
+            server,
+            Vec::new(),
+            &config,
+            &limiter(),
+            "test",
+            None,
+            "test-request-id",
+            None,
+        )
+        .await
+    });
+    let (mut client_read, mut client_write) = tokio::io::split(client);
+    client_write
+        .write_all(&preface(L4Proto::Tcp, "db.test", 5432))
+        .await
+        .unwrap();
+    assert_eq!(read_status(&mut client_read).await, Status::Ok);
+    client_write.write_all(b"ping").await.unwrap();
+    let mut echoed = [0u8; 4];
+    client_read.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"ping");
+    let during_tcp = budget.held() - base;
+    assert_eq!(
+        during_tcp,
+        2 * crate::stream_util::COPY_BUF_SIZE,
+        "a TCP flow is charged for its two copy buffers"
+    );
+    drop(client_write);
+    drop(client_read);
+    task.await.unwrap().unwrap();
+    echo.abort();
+
+    // --- a UDP flow ---
+    let base = budget.held();
+    let config = RoutingTable::new(vec![udp_route(
+        "turn.test",
+        &udp_addr.to_string(),
+        Some(Duration::from_secs(2)),
+    )]);
+    let (client, server) = tokio::io::duplex(4096);
+    let task = tokio::spawn(async move {
+        serve_stream(
+            server,
+            Vec::new(),
+            &config,
+            &limiter(),
+            "test",
+            None,
+            "test-request-id",
+            None,
+        )
+        .await
+    });
+    let (mut client_read, mut client_write) = tokio::io::split(client);
+    client_write
+        .write_all(&preface(L4Proto::Udp, "turn.test", 3478))
+        .await
+        .unwrap();
+    assert_eq!(read_status(&mut client_read).await, Status::Ok);
+    client_write
+        .write_all(&encode_frame_to_vec(b"ping").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(read_udp_frame(&mut client_read).await, b"ping");
+    let during_udp = budget.held() - base;
+    assert_eq!(
+        during_udp, 0,
+        "a UDP flow holds a 64 KiB receive buffer and is charged nothing"
+    );
+    drop(client_write);
+    drop(client_read);
+    let _ = task.await;
+    udp_echo.abort();
+}

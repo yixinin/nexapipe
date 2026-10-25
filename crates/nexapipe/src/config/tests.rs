@@ -3299,3 +3299,36 @@ fn a_generated_key_lands_in_a_private_file() {
         "a file holding the endpoint's private key must be private, got {mode:o}"
     );
 }
+
+/// The per-route flow bound has no ceiling, while the server-wide one has.
+#[test]
+fn a_route_may_carry_a_flow_bound_of_a_century() {
+    let spec = RouteSpec {
+        host_pattern: "app.test".to_string(),
+        path_pattern: "/".to_string(),
+        path_is_prefix: Some(true),
+        strategy: None,
+        backends: vec!["127.0.0.1:9000".to_string()],
+        backend_protocol: None,
+        mode: Some("tcp".to_string()),
+        modes: None,
+        path_rewrite: None,
+        client_ports: None,
+        idle_timeout_secs: None,
+        flow_timeout_secs: Some(315_360_000_000),
+        cert_path: None,
+        key_path: None,
+        redirect_to_https: None,
+    };
+
+    let route = crate::routes::Route::try_from(spec).expect("the route is built");
+    assert_eq!(
+        route.flow_timeout(),
+        Some(std::time::Duration::from_secs(315_360_000_000)),
+        "a century-long flow bound is accepted"
+    );
+    assert!(
+        315_360_000_000 > crate::deadline::MAX_SECS,
+        "the server-wide ceiling for the same bound is one day"
+    );
+}

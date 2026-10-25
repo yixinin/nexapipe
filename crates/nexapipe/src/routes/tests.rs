@@ -1412,3 +1412,39 @@ mod backend_port_tests {
         assert_eq!(backend_port("[::1]:8443"), Some(8443));
     }
 }
+
+/// Two passthrough routes for the same host: the one whose `path_pattern` is
+/// longer wins, even though a passthrough route's path is not matched at all.
+#[tokio::test]
+async fn a_passthrough_route_is_chosen_by_its_path_pattern() {
+    let short = Route::new(
+        "app.test",
+        "/",
+        true,
+        vec!["short-backend:443".to_string()],
+        LoadBalancingStrategy::RoundRobin,
+        RouteMode::Passthrough,
+        None,
+    );
+    let long = Route::new(
+        "app.test",
+        "/a/longer/path",
+        true,
+        vec!["long-backend:443".to_string()],
+        LoadBalancingStrategy::RoundRobin,
+        RouteMode::Passthrough,
+        None,
+    );
+    let config = RoutingTable::new(vec![short, long]);
+
+    let lease = config
+        .get_passthrough_backend("app.test")
+        .await
+        .backend()
+        .expect("a passthrough route serves the name");
+    assert_eq!(
+        lease.url(),
+        "long-backend:443",
+        "the path pattern, which a passthrough route never matches on, picked the backend"
+    );
+}
