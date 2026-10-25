@@ -84,6 +84,25 @@ tracing = ["dep:tracing"]
 jni = ["dep:jni", "dep:log", "dep:android_logger", "dep:ndk-context"]
 tun-proxy = ["local-proxy", "dep:netstack-smoltcp", "dep:libc"]
 
+# What docs.rs builds the page from. Without this it builds with the default
+# features alone, and eight of this crate's twenty-three modules are behind a
+# feature that no default carries: `tun_proxy` (the smoltcp stack), `dns`,
+# `virtual_ip` and `virtual_block` (behind `tun-proxy`), `local_proxy` and
+# `l4` (behind `local-proxy`), `jni` (the Android bridge) and
+# `uniffi_bindings` (the bindings for an app that is not written in Rust). A
+# reader who only ever sees the documentation would conclude that they do not
+# exist.
+#
+# All four features build on Linux, which is what docs.rs builds on: the CI
+# job "client features" checks each of these feature sets on ubuntu-latest,
+# and the two that pull a platform dependency in (the JNI bridge and the UniFFI
+# bindings) carry their non-Android path explicitly.
+#
+# `native-certs` and `webpki-roots` are left out on purpose: they name the
+# trust store, and this crate does not use either of them — the server does.
+[package.metadata.docs.rs]
+features = ["tun-proxy", "local-proxy", "jni", "uniffi"]
+
 [target.'cfg(target_os = "ios")'.dependencies]
 webpki-roots = "1.0.8"
 

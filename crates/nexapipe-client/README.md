@@ -88,6 +88,13 @@ What the patch changes, and why, is written down in
 The features that do not run the TCP/IP stack — `local-proxy` and the L4 tunnel
 — are unaffected.
 
+### Documentation
+
+The page on [docs.rs](https://docs.rs/nexapipe-client) is built with the
+`tun-proxy`, `local-proxy`, `jni` and `uniffi` features on, so it carries the
+whole crate — the TUN stack, the local proxy, the Android bridge and the
+UniFFI bindings, not only the part the default features reach.
+
 ## Licence
 
 MIT. See the `LICENSE` file in the package.

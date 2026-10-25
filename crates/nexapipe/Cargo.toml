@@ -77,7 +77,7 @@ tokio-stream.workspace = true
 flate2 = '1.0'
 bytes.workspace = true
 hex = '0.4'
-nexapipe-client = { path = '../nexapipe-client', version = '1.0.0', features = ['local-proxy'] }
+nexapipe-client = { path = '../nexapipe-client', version = '1.0.1', features = ['local-proxy'] }
 nexapipe-proto.workspace = true
 # 2FA support
 # `zeroize` so the TOTP validator wipes its own copy of the seed when it is

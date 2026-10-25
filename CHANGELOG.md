@@ -19,6 +19,11 @@ and its meaning.
 
 ## [Unreleased]
 
+> The three items below are already in the crates.io releases of `nexapipe`,
+> `nexapipe-client` and `nexapipe-proto` at 1.0.0 and 1.0.1. They stay listed
+> here because the tag that would carry them into the server archives, the
+> desktop bundles and the signed APK has not been cut yet.
+
 ### Added
 
 - **Where a credential is checked is now a seam, and the built-in check is the
@@ -68,6 +73,29 @@ and its meaning.
   already do it, rather than a `license-file` pointing at the repository root
   — which is what keeps the manifest free of the warning cargo gives for
   naming both.
+
+## [1.0.1] — 2026-10-25
+
+A packaging release: the code is the code of 1.0.0, and what changed is where
+the documentation is built from.
+
+### Added
+
+- **The client's documentation now carries the whole crate.** Half of
+  `nexapipe-client`'s public surface is behind a feature that no default
+  carries: the TUN stack (`tun_proxy`), the local proxy and the L4 tunnel
+  (`local_proxy`, `l4`), the Android bridge (`jni`), and the bindings for an
+  app that is not written in Rust (`uniffi`). docs.rs builds with the default
+  features alone, so those four modules were not on the page at all — a reader
+  who only ever saw the documentation would have had no way to know that they
+  exist. The crate now says which features its documentation is built with,
+  and the page has all four.
+
+### Changed
+
+- The three crates carry 1.0.1 rather than 1.0.0, so that all three name the
+  same release. The protocol and the server are unchanged; the client's
+  manifest grew the lines above.
 
 ## [1.0.0] — 2026-10-24
 

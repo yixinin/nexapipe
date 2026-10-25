@@ -3583,7 +3583,7 @@ dependencies = [
 
 [[package]]
 name = "nexapipe-client"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "base32",
@@ -3617,7 +3617,7 @@ dependencies = [
 
 [[package]]
 name = "nexapipe-proto"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "hmac",
  "serde",
